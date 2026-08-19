@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/coredns/coredns v1.14.6
 	github.com/miekg/dns v1.1.72
+	github.com/spiffe/spire-api-sdk v1.15.2
 )
 
 require (
