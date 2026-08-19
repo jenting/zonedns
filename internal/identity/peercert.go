@@ -22,6 +22,7 @@ import (
 //     而不是對 writer 做型別斷言 — 上游 plugin（例如 metrics）可能包裝過
 //     ResponseWriter，型別斷言會失敗，而失敗的方式是「安靜地回 false」，
 //     結果是 zone 驗證整個失效卻沒有任何錯誤。
+//
 //   - DoT：writer 實作 dns.ConnectionStater。
 //
 //     這條路徑對 ResponseWriter 包裝不健壯：CoreDNS 的 metrics plugin 會用一個

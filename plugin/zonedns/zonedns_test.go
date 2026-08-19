@@ -85,7 +85,7 @@ type failingWriter struct {
 }
 
 func (w *failingWriter) ConnectionState() *tls.ConnectionState { return w.state }
-func (w *failingWriter) WriteMsg(*dns.Msg) error                { return errors.New("write failed") }
+func (w *failingWriter) WriteMsg(*dns.Msg) error               { return errors.New("write failed") }
 
 func newHandler(t *testing.T, next plugin.Handler) ZoneDNS {
 	t.Helper()
