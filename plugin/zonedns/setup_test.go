@@ -5,7 +5,9 @@ import (
 	"testing"
 
 	"github.com/coredns/caddy"
+	"github.com/coredns/coredns/core/dnsserver"
 	"github.com/coredns/coredns/plugin/pkg/transport"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestCheckDirectiveOrder(t *testing.T) {
@@ -176,7 +178,6 @@ func TestParseCorefileRequiresSpireServerIDForNetworkAddress(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns {
 		spire_server spire-server.example.org:8443
 		workload_api unix:///tmp/agent/public/api.sock
-		trust_domain example.org
 		authorized_agent spiffe://example.org/node/n1
 	}`)
 	if _, err := parseConfig(c); err == nil {
@@ -200,7 +201,6 @@ func TestParseCorefileAcceptsSpireServerIDForNetworkAddress(t *testing.T) {
 		spire_server spire-server.example.org:8443
 		spire_server_id spiffe://example.org/spire/server
 		workload_api unix:///tmp/agent/public/api.sock
-		trust_domain example.org
 		authorized_agent spiffe://example.org/node/n1
 	}`)
 	cfg, err := parseConfig(c)
@@ -209,6 +209,56 @@ func TestParseCorefileAcceptsSpireServerIDForNetworkAddress(t *testing.T) {
 	}
 	if cfg.spireServerID != "spiffe://example.org/spire/server" {
 		t.Fatalf("spireServerID = %q, want spiffe://example.org/spire/server", cfg.spireServerID)
+	}
+}
+
+// registryReady 是跨 Corefile reload 共用的套件層級 gauge（見 setup.go）。若
+// setup() 不主動歸零，reload 後它會繼續回報前一個 instance 的就緒狀態，而新的
+// （空的）Store 其實會讓每個查詢都靜默走非 zone-aware 路徑 —— 這個 metric 正是
+// 在最需要準確的時候說謊。
+//
+// setup() 內部第一步會呼叫 CheckDirectiveOrder(dnsserver.Directives)，那是
+// vendor 進來、編譯期就固定的 CoreDNS 內建 directive 清單，不包含 "zonedns"
+// （要包含它，必須是下游用自己的 plugin.cfg 重新產生 zdirectives.go 之後的組
+// 建）。測試在本檔案的其他測試都只呼叫 parseConfig，唯獨這裡需要 setup() 真的
+// 跑到底才能驗證 registryReady 的歸零時機，所以在測試範圍內暫時把 "zonedns"
+// 插進 "cache" 之前（滿足 CheckDirectiveOrder），跑完立刻還原。本套件沒有任何
+// 測試使用 t.Parallel()，因此這個暫時性的全域修改不會與其他測試競爭。
+func TestSetupResetsRegistryReadyGauge(t *testing.T) {
+	registryReady.Set(1) // 模擬前一個 instance 已經就緒過。
+
+	origDirectives := dnsserver.Directives
+	extended := make([]string, 0, len(origDirectives)+1)
+	inserted := false
+	for _, d := range origDirectives {
+		if d == "cache" && !inserted {
+			extended = append(extended, "zonedns")
+			inserted = true
+		}
+		extended = append(extended, d)
+	}
+	if !inserted {
+		extended = append(extended, "zonedns")
+	}
+	dnsserver.Directives = extended
+	defer func() { dnsserver.Directives = origDirectives }()
+
+	c := caddy.NewTestController("dns", `zonedns {
+		spire_server unix:///tmp/spire-server/private/api.sock
+		authorized_agent spiffe://example.org/node/n1
+	}`)
+
+	// dialSPIRE's unix:// branch uses grpc.NewClient, which is lazy and does
+	// not dial or block — no live SPIRE Server socket is required for setup()
+	// to return, and OnStartup/OnShutdown callbacks registered here are never
+	// invoked by NewTestController, so no goroutine or network I/O actually
+	// starts during this test.
+	if err := setup(c); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	if got := testutil.ToFloat64(registryReady); got != 0 {
+		t.Fatalf("registryReady = %v, want 0", got)
 	}
 }
 

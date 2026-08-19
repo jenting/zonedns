@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"net/http"
 	"net/netip"
 	"testing"
@@ -73,6 +74,18 @@ func (w *dohWriter) WriteMsg(m *dns.Msg) error {
 	w.Msg = m
 	return w.ResponseWriter.WriteMsg(m)
 }
+
+// failingWriter 模擬底層連線寫入失敗的情境（例如 client 已斷線）。用來驗證
+// answerGateway 不會把 WriteMsg 的錯誤吞掉導致 panic，也不會誤把失敗的寫入
+// 回報成別的 rcode —— ServeDNS 仍必須回傳 (dns.RcodeSuccess, nil)，只是把
+// 錯誤記錄下來（見 zonedns.go 的 log.Errorf）。
+type failingWriter struct {
+	dns.ResponseWriter
+	state *tls.ConnectionState
+}
+
+func (w *failingWriter) ConnectionState() *tls.ConnectionState { return w.state }
+func (w *failingWriter) WriteMsg(*dns.Msg) error                { return errors.New("write failed") }
 
 func newHandler(t *testing.T, next plugin.Handler) ZoneDNS {
 	t.Helper()
@@ -151,6 +164,31 @@ func TestServeDNSCrossZoneAnswersGateway(t *testing.T) {
 	}
 	if a.Hdr.Ttl != 30 {
 		t.Fatalf("ttl = %d, want 30", a.Hdr.Ttl)
+	}
+}
+
+// answerGateway 呼叫 state.W.WriteMsg 失敗時（例如 client 中途斷線），不可讓
+// ServeDNS panic 或回傳跟成功時不一致的結果 —— 呼叫端（CoreDNS 的 server 迴圈）
+// 只看 (rcode, error) 這兩個回傳值，錯誤已經在內部記錄成 log 就足夠了。
+func TestServeDNSCrossZoneWriteMsgErrorDoesNotPanic(t *testing.T) {
+	next := &nextCalled{}
+	h := newHandler(t, next)
+
+	m := new(dns.Msg)
+	m.SetQuestion("payments.example.com.", dns.TypeA)
+	ednszone.Set(m, ednszone.DefaultCode, "zone-b")
+	certs := []*x509.Certificate{testcerts.New(t, testAgentID)}
+	w := &failingWriter{state: &tls.ConnectionState{PeerCertificates: certs}}
+
+	code, err := h.ServeDNS(context.Background(), w, m)
+	if err != nil {
+		t.Fatalf("ServeDNS: %v", err)
+	}
+	if code != dns.RcodeSuccess {
+		t.Fatalf("rcode = %d, want NOERROR", code)
+	}
+	if next.called {
+		t.Fatal("cross-zone query must not reach the next plugin even when the write fails")
 	}
 }
 

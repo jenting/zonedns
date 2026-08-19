@@ -44,7 +44,6 @@ type config struct {
 	ttl              uint32
 	zones            *zonetable.Table
 	workloadAPI      string // 僅在 spire_server 為網路位址時需要
-	trustDomain      string // 同上；不再用於驗證身分 —— spire_server_id 直接釘住確切身分，見 dialSPIRE
 	spireServerID    string // 同上，SPIRE Server 的 SPIFFE ID；network address 時必填，見下方驗證
 }
 
@@ -264,12 +263,6 @@ func parseConfig(c *caddy.Controller) (*config, error) {
 					return nil, c.ArgErr()
 				}
 				cfg.workloadAPI = c.Val()
-
-			case "trust_domain":
-				if !c.NextArg() {
-					return nil, c.ArgErr()
-				}
-				cfg.trustDomain = c.Val()
 
 			case "spire_server_id":
 				if !c.NextArg() {
