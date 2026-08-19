@@ -51,7 +51,11 @@ func (a Agent) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (
 	now := timeNow()
 	if cached, ok := a.Cache.Get(state.Name(), state.QType(), zone, now); ok {
 		cacheTotal.WithLabelValues("hit").Inc()
+		// SetReply forces Rcode to RcodeSuccess; the cached message's own Rcode
+		// (e.g. a stored NXDOMAIN/SERVFAIL) must reach the client unchanged.
+		rcode := cached.Rcode
 		cached.SetReply(r)
+		cached.Rcode = rcode
 		if err := w.WriteMsg(cached); err != nil {
 			log.Warningf("write cached reply for %q: %v", state.Name(), err)
 		}
@@ -60,6 +64,12 @@ func (a Agent) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (
 	cacheTotal.WithLabelValues("miss").Inc()
 
 	outbound := r.Copy()
+	// Strip any zone declaration the client itself attached, unconditionally
+	// and before deciding whether to declare one. Central trusts whatever
+	// this agent forwards; a client-supplied option under EDNS0Code must
+	// never survive, whether or not the agent has a zone of its own to
+	// assert.
+	stripZoneOption(outbound, a.EDNS0Code)
 	if haveZone {
 		ednszone.Set(outbound, a.EDNS0Code, zone)
 	}
@@ -73,11 +83,35 @@ func (a Agent) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (
 
 	a.Cache.Put(state.Name(), state.QType(), zone, answer, now)
 
+	// See the cache-hit path above: preserve the upstream's own Rcode across
+	// SetReply so an in-band NXDOMAIN/SERVFAIL isn't rewritten to NOERROR.
+	rcode := answer.Rcode
 	answer.SetReply(r)
+	answer.Rcode = rcode
 	if err := w.WriteMsg(answer); err != nil {
 		log.Warningf("write reply for %q: %v", state.Name(), err)
 	}
 	return dns.RcodeSuccess, nil
+}
+
+// stripZoneOption removes any existing EDNS0 local option under code from m,
+// without creating an OPT record if none exists. The zone declaration sent
+// to central must originate from this agent's own determination or not
+// exist at all — never from whatever the client happened to attach to its
+// query.
+func stripZoneOption(m *dns.Msg, code uint16) {
+	opt := m.IsEdns0()
+	if opt == nil {
+		return
+	}
+	kept := opt.Option[:0]
+	for _, o := range opt.Option {
+		if l, isLocal := o.(*dns.EDNS0_LOCAL); isLocal && l.Code == code {
+			continue
+		}
+		kept = append(kept, o)
+	}
+	opt.Option = kept
 }
 
 // resolveZone 判定來源的 zone 並記錄結果。
