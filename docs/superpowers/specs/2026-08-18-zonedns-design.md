@@ -324,7 +324,24 @@ example.com:53 {
 zone-aware 快取（§7.3）由 agent plugin 自行持有，不使用 stock `cache` plugin。此安排
 使匯入本設計對既有 node-local DNS 行為的影響面收斂到單一網域。
 
-### 7.5 失效模式與偵測
+### 7.5 上游身分驗證
+
+**agent 必須以 SPIFFE ID 釘住 central，不可只驗證憑證鏈。**
+
+若只用 SPIRE trust bundle 做一般 TLS 驗證，信任域內**任何一張 SVID** 都能冒充
+central。這與子專案 1 實作時發現並修掉的 `AuthorizeMemberOf` 問題完全對稱，但這一
+側後果更重：偽造的 central 可以回傳任意答案 —— 例如告訴 zone-a 的 client 某個同
+zone 服務其實是跨 zone 的，並給出攻擊者控制的位址。agent 對答案沒有任何獨立查核
+手段，會完整採信。
+
+作法與子專案 1 相同：`tlsconfig.AuthorizeID` 搭配設定中的 central SPIFFE ID，
+設定項為必填（無預設值，缺少即啟動失敗）。
+
+**部署耦合**：agent 自身 SVID 的 SPIFFE ID 必須出現在 central 的 `authorized_agent`
+清單中，否則 central 會忽略它宣告的 zone 並靜默退回非 zone-aware 路徑。兩端的
+設定必須成對維護。
+
+### 7.6 失效模式與偵測
 
 這類問題最大的風險不是會壞，而是壞得安靜。每一項都必須有偵測手段：
 
