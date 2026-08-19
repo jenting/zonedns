@@ -76,9 +76,12 @@ func TestSourceZoneAuthorizedListIsExactMatch(t *testing.T) {
 		"spiffe://evil.org/node/n1",
 	} {
 		w := tlsWriter(t, id)
-		_, reason := cfg().SourceZone(context.Background(), w, query("zone-a"))
+		zone, reason := cfg().SourceZone(context.Background(), w, query("zone-a"))
 		if reason != ReasonUnauthorizedAgent {
 			t.Fatalf("id %q: reason = %v, want ReasonUnauthorizedAgent", id, reason)
+		}
+		if zone != "" {
+			t.Fatalf("id %q: zone = %q, want empty", id, zone)
 		}
 	}
 }
@@ -99,18 +102,24 @@ func TestSourceZoneRejectsMalformedZone(t *testing.T) {
 		m.SetQuestion("payments.example.com.", dns.TypeA)
 		ednszone.Set(m, ednszone.DefaultCode, bad)
 
-		_, reason := cfg().SourceZone(context.Background(), tlsWriter(t, agentID), m)
+		zone, reason := cfg().SourceZone(context.Background(), tlsWriter(t, agentID), m)
 		if reason != ReasonNoDeclaration {
 			t.Fatalf("zone %q: reason = %v, want ReasonNoDeclaration", bad, reason)
+		}
+		if zone != "" {
+			t.Fatalf("bad zone %q: zone = %q, want empty", bad, zone)
 		}
 	}
 }
 
 // 憑證沒有 SPIFFE ID 時不可被當成授權 agent。
 func TestSourceZoneCertWithoutSPIFFEID(t *testing.T) {
-	_, reason := cfg().SourceZone(context.Background(), tlsWriter(t, ""), query("zone-a"))
+	zone, reason := cfg().SourceZone(context.Background(), tlsWriter(t, ""), query("zone-a"))
 	if reason != ReasonUnauthorizedAgent {
 		t.Fatalf("reason = %v, want ReasonUnauthorizedAgent", reason)
+	}
+	if zone != "" {
+		t.Fatalf("zone = %q, want empty", zone)
 	}
 }
 
@@ -122,26 +131,56 @@ func TestSourceZoneOnlyLeafCertificateCounts(t *testing.T) {
 		PeerCertificates: []*x509.Certificate{leaf, intermediate},
 	}}
 
-	_, reason := cfg().SourceZone(context.Background(), w, query("zone-a"))
+	zone, reason := cfg().SourceZone(context.Background(), w, query("zone-a"))
 	if reason != ReasonUnauthorizedAgent {
 		t.Fatalf("reason = %v, want ReasonUnauthorizedAgent", reason)
+	}
+	if zone != "" {
+		t.Fatalf("zone = %q, want empty", zone)
 	}
 }
 
 // 空的授權清單表示沒有任何 agent 被授權，不是「全部放行」。
 func TestSourceZoneEmptyAuthorizedListDeniesAll(t *testing.T) {
 	c := NewConfig(nil, ednszone.DefaultCode)
-	_, reason := c.SourceZone(context.Background(), tlsWriter(t, agentID), query("zone-a"))
+	zone, reason := c.SourceZone(context.Background(), tlsWriter(t, agentID), query("zone-a"))
 	if reason != ReasonUnauthorizedAgent {
 		t.Fatalf("reason = %v, want ReasonUnauthorizedAgent", reason)
+	}
+	if zone != "" {
+		t.Fatalf("zone = %q, want empty", zone)
 	}
 }
 
 // option code 設定不一致時，宣告必須被忽略而非誤讀。
 func TestSourceZoneRespectsConfiguredOptionCode(t *testing.T) {
 	c := NewConfig([]string{agentID}, 65002)
-	_, reason := c.SourceZone(context.Background(), tlsWriter(t, agentID), query("zone-a"))
+	zone, reason := c.SourceZone(context.Background(), tlsWriter(t, agentID), query("zone-a"))
 	if reason != ReasonNoDeclaration {
 		t.Fatalf("reason = %v, want ReasonNoDeclaration", reason)
+	}
+	if zone != "" {
+		t.Fatalf("zone = %q, want empty", zone)
+	}
+}
+
+// Reason.String() 的輸出是 Prometheus metric 的 label value；調整 iota 順序
+// 會在不知不覺間改名 metric，所以每個常數的字串都要單獨鎖住，外加一個
+// out-of-range 值鎖住 default 分支。
+func TestReasonString(t *testing.T) {
+	cases := []struct {
+		reason Reason
+		want   string
+	}{
+		{ReasonOK, "ok"},
+		{ReasonNoTLS, "no_tls"},
+		{ReasonUnauthorizedAgent, "unauthorized_agent"},
+		{ReasonNoDeclaration, "no_declaration"},
+		{Reason(999), "unknown"},
+	}
+	for _, c := range cases {
+		if got := c.reason.String(); got != c.want {
+			t.Fatalf("Reason(%d).String() = %q, want %q", c.reason, got, c.want)
+		}
 	}
 }

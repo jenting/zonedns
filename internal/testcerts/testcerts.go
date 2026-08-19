@@ -17,9 +17,14 @@ import (
 	"time"
 )
 
-// New generates a certificate with the given URI SAN. If uri is the empty
-// string, the certificate carries no URI SAN.
-func New(t *testing.T, uri string) *x509.Certificate {
+// New generates a certificate with the given URI SANs.
+//
+// Variadic so every existing single-argument call site (including
+// New(t, "") for "no URI SAN") keeps compiling unchanged, while callers
+// that need to test multi-SAN certificates can pass more than one URI:
+// New(t, uri1, uri2). Empty-string arguments are skipped rather than
+// turned into a SAN, preserving the historical "" == no SAN meaning.
+func New(t *testing.T, uris ...string) *x509.Certificate {
 	t.Helper()
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -33,12 +38,15 @@ func New(t *testing.T, uri string) *x509.Certificate {
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(time.Hour),
 	}
-	if uri != "" {
+	for _, uri := range uris {
+		if uri == "" {
+			continue
+		}
 		u, err := url.Parse(uri)
 		if err != nil {
 			t.Fatalf("parse uri %q: %v", uri, err)
 		}
-		tmpl.URIs = []*url.URL{u}
+		tmpl.URIs = append(tmpl.URIs, u)
 	}
 
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)

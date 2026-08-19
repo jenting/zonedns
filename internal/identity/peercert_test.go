@@ -99,3 +99,49 @@ func TestSPIFFEIDFromCertRejectsNonSPIFFE(t *testing.T) {
 		t.Fatal("certificate without URI SAN must be rejected")
 	}
 }
+
+// 多個 URI SAN 的順序由憑證持有者（可能是攻擊者）決定，所以「挑第一個 spiffe
+// scheme 的當身分」不安全 — 必須整張憑證直接拒絕，不管 SAN 順序為何。
+func TestSPIFFEIDFromCertRejectsMultipleURISANs(t *testing.T) {
+	cases := []struct {
+		name string
+		uris []string
+	}{
+		{
+			name: "two spiffe SANs, authorized one first",
+			uris: []string{agentID, "spiffe://example.org/workload/attacker"},
+		},
+		{
+			name: "two spiffe SANs, authorized one last",
+			uris: []string{"spiffe://example.org/workload/attacker", agentID},
+		},
+		{
+			name: "spiffe SAN then https SAN",
+			uris: []string{agentID, "https://example.org/node/n1"},
+		},
+		{
+			name: "https SAN then spiffe SAN",
+			uris: []string{"https://example.org/node/n1", agentID},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cert := testcerts.New(t, c.uris...)
+			if _, ok := SPIFFEIDFromCert(cert); ok {
+				t.Fatalf("%s: certificate with multiple URI SANs must be rejected", c.name)
+			}
+		})
+	}
+}
+
+// 恰好一個 URI SAN、且是 spiffe scheme 時才接受 — 這是唯一應該通過的形狀。
+func TestSPIFFEIDFromCertAcceptsExactlyOneSPIFFESAN(t *testing.T) {
+	cert := testcerts.New(t, agentID)
+	got, ok := SPIFFEIDFromCert(cert)
+	if !ok {
+		t.Fatal("ok = false, want true")
+	}
+	if got != agentID {
+		t.Fatalf("got %q, want %q", got, agentID)
+	}
+}
