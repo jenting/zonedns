@@ -99,6 +99,35 @@ func TestExchangeRestoresMessageID(t *testing.T) {
 	}
 }
 
+// Exchange 不得改動呼叫端傳入的 *dns.Msg —— CoreDNS plugin 在請求生命週期中
+// 會重複使用同一個訊息物件，若少了內部的 .Copy()，日後的「簡化」會讓
+// Exchange 直接改動呼叫端的訊息（ID 被清成 0、EDNS0 選項被動到），而且不會有
+// 任何測試失敗提醒。
+func TestExchangeDoesNotMutateCallerMessage(t *testing.T) {
+	srv := echoServer(t, nil)
+	defer srv.Close()
+
+	q := query()
+	q.Id = 0x1234
+	q.SetEdns0(4096, false)
+
+	wantID := q.Id
+	wantEdns0 := q.IsEdns0().String()
+
+	if _, err := NewWithHTTPClient(srv.URL, srv.Client()).Exchange(context.Background(), q); err != nil {
+		t.Fatalf("Exchange: %v", err)
+	}
+
+	if q.Id != wantID {
+		t.Fatalf("caller's message ID mutated: got %#x, want %#x", q.Id, wantID)
+	}
+	if opt := q.IsEdns0(); opt == nil {
+		t.Fatal("caller's EDNS0 OPT record was removed")
+	} else if opt.String() != wantEdns0 {
+		t.Fatalf("caller's EDNS0 OPT record mutated: got %q, want %q", opt.String(), wantEdns0)
+	}
+}
+
 func TestExchangeNonOKStatus(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
