@@ -358,6 +358,25 @@ zone-aware 快取（§7.3）由 agent plugin 自行持有，不使用 stock `cac
    per-workload DNS 政策，須重新設計而非擴充。
 4. **hostNetwork pod 不支援 zone 路由。**
 
+5. **zone-aware listener 必須是 DoH，不可用 DoT。** 實作審查時發現：CoreDNS 的
+   `metrics` plugin 以 `NewRecorder(w)` 包裝 ResponseWriter，而該 Recorder 是把
+   `dns.ResponseWriter` 當**介面欄位**內嵌，因此 DoT 取憑證所依賴的
+   `w.(dns.ConnectionStater)` 型別斷言必然失敗。後果是 DoT 查詢一律被判定為
+   「沒有憑證」→ 走非 zone-aware 路徑 → **zone 隔離靜默關閉，且 `unauthorized_agent`
+   告警永遠不會觸發**。
+
+   DoH 路徑不受影響，因為它是從 context 取 `*http.Request`（見 §6.1），與 writer
+   是否被包裝無關 —— 這正是當初選擇 context 而非型別斷言的原因。
+
+   未以調整 plugin 順序修正：把 `zonedns` 排到 `metrics` 之前雖可修好 DoT，但會使
+   CoreDNS 的標準請求 metrics 從此看不到任何跨 zone 答案，對一個已決定不部署的傳輸
+   而言代價過高。
+
+6. **多個 URI SAN 的憑證一律拒絕。** SPIFFE 規定憑證只能有一個 URI SAN，但
+   `crypto/tls` 的憑證鏈驗證不檢查 SAN 數量。若接受多個並取第一個 spiffe URI，
+   攻擊者只要取得一張同時帶有授權 agent ID 與自己 ID 的憑證，把授權那個排在前面
+   即可冒充。因此 `SPIFFEIDFromCert` 要求恰好一個 URI SAN，模糊即拒絕。
+
 ## 10. 測試策略
 
 - `identity` 單元的測試密度須高於其他單元 — **整套 zone 隔離是否可被繞過只取決於它**。
