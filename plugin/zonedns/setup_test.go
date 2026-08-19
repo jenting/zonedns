@@ -91,6 +91,127 @@ func TestParseCorefileRejectsBadGatewayAddress(t *testing.T) {
 	}
 }
 
+// 重複宣告同一個 zone 的 gateway 會靜默用後面那筆覆蓋前面那筆，等於在不知情的
+// 情況下把跨 zone 流量改導到另一個位址 —— 必須直接拒絕設定檔，而不是接受
+// 「最後寫的贏」。
+func TestParseCorefileRejectsDuplicateGateway(t *testing.T) {
+	c := caddy.NewTestController("dns", `zonedns {
+		spire_server unix:///tmp/spire-server/private/api.sock
+		authorized_agent spiffe://example.org/node/n1
+		gateway zone-a 203.0.113.10
+		gateway zone-a 198.51.100.9
+	}`)
+	if _, err := parseConfig(c); err == nil {
+		t.Fatal("expected error for a zone with two gateway declarations")
+	}
+}
+
+// poll_interval 0 或負值會讓 OnStartup 那個 goroutine 裡的 time.NewTicker
+// panic，直接讓 process 崩潰 —— 必須在解析設定檔的當下就擋下來。
+func TestParseCorefileRejectsNonPositivePollInterval(t *testing.T) {
+	for _, v := range []string{"0s", "-5s"} {
+		c := caddy.NewTestController("dns", `zonedns {
+			spire_server unix:///tmp/spire-server/private/api.sock
+			authorized_agent spiffe://example.org/node/n1
+			poll_interval `+v+`
+		}`)
+		if _, err := parseConfig(c); err == nil {
+			t.Fatalf("poll_interval %q: expected error", v)
+		}
+	}
+}
+
+// fmt.Sscanf("%d") 會在遇到第一個非數字字元時停止掃描但不回報錯誤，因此
+// "5m"（duration 格式）會被誤判成 5、"30.5" 被誤判成 30、"65001abc" 被誤判成
+// 65001。改用 strconv.ParseUint 後這些輸入都必須被整個拒絕，而不是截斷取用
+// 開頭那段數字。
+func TestParseCorefileRejectsMalformedTTL(t *testing.T) {
+	for _, v := range []string{"5m", "30.5", "30abc"} {
+		c := caddy.NewTestController("dns", `zonedns {
+			spire_server unix:///tmp/spire-server/private/api.sock
+			authorized_agent spiffe://example.org/node/n1
+			ttl `+v+`
+		}`)
+		if _, err := parseConfig(c); err == nil {
+			t.Fatalf("ttl %q: expected error", v)
+		}
+	}
+}
+
+// edns0_code 必須落在 IANA 保留給 local/experimental 用途的 65001-65534 區間，
+// 且不接受帶尾碼垃圾字元的輸入（同一個 strconv 修法順帶解決）。
+func TestParseCorefileRejectsMalformedEdns0Code(t *testing.T) {
+	for _, v := range []string{"65000", "65535", "65001abc"} {
+		c := caddy.NewTestController("dns", `zonedns {
+			spire_server unix:///tmp/spire-server/private/api.sock
+			authorized_agent spiffe://example.org/node/n1
+			edns0_code `+v+`
+		}`)
+		if _, err := parseConfig(c); err == nil {
+			t.Fatalf("edns0_code %q: expected error", v)
+		}
+	}
+}
+
+func TestParseCorefileAcceptsEdns0CodeUpperBound(t *testing.T) {
+	c := caddy.NewTestController("dns", `zonedns {
+		spire_server unix:///tmp/spire-server/private/api.sock
+		authorized_agent spiffe://example.org/node/n1
+		edns0_code 65534
+	}`)
+	cfg, err := parseConfig(c)
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if cfg.edns0Code != 65534 {
+		t.Fatalf("edns0Code = %d, want 65534", cfg.edns0Code)
+	}
+}
+
+// spire_server 是網路位址時走 mTLS：少了 spire_server_id 就只能驗證「trust
+// domain 內的某個成員」，任何持有同 trust domain SVID 的攻擊者攔截連線後都能
+// 冒充 SPIRE Server、餵一份偽造的 registry。必須 fail closed，在設定檔解析時
+// 就拒絕。
+func TestParseCorefileRequiresSpireServerIDForNetworkAddress(t *testing.T) {
+	c := caddy.NewTestController("dns", `zonedns {
+		spire_server spire-server.example.org:8443
+		workload_api unix:///tmp/agent/public/api.sock
+		trust_domain example.org
+		authorized_agent spiffe://example.org/node/n1
+	}`)
+	if _, err := parseConfig(c); err == nil {
+		t.Fatal("expected error when spire_server is a network address without spire_server_id")
+	}
+}
+
+// unix:// 走本機管理 socket，不受 mTLS 身分驗證影響，不需要 spire_server_id。
+func TestParseCorefileUnixSocketDoesNotRequireSpireServerID(t *testing.T) {
+	c := caddy.NewTestController("dns", `zonedns {
+		spire_server unix:///tmp/spire-server/private/api.sock
+		authorized_agent spiffe://example.org/node/n1
+	}`)
+	if _, err := parseConfig(c); err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+}
+
+func TestParseCorefileAcceptsSpireServerIDForNetworkAddress(t *testing.T) {
+	c := caddy.NewTestController("dns", `zonedns {
+		spire_server spire-server.example.org:8443
+		spire_server_id spiffe://example.org/spire/server
+		workload_api unix:///tmp/agent/public/api.sock
+		trust_domain example.org
+		authorized_agent spiffe://example.org/node/n1
+	}`)
+	cfg, err := parseConfig(c)
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if cfg.spireServerID != "spiffe://example.org/spire/server" {
+		t.Fatalf("spireServerID = %q, want spiffe://example.org/spire/server", cfg.spireServerID)
+	}
+}
+
 // warnIfDoT 必須只在 transport 為 tls 時回傳警告文字，其餘傳輸方式一律回傳空字串。
 //
 // 原因：身分擷取在 DoT 與 DoH 上的做法不同 —— DoH 從 context 取出 *http.Request，

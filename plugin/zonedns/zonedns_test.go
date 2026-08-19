@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"net/http"
 	"net/netip"
 	"testing"
 
+	"github.com/coredns/coredns/core/dnsserver"
 	"github.com/coredns/coredns/plugin"
 	"github.com/coredns/coredns/plugin/pkg/dnstest"
 	"github.com/coredns/coredns/plugin/test"
@@ -52,6 +54,22 @@ type dotWriter struct {
 func (w *dotWriter) ConnectionState() *tls.ConnectionState { return w.state }
 
 func (w *dotWriter) WriteMsg(m *dns.Msg) error {
+	w.Msg = m
+	return w.ResponseWriter.WriteMsg(m)
+}
+
+// dohWriter 模擬 DoH 連線的 ResponseWriter：它刻意不實作 dns.ConnectionStater，
+// 因為真正的 DoH server 也不會讓 writer 帶連線狀態 —— 身分必須從 context 裡的
+// *http.Request 讀出（見 internal/identity/peercert.go）。若 ServeDNS 有 bug
+// 忘記把呼叫端傳入的 ctx 往下傳給 SourceZone（例如誤用
+// context.Background()），這個 writer 會讓身分擷取直接落回「沒有憑證」，
+// 讓依賴 DoH 路徑的測試確實失敗，而不是意外地從 DoT 分支拿到憑證而蒙混過去。
+type dohWriter struct {
+	dns.ResponseWriter
+	Msg *dns.Msg
+}
+
+func (w *dohWriter) WriteMsg(m *dns.Msg) error {
 	w.Msg = m
 	return w.ResponseWriter.WriteMsg(m)
 }
@@ -114,6 +132,13 @@ func TestServeDNSCrossZoneAnswersGateway(t *testing.T) {
 	if next.called {
 		t.Fatal("cross-zone query must not reach the next plugin")
 	}
+	// ServeDNS's own return value is not what the client sees: CoreDNS only
+	// rewrites the reply's rcode when the returned code fails plugin.ClientWrite,
+	// which RcodeSuccess does not. The client sees w.Msg.Rcode as written by
+	// answerGateway, so that is what must be asserted here.
+	if w.Msg.Rcode != dns.RcodeSuccess {
+		t.Fatalf("w.Msg.Rcode = %d, want NOERROR", w.Msg.Rcode)
+	}
 	if len(w.Msg.Answer) != 1 {
 		t.Fatalf("answers = %d, want 1", len(w.Msg.Answer))
 	}
@@ -126,6 +151,47 @@ func TestServeDNSCrossZoneAnswersGateway(t *testing.T) {
 	}
 	if a.Hdr.Ttl != 30 {
 		t.Fatalf("ttl = %d, want 30", a.Hdr.Ttl)
+	}
+}
+
+// 專案唯一支援的傳輸方式是 DoH（見 setup.go 的 warnIfDoT），身分擷取走的是
+// context 裡的 *http.Request，而非對 writer 做型別斷言那條路徑。這個測試確保
+// ServeDNS 真的把呼叫端傳入的 ctx 往下傳給 Identity.SourceZone —— 若不小心
+// 改成 context.Background()，所有帶 DoT ConnectionStater 的測試仍會通過（它們
+// 走的是另一條分支），只有這個測試會發現迴歸。
+func TestServeDNSDoHCrossZoneAnswersGateway(t *testing.T) {
+	next := &nextCalled{}
+	h := newHandler(t, next)
+
+	m := new(dns.Msg)
+	m.SetQuestion("payments.example.com.", dns.TypeA)
+	ednszone.Set(m, ednszone.DefaultCode, "zone-b")
+
+	cert := testcerts.New(t, testAgentID)
+	req := &http.Request{TLS: &tls.ConnectionState{PeerCertificates: []*x509.Certificate{cert}}}
+	ctx := context.WithValue(context.Background(), dnsserver.HTTPRequestKey{}, req)
+
+	w := &dohWriter{ResponseWriter: &test.ResponseWriter{}}
+
+	code, err := h.ServeDNS(ctx, w, m)
+	if err != nil {
+		t.Fatalf("ServeDNS: %v", err)
+	}
+	if code != dns.RcodeSuccess {
+		t.Fatalf("rcode = %d, want NOERROR", code)
+	}
+	if next.called {
+		t.Fatal("cross-zone query must not reach the next plugin")
+	}
+	if w.Msg == nil || len(w.Msg.Answer) != 1 {
+		t.Fatalf("answers = %v, want 1", w.Msg)
+	}
+	a, isA := w.Msg.Answer[0].(*dns.A)
+	if !isA {
+		t.Fatalf("answer is %T, want *dns.A", w.Msg.Answer[0])
+	}
+	if a.A.String() != "203.0.113.10" {
+		t.Fatalf("answer = %s, want 203.0.113.10", a.A)
 	}
 }
 
@@ -202,6 +268,14 @@ func TestServeDNSCrossZoneAAAAWithIPv4GatewayReturnsNoData(t *testing.T) {
 	}
 	if code != dns.RcodeSuccess {
 		t.Fatalf("rcode = %d, want NOERROR", code)
+	}
+	// NODATA means NOERROR with an empty answer section, as seen by the client —
+	// not just ServeDNS's return value. Without this, a mutation that sets
+	// m.Rcode = dns.RcodeNameError whenever the answer is empty (turning NODATA
+	// into NXDOMAIN, which makes clients abandon the A lookup too) would leave
+	// the suite green.
+	if w.Msg.Rcode != dns.RcodeSuccess {
+		t.Fatalf("w.Msg.Rcode = %d, want NOERROR", w.Msg.Rcode)
 	}
 	if len(w.Msg.Answer) != 0 {
 		t.Fatalf("answers = %d, want 0", len(w.Msg.Answer))

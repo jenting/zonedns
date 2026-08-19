@@ -63,7 +63,14 @@ func (z ZoneDNS) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg)
 		log.Errorf("no gateway configured for zone %q while answering %q; check the zonedns gateway settings",
 			destZone, state.Name())
 		return dns.RcodeServerFailure, nil
+	case decision.ActionPassThrough:
+		return plugin.NextOrFailure(z.Name(), z.Next, ctx, w, r)
 	default:
+		// decision.Decide should never return anything else, but this project's
+		// dominant failure mode is fail-open: a future action (e.g. "refuse" or
+		// "drop") landing here by mistake must not be silently treated as
+		// pass-through without at least a loud, alertable log line.
+		log.Errorf("unhandled decision action %q for %q; treating as pass-through", d.Action, state.Name())
 		return plugin.NextOrFailure(z.Name(), z.Next, ctx, w, r)
 	}
 }
@@ -96,6 +103,8 @@ func (z ZoneDNS) answerGateway(state request.Request, gw string) (int, error) {
 		m.Answer = []dns.RR{&dns.AAAA{Hdr: hdr, AAAA: ip.To16()}}
 	}
 
-	state.W.WriteMsg(m)
+	if err := state.W.WriteMsg(m); err != nil {
+		log.Errorf("write gateway answer for %q: %v", state.QName(), err)
+	}
 	return dns.RcodeSuccess, nil
 }

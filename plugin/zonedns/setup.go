@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,7 +44,8 @@ type config struct {
 	ttl              uint32
 	zones            *zonetable.Table
 	workloadAPI      string // 僅在 spire_server 為網路位址時需要
-	trustDomain      string // 同上，用於驗證 SPIRE Server 的身分
+	trustDomain      string // 同上；不再用於驗證身分 —— spire_server_id 直接釘住確切身分，見 dialSPIRE
+	spireServerID    string // 同上，SPIRE Server 的 SPIFFE ID；network address 時必填，見下方驗證
 }
 
 // CheckDirectiveOrder 確認 zonedns 排在 cache 之前。
@@ -107,6 +109,12 @@ func setup(c *caddy.Controller) error {
 	}
 
 	store := registry.NewStore()
+	// registryReady is a package-level gauge shared across Corefile reloads. Without
+	// this reset it would keep reporting the *previous* instance's readiness (1) for
+	// up to a full poll_interval after a reload, while the new (empty) Store silently
+	// takes the non-zone-aware path on every query — the metric would lie exactly
+	// when it matters most.
+	registryReady.Set(0)
 
 	conn, cleanup, err := dialSPIRE(cfg)
 	if err != nil {
@@ -169,9 +177,12 @@ func dialSPIRE(cfg *config) (*grpc.ClientConn, func(), error) {
 		return nil, nil, fmt.Errorf("spire_server %q is a network address, so workload_api must also be set "+
 			"to obtain the admin SVID used to authenticate to the Entry API", cfg.spireServer)
 	}
-	td, err := spiffeid.TrustDomainFromString(cfg.trustDomain)
+	// spire_server_id is required by parseConfig whenever spireServer is a network
+	// address, so this should never actually fail — but dialSPIRE must not trust
+	// that invariant blindly.
+	serverID, err := spiffeid.FromString(cfg.spireServerID)
 	if err != nil {
-		return nil, nil, fmt.Errorf("invalid trust_domain %q: %w", cfg.trustDomain, err)
+		return nil, nil, fmt.Errorf("invalid spire_server_id %q: %w", cfg.spireServerID, err)
 	}
 
 	source, err := workloadapi.NewX509Source(context.Background(),
@@ -180,7 +191,12 @@ func dialSPIRE(cfg *config) (*grpc.ClientConn, func(), error) {
 		return nil, nil, fmt.Errorf("create X509Source from %q: %w", cfg.workloadAPI, err)
 	}
 
-	creds := grpccredentials.MTLSClientCredentials(source, source, tlsconfig.AuthorizeMemberOf(td))
+	// AuthorizeID pins the exact SPIFFE ID that must present the server certificate.
+	// AuthorizeMemberOf would instead accept *any* SVID in the trust domain as "the
+	// SPIRE Server" — an attacker holding any workload SVID who can intercept this
+	// connection could serve a forged registry and map arbitrary names to arbitrary
+	// zones, compromising every routing decision the plugin makes.
+	creds := grpccredentials.MTLSClientCredentials(source, source, tlsconfig.AuthorizeID(serverID))
 	conn, err := grpc.NewClient(cfg.spireServer, grpc.WithTransportCredentials(creds))
 	if err != nil {
 		source.Close()
@@ -214,6 +230,11 @@ func parseConfig(c *caddy.Controller) (*config, error) {
 				if err != nil {
 					return nil, c.Errf("invalid poll_interval %q: %v", c.Val(), err)
 				}
+				// A zero or negative interval reaches time.NewTicker inside the
+				// OnStartup goroutine, which panics and crashes the process.
+				if d <= 0 {
+					return nil, c.Errf("poll_interval must be positive, got %q", c.Val())
+				}
 				cfg.pollInterval = d
 
 			case "authorized_agent":
@@ -226,14 +247,17 @@ func parseConfig(c *caddy.Controller) (*config, error) {
 				if !c.NextArg() {
 					return nil, c.ArgErr()
 				}
-				var code uint16
-				if _, err := fmt.Sscanf(c.Val(), "%d", &code); err != nil {
+				// strconv.ParseUint (unlike fmt.Sscanf with "%d") rejects trailing
+				// garbage outright instead of silently stopping at the first
+				// non-digit character.
+				code, err := strconv.ParseUint(c.Val(), 10, 16)
+				if err != nil {
 					return nil, c.Errf("invalid edns0_code %q: %v", c.Val(), err)
 				}
-				if code < 65001 {
+				if code < 65001 || code > 65534 {
 					return nil, c.Errf("edns0_code %d is outside the local/experimental range 65001-65534", code)
 				}
-				cfg.edns0Code = code
+				cfg.edns0Code = uint16(code)
 
 			case "workload_api":
 				if !c.NextArg() {
@@ -247,20 +271,33 @@ func parseConfig(c *caddy.Controller) (*config, error) {
 				}
 				cfg.trustDomain = c.Val()
 
+			case "spire_server_id":
+				if !c.NextArg() {
+					return nil, c.ArgErr()
+				}
+				cfg.spireServerID = c.Val()
+
 			case "ttl":
 				if !c.NextArg() {
 					return nil, c.ArgErr()
 				}
-				var ttl uint32
-				if _, err := fmt.Sscanf(c.Val(), "%d", &ttl); err != nil {
+				// strconv.ParseUint rejects duration-shaped values ("5m", "30s")
+				// and trailing garbage ("30.5", "65001abc") outright, where
+				// fmt.Sscanf with "%d" would silently stop at the first
+				// non-digit and accept a truncated prefix.
+				ttl, err := strconv.ParseUint(c.Val(), 10, 32)
+				if err != nil {
 					return nil, c.Errf("invalid ttl %q: %v", c.Val(), err)
 				}
-				cfg.ttl = ttl
+				cfg.ttl = uint32(ttl)
 
 			case "gateway":
 				args := c.RemainingArgs()
 				if len(args) != 2 {
 					return nil, c.Errf("gateway needs a zone and an address, got %d arguments", len(args))
+				}
+				if _, dup := gateways[args[0]]; dup {
+					return nil, c.Errf("gateway for zone %q is already configured", args[0])
 				}
 				addr, err := netip.ParseAddr(args[1])
 				if err != nil {
@@ -281,6 +318,15 @@ func parseConfig(c *caddy.Controller) (*config, error) {
 	// 這一定是設定錯誤，不是合法組態。
 	if len(cfg.authorizedAgents) == 0 {
 		return nil, c.Err("at least one authorized_agent is required")
+	}
+	// spire_server 是網路位址時，dialSPIRE 走 mTLS，必須用 spire_server_id 釘住
+	// SPIRE Server 的確切身分。少了它就只能驗證「trust domain 內的某個成員」，
+	// 任何持有同 trust domain SVID 的攻擊者攔截連線後都能冒充 SPIRE Server、
+	// 餵一份偽造的 registry，進而左右所有路由決策 —— 必須 fail closed。
+	// unix:// 走本機 socket，不受影響，不需要這個欄位。
+	if !strings.HasPrefix(cfg.spireServer, "unix://") && cfg.spireServerID == "" {
+		return nil, c.Err("spire_server_id is required when spire_server is a network address, to authenticate " +
+			"the SPIRE Server by its exact identity rather than merely by trust domain membership")
 	}
 
 	cfg.zones = zonetable.New(gateways)
