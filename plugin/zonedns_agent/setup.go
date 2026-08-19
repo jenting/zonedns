@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"net/url"
 	"os"
 	"strconv"
+	"sync/atomic"
 
 	"github.com/coredns/caddy"
 	"github.com/coredns/coredns/core/dnsserver"
@@ -69,6 +71,40 @@ func CheckDirectiveOrder(directives []string) error {
 	return nil
 }
 
+// resolverGeneration 為每一次啟動 k8s watcher 配發一個遞增的世代編號；
+// resolverReadyGeneration 記錄「最近一次被標成就緒」的是哪個世代。兩者都是
+// package 層級、跨越多次 setup() 呼叫共用的狀態。
+//
+// 理由：reload 期間新舊兩個 watcher 的生命週期會重疊 —— coredns/caddy 的
+// Instance.Restart 先把新 instance 完整啟動（含這裡的 c.OnStartup）成功之後，
+// 才去呼叫舊 instance 的 Stop 與 OnShutdown。若舊 watcher 因為自己的 ctx 被
+// 取消而想把 resolverReady 歸零，這個歸零可能發生在新 watcher 已經同步完成、
+// 把 gauge 設成 1 之後 —— 兩個 goroutine 之間沒有任何順序保證，較舊世代的
+// 歸零會蓋掉較新世代已經回報的就緒狀態，而且蓋掉之後不會再有任何事件把它
+// 修回來（每個 watcher 的 OnReady 只呼叫一次）。世代編號讓「要歸零」的那一刻
+// 可以自問「我是不是最後一個真正就緒的世代」，不是的話就什麼都不做。
+var (
+	resolverGeneration      atomic.Uint64
+	resolverReadyGeneration atomic.Uint64
+)
+
+// markResolverReady 記錄 gen 這個世代已經同步完成。呼叫端一律可以直接標成
+// 就緒，因為 OnReady 只會在真正同步完成時觸發一次，永遠代表目前已知最新的
+// 事實 —— 不需要跟任何人比較。
+func markResolverReady(gen uint64) {
+	resolverReadyGeneration.Store(gen)
+	resolverReady.Set(1)
+}
+
+// markResolverStopped 記錄 gen 這個世代的 watcher 已經停止。只有在還沒有
+// 更新的世代取得就緒狀態時才把 gauge 歸零，理由見 resolverGeneration 上的
+// 註解。
+func markResolverStopped(gen uint64) {
+	if resolverReadyGeneration.Load() == gen {
+		resolverReady.Set(0)
+	}
+}
+
 func setup(c *caddy.Controller) error {
 	if err := CheckDirectiveOrder(dnsserver.Directives); err != nil {
 		return plugin.Error("zonedns_agent", err)
@@ -117,11 +153,17 @@ func setup(c *caddy.Controller) error {
 		}
 		w := podzone.New(client, cfg.nodeName, cfg.zoneLabel)
 		resolver = w
-		resolverReady.Set(0)
-		// OnReady 在 informer 首次完成同步後被呼叫一次；在那之前 resolverReady
-		// 必須留在 0，否則這個 gauge 會回報「就緒」而 watcher 其實還沒有任何
-		// pod 的對照資料。
-		w.OnReady = func() { resolverReady.Set(1) }
+
+		// 這裡刻意不把 resolverReady 設成 0：此刻只是「正在解析新的設定」，
+		// 舊 instance（如果這是一次 reload）仍在正常回答查詢，把全域共用的
+		// gauge 提早歸零會製造一個假的「未就緒」窗口，讓每一次 reload 都觸發
+		// resolver_ready==0 的告警，即使服務完全沒有中斷。gauge 維持它原本
+		// 的值 —— 冷啟動時是 promauto 給的預設 0，reload 時是舊 instance 留下
+		// 的 1 —— 直到下面兩個事件之一真正發生：這個 watcher 同步完成
+		// （OnReady）或它被關閉（ctx.Done）。世代編號的用途見上方
+		// resolverGeneration 的註解。
+		gen := resolverGeneration.Add(1)
+		w.OnReady = func() { markResolverReady(gen) }
 		c.OnStartup(func() error {
 			go func() {
 				if err := w.Run(ctx); err != nil {
@@ -130,7 +172,7 @@ func setup(c *caddy.Controller) error {
 			}()
 			go func() {
 				<-ctx.Done()
-				resolverReady.Set(0)
+				markResolverStopped(gen)
 			}()
 			return nil
 		})
@@ -160,10 +202,18 @@ func parseConfig(c *caddy.Controller) (*config, error) {
 		edns0Code: ednszone.DefaultCode,
 		zoneLabel: "zone",
 	}
+	// 一個設了但解不開的 NODE_IP 必須是錯誤，而不是悄悄當成沒設：masquerade
+	// 偵測（Agent.resolveZone 比對來源位址是不是節點自己的 IP）是唯一會告訴
+	// 操作者「這個節點上有東西在改寫來源位址、已經退化成單一 zone」的訊號，
+	// DaemonSet manifest 裡打錯一個字元就讓它悄悄失效，且沒有任何記錄，正是
+	// 這個專案一路在消除的那種失敗模式。行為要跟下面 Corefile 的 node_ip
+	// 選項一致——那裡同樣的解析錯誤會讓啟動失敗。
 	if v := os.Getenv("NODE_IP"); v != "" {
-		if addr, err := netip.ParseAddr(v); err == nil {
-			cfg.nodeIP = addr
+		addr, err := netip.ParseAddr(v)
+		if err != nil {
+			return nil, c.Errf("invalid NODE_IP environment variable %q: %v", v, err)
 		}
+		cfg.nodeIP = addr
 	}
 
 	for c.Next() {
@@ -252,6 +302,20 @@ func parseConfig(c *caddy.Controller) (*config, error) {
 	}
 	if cfg.upstreamURL == "" {
 		return nil, c.Err("upstream is required")
+	}
+	// upstream 必須是 https:// —— NewMTLS 建出來的 client 整套存在的理由就是
+	// 用 SPIFFE ID 釘住 central 的身分；一個 http:// 的 upstream 會讓查詢走
+	// 純文字傳輸，http.Transport 的 TLSClientConfig（也就是那個 AuthorizeID
+	// pin）根本不會被用上，等於一個字元就讓 mTLS 釘住整套形同虛設，且沒有
+	// 任何錯誤或警告，查詢照常送出去。
+	u, err := url.Parse(cfg.upstreamURL)
+	if err != nil {
+		return nil, c.Errf("invalid upstream %q: %v", cfg.upstreamURL, err)
+	}
+	if u.Scheme != "https" {
+		return nil, c.Errf("upstream %q must use https; a plain %q upstream would send DoH queries in "+
+			"cleartext, bypassing the SPIFFE server pinning NewMTLS exists to provide entirely",
+			cfg.upstreamURL, u.Scheme)
 	}
 	// central_spiffe_id 沒有安全的預設值：少了它就只剩憑證鏈驗證，信任域內任何
 	// 一張 SVID 都能冒充 central 並回傳任意答案。
