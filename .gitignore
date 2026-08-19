@@ -1,0 +1,10 @@
+# Go
+*.exe
+*.test
+*.out
+vendor/
+
+# 編輯器與作業系統
+.DS_Store
+.idea/
+.vscode/
