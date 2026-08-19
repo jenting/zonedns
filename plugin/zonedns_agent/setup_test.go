@@ -50,7 +50,7 @@ func TestParseVMMode(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode vm
 		zone zone-c
-		upstream https://central.example.org/dns-query
+		upstream https://central.example.org
 		central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
 		workload_api unix:///run/spire/sockets/agent.sock
 		cache_size 4096
@@ -76,7 +76,7 @@ func TestParseK8sMode(t *testing.T) {
 		mode k8s
 		node_name node-1
 		zone_label zone
-		upstream https://central.example.org/dns-query
+		upstream https://central.example.org
 		central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
 		workload_api unix:///run/spire/sockets/agent.sock
 	}`)
@@ -102,7 +102,7 @@ func TestParseRequiresCentralSPIFFEID(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode vm
 		zone zone-c
-		upstream https://central.example.org/dns-query
+		upstream https://central.example.org
 		workload_api unix:///run/spire/sockets/agent.sock
 	}`)
 	if _, err := parseConfig(c); err == nil {
@@ -113,7 +113,7 @@ func TestParseRequiresCentralSPIFFEID(t *testing.T) {
 func TestParseVMModeRequiresZone(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode vm
-		upstream https://central.example.org/dns-query
+		upstream https://central.example.org
 		central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
 		workload_api unix:///run/spire/sockets/agent.sock
 	}`)
@@ -126,7 +126,7 @@ func TestParseVMModeRejectsMalformedZone(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode vm
 		zone zone.c
-		upstream https://central.example.org/dns-query
+		upstream https://central.example.org
 		central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
 		workload_api unix:///run/spire/sockets/agent.sock
 	}`)
@@ -138,7 +138,7 @@ func TestParseVMModeRejectsMalformedZone(t *testing.T) {
 func TestParseK8sModeRequiresNodeName(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode k8s
-		upstream https://central.example.org/dns-query
+		upstream https://central.example.org
 		central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
 		workload_api unix:///run/spire/sockets/agent.sock
 	}`)
@@ -150,7 +150,7 @@ func TestParseK8sModeRequiresNodeName(t *testing.T) {
 func TestParseRejectsUnknownMode(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode kubernetes
-		upstream https://central.example.org/dns-query
+		upstream https://central.example.org
 		central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
 	}`)
 	if _, err := parseConfig(c); err == nil {
@@ -163,7 +163,7 @@ func TestParseRejectsNonPositiveCacheSize(t *testing.T) {
 		c := caddy.NewTestController("dns", `zonedns_agent {
 			mode vm
 			zone zone-c
-			upstream https://central.example.org/dns-query
+			upstream https://central.example.org
 			central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
 			workload_api unix:///run/spire/sockets/agent.sock
 			cache_size `+v+`
@@ -178,7 +178,7 @@ func TestParseRejectsMalformedCacheSize(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode vm
 		zone zone-c
-		upstream https://central.example.org/dns-query
+		upstream https://central.example.org
 		central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
 		workload_api unix:///run/spire/sockets/agent.sock
 		cache_size 4096abc
@@ -195,7 +195,7 @@ func TestParseRejectsHTTPUpstream(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode vm
 		zone zone-c
-		upstream http://central.example.org/dns-query
+		upstream http://central.example.org
 		central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
 		workload_api unix:///run/spire/sockets/agent.sock
 	}`)
@@ -216,11 +216,51 @@ func TestParseRejectsMalformedUpstreamURL(t *testing.T) {
 	parseConfigErr(t, c)
 }
 
+// upstream 帶路徑必須在啟動時被擋下。CoreDNS 的 doh 套件會自己接上 "/dns-query"，
+// 所以帶路徑的值會變成 "/dns-query/dns-query" 並得到 HTTP 404 —— 一個在執行期
+// 完全指不到原因的錯誤。這個案例是本專案第一次在真實環境跑起來時發現的。
+func TestParseRejectsUpstreamWithPath(t *testing.T) {
+	for _, u := range []string{
+		"https://central.example.org/dns-query",
+		"https://central.example.org:8443/dns-query",
+		"https://central.example.org/anything",
+	} {
+		c := caddy.NewTestController("dns", `zonedns_agent {
+			mode vm
+			zone zone-c
+			upstream `+u+`
+			central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
+			workload_api unix:///run/spire/sockets/agent.sock
+		}`)
+		_, err := parseConfig(c)
+		if err == nil {
+			t.Fatalf("upstream %q with a path was accepted", u)
+		}
+		if !strings.Contains(err.Error(), "dns-query") {
+			t.Fatalf("upstream %q: error should explain the fixed DoH path, got: %v", u, err)
+		}
+	}
+}
+
+// 只有一個斜線不算路徑 —— 那是 URL 的正常寫法，不該擋。
+func TestParseAcceptsUpstreamWithTrailingSlash(t *testing.T) {
+	c := caddy.NewTestController("dns", `zonedns_agent {
+		mode vm
+		zone zone-c
+		upstream https://central.example.org/
+		central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
+		workload_api unix:///run/spire/sockets/agent.sock
+	}`)
+	if _, err := parseConfig(c); err != nil {
+		t.Fatalf("a bare trailing slash should be accepted: %v", err)
+	}
+}
+
 func TestParseAcceptsHTTPSUpstream(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode vm
 		zone zone-c
-		upstream https://central.example.org/dns-query
+		upstream https://central.example.org
 		central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
 		workload_api unix:///run/spire/sockets/agent.sock
 	}`)
@@ -248,7 +288,7 @@ func TestParseNodeIPEnvRejectsMalformed(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode vm
 		zone zone-c
-		upstream https://central.example.org/dns-query
+		upstream https://central.example.org
 		central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
 		workload_api unix:///run/spire/sockets/agent.sock
 	}`)
@@ -264,7 +304,7 @@ func TestParseNodeIPEnvAbsentLeavesNodeIPUnset(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode vm
 		zone zone-c
-		upstream https://central.example.org/dns-query
+		upstream https://central.example.org
 		central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
 		workload_api unix:///run/spire/sockets/agent.sock
 	}`)
@@ -280,7 +320,7 @@ func TestParseNodeIPEnvAbsentLeavesNodeIPUnset(t *testing.T) {
 func TestParseMissingModeArgument(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode
-		upstream https://central.example.org/dns-query
+		upstream https://central.example.org
 		central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
 		workload_api unix:///run/spire/sockets/agent.sock
 	}`)
@@ -293,7 +333,7 @@ func TestParseMissingZoneArgument(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode vm
 		zone
-		upstream https://central.example.org/dns-query
+		upstream https://central.example.org
 		central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
 		workload_api unix:///run/spire/sockets/agent.sock
 	}`)
@@ -310,7 +350,7 @@ func TestParseEdns0Code(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode vm
 		zone zone-c
-		upstream https://central.example.org/dns-query
+		upstream https://central.example.org
 		central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
 		workload_api unix:///run/spire/sockets/agent.sock
 		edns0_code 65002
@@ -328,7 +368,7 @@ func TestParseEdns0CodeDefault(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode vm
 		zone zone-c
-		upstream https://central.example.org/dns-query
+		upstream https://central.example.org
 		central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
 		workload_api unix:///run/spire/sockets/agent.sock
 	}`)
@@ -346,7 +386,7 @@ func TestParseRejectsOutOfRangeEdns0Code(t *testing.T) {
 		c := caddy.NewTestController("dns", `zonedns_agent {
 			mode vm
 			zone zone-c
-			upstream https://central.example.org/dns-query
+			upstream https://central.example.org
 			central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
 			workload_api unix:///run/spire/sockets/agent.sock
 			edns0_code `+v+`
@@ -361,7 +401,7 @@ func TestParseRejectsMalformedEdns0Code(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode vm
 		zone zone-c
-		upstream https://central.example.org/dns-query
+		upstream https://central.example.org
 		central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
 		workload_api unix:///run/spire/sockets/agent.sock
 		edns0_code 65002abc
@@ -379,7 +419,7 @@ func TestParseVMModeRejectsNodeName(t *testing.T) {
 		mode vm
 		zone zone-c
 		node_name node-1
-		upstream https://central.example.org/dns-query
+		upstream https://central.example.org
 		central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
 		workload_api unix:///run/spire/sockets/agent.sock
 	}`)
@@ -396,7 +436,7 @@ func TestParseK8sModeRejectsZone(t *testing.T) {
 		mode k8s
 		node_name node-1
 		zone zone-c
-		upstream https://central.example.org/dns-query
+		upstream https://central.example.org
 		central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
 		workload_api unix:///run/spire/sockets/agent.sock
 	}`)
@@ -410,7 +450,7 @@ func TestParseRejectsUnknownProperty(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode vm
 		zone zone-c
-		upstream https://central.example.org/dns-query
+		upstream https://central.example.org
 		central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
 		workload_api unix:///run/spire/sockets/agent.sock
 		bogus_property yes
@@ -590,7 +630,7 @@ func fakeUpstreamConstructor(cleanupCalls *int, capturedCtx *context.Context) fu
 const vmModeConfig = `zonedns_agent {
 	mode vm
 	zone zone-c
-	upstream https://central.example.org/dns-query
+	upstream https://central.example.org
 	central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
 	workload_api unix:///run/spire/sockets/agent.sock
 }`
@@ -676,7 +716,7 @@ func TestSetupK8sModeFailurePathRunsCleanup(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode k8s
 		node_name node-1
-		upstream https://central.example.org/dns-query
+		upstream https://central.example.org
 		central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
 		workload_api unix:///run/spire/sockets/agent.sock
 	}`)

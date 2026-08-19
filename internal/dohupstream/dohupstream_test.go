@@ -222,3 +222,54 @@ func TestNewMTLSRequiresCentralSPIFFEID(t *testing.T) {
 		t.Fatalf("error should name the missing option: %v", err)
 	}
 }
+
+// Exchange 送出的請求路徑必須恰好是 "/dns-query"。
+//
+// CoreDNS 的 doh.NewRequestWithContext 自己會接上那段路徑，所以呼叫端給的 URL
+// 不可再帶路徑。這個假設一直沒有被測到：其他測試都用 httptest 的 srv.URL（剛好
+// 不帶路徑），而 echoServer 又接受任何路徑，兩邊互補地遮蔽了它 —— 實際部署時
+// 帶路徑的 URL 會被 central 以 HTTP 404 拒絕。
+func TestExchangeRequestsTheDoHPathExactlyOnce(t *testing.T) {
+	var seenPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		req, err := doh.RequestToMsg(r)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		resp := new(dns.Msg)
+		resp.SetReply(req)
+		packed, _ := resp.Pack()
+		w.Header().Set("Content-Type", "application/dns-message")
+		w.Write(packed)
+	}))
+	defer srv.Close()
+
+	if _, err := NewWithHTTPClient(srv.URL, srv.Client()).Exchange(context.Background(), query()); err != nil {
+		t.Fatalf("Exchange: %v", err)
+	}
+	if seenPath != "/dns-query" {
+		t.Fatalf("request path = %q, want %q", seenPath, "/dns-query")
+	}
+}
+
+// 給了帶路徑的 URL，路徑會被重複附加 —— 記錄這個上游行為，因為呼叫端的設定
+// 驗證正是為了擋下它而存在。
+func TestExchangeDoublesAPathAlreadyInTheURL(t *testing.T) {
+	var seenPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	_, err := NewWithHTTPClient(srv.URL+"/dns-query", srv.Client()).Exchange(context.Background(), query())
+	if err == nil {
+		t.Fatal("expected the doubled path to be rejected by the server")
+	}
+	if seenPath != "/dns-query/dns-query" {
+		t.Fatalf("request path = %q, want %q — the upstream helper is expected to append the path itself",
+			seenPath, "/dns-query/dns-query")
+	}
+}

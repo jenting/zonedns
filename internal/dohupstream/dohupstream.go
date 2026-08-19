@@ -41,6 +41,16 @@ const defaultQueryTimeout = 5 * time.Second
 
 // Config 是建立 mTLS client 所需的設定。
 type Config struct {
+	// URL 是 central 的位址，**不含路徑**。
+	//
+	// CoreDNS 的 doh.NewRequestWithContext 會自己接上 "/dns-query"（它的註解
+	// 明講 "The URL should not have a path"），所以這裡若給了
+	// "https://central/dns-query"，實際請求會是 "/dns-query/dns-query"，central
+	// 的 DoH server 回 404，而 agent 只看得到「上游回 HTTP 404」。
+	//
+	// 這個契約一度沒有被寫下來也沒有被測試：所有單元測試都用 httptest 的
+	// srv.URL（剛好不帶路徑），而測試用的假伺服器又接受任何路徑，兩邊互補地
+	// 遮蔽了它。呼叫端的設定驗證負責在啟動時擋下帶路徑的值。
 	URL             string
 	WorkloadAPIAddr string
 	CentralSPIFFEID string

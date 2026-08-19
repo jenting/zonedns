@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -395,6 +396,18 @@ func parseConfig(c *caddy.Controller) (*config, error) {
 		return nil, c.Errf("upstream %q must use https; a plain %q upstream would send DoH queries in "+
 			"cleartext, bypassing the SPIFFE server pinning NewMTLS exists to provide entirely",
 			cfg.upstreamURL, u.Scheme)
+	}
+	// upstream 不可帶路徑。CoreDNS 的 doh.NewRequestWithContext 會自己接上
+	// "/dns-query"，所以 "https://central/dns-query" 會變成
+	// "/dns-query/dns-query"，central 回 404，而這裡看到的只會是「上游回
+	// HTTP 404」—— 對維運的人來說完全指不到原因。
+	//
+	// 選擇拒絕而不是自動去掉：一個被靜默改寫的設定值比一個啟動就失敗的設定值
+	// 危險，而這正是本專案反覆在消除的那種失效形態。
+	if p := strings.TrimSuffix(u.Path, "/"); p != "" {
+		return nil, c.Errf("upstream %q must not include a path; the DoH path is always %q and is "+
+			"appended automatically, so %q would be requested as %q and answered with HTTP 404",
+			cfg.upstreamURL, "/dns-query", u.Path, u.Path+"/dns-query")
 	}
 	// central_spiffe_id 沒有安全的預設值：少了它就只剩憑證鏈驗證，信任域內任何
 	// 一張 SVID 都能冒充 central 並回傳任意答案。

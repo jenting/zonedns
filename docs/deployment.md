@@ -302,7 +302,7 @@ example.com:53 {
         mode              k8s
         node_name         {$NODE_NAME}
         zone_label        zone
-        upstream          https://central.example.org/dns-query
+        upstream          https://central.example.org:8443
         central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
         workload_api      unix:///run/spire/sockets/agent.sock
         cache_size        4096
@@ -321,7 +321,7 @@ example.com:53 {
     zonedns_agent {
         mode              vm
         zone              zone-c
-        upstream          https://central.example.org/dns-query
+        upstream          https://central.example.org:8443
         central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
         workload_api      unix:///run/spire/sockets/agent.sock
         cache_size        4096
@@ -340,7 +340,7 @@ zone），改用 `zone` 直接指定。
 | 選項 | 必要性 | 說明 |
 |---|---|---|
 | `mode` | **必要**，`k8s` 或 `vm` | 決定用哪一種 `ZoneResolver`。其他值直接拒絕。 |
-| `upstream` | **必要** | 必須是 `https://` URL。純 `http://` 會在啟動時被拒絕 —— 不是風格偏好：走純文字傳輸時，`http.Transport` 的 `TLSClientConfig` 根本不會被用上，`central_spiffe_id` 的 SPIFFE pin 形同虛設，而且不會有任何錯誤或警告，查詢照常送出去。 |
+| `upstream` | **必要** | central 的位址，**不含路徑**。DoH 路徑固定是 `/dns-query`，由 CoreDNS 的 doh 套件自動接上；若自己寫進去，實際請求會變成 `/dns-query/dns-query`，central 回 HTTP 404，而 agent 端只看得到「上游回 404」，指不到原因 —— 因此帶路徑的值會在啟動時被拒絕。必須是 `https://` URL。純 `http://` 會在啟動時被拒絕 —— 不是風格偏好：走純文字傳輸時，`http.Transport` 的 `TLSClientConfig` 根本不會被用上，`central_spiffe_id` 的 SPIFFE pin 形同虛設，而且不會有任何錯誤或警告，查詢照常送出去。 |
 | `central_spiffe_id` | **必要，無預設值** | 少了它，信任域內任何一張 SVID 都能冒充 central，而 agent 對收到的答案沒有任何獨立查核手段，會完整採信。 |
 | `workload_api` | **必要** | agent 自己的 SPIRE Workload API socket，取得出示給 central 的 SVID。 |
 | `zone` | `vm` 模式**必要** | 該 VM 所屬的 zone；必須通過 `ednszone.Valid`（字母、數字、`-`、`_`，長度不超過 63 bytes），否則 central 會靜默忽略這台 VM 的 zone 宣告。 |
