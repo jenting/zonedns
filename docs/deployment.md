@@ -348,15 +348,10 @@ zone），改用 `zone` 直接指定。
 | `zone_label` | 選填，預設 `zone` | 讀取 pod 上哪一個 label 當作 zone；必須跟 SPIRE 的 `spiffeIDTemplate` 讀的是同一個 label（見 central 部署一節），否則節點端判定的 zone 會跟 registry 裡的 zone 對不上。 |
 | `cache_size` | 選填，預設 `4096` | zone-aware 快取的筆數上限；必須是正整數。 |
 | `node_ip` | 選填，也可用 `NODE_IP` 環境變數 | 本機節點自己的位址，僅用於偵測 masquerade（source IP 等於節點 IP 時無法判斷是哪個 workload 在問）。**兩個來源中任一個若給了格式錯誤的值，都是啟動失敗，不是被靜默忽略** —— 這個位址是 masquerade 偵測唯一的依據，DaemonSet manifest 裡打錯一個字元若被吞掉，就會沒有任何記錄地讓這個訊號永遠不動。Corefile 的 `node_ip` 優先於環境變數（後解析）。 |
+| `edns0_code` | 選填，預設 `65001` | agent/central 之間攜帶 source zone 的 EDNS0 option code，須落在 IANA local/experimental 區間 `65001`–`65534`，驗證規則與 central 端的 `edns0_code`（見本文件前段）完全一致。**必須與 central Corefile 的 `edns0_code` 相同**，見下一節。 |
 
 `central_spiffe_id`、`workload_api`、`cache_size` 在 k8s／vm 兩種模式下語意相同，
 不隨模式改變。
-
-沒有 `edns0_code` 選項：agent 端固定使用 `ednszone.DefaultCode`
-（`65001`，與 central 端的預設值相同），不能個別調整。若 central 那邊把
-`edns0_code` 改成非預設值，兩端就會用不同的 EDNS0 option code 溝通 ——
-agent 宣告的 zone 會被 central 忽略，查詢仍然「正常」回應，只是回退到非
-zone-aware 的一般答案。
 
 ## RBAC
 
@@ -410,6 +405,13 @@ zone 路由的信任關係是雙向釘住的，兩邊都要改，改一邊就會
   換了憑證但這裡沒同步更新），mTLS 握手會直接失敗，`upstream_errors_total`
   上升、查詢回 SERVFAIL —— 這一側的失效不是靜默的，因為 `AuthorizeID` 拒絕連線
   本身就是可觀測事件。
+- **agent ↔ central 的 `edns0_code`**：兩端 Corefile 的 `edns0_code` 必須是
+  同一個值。兩邊都有各自的預設值 `65001`，只要都不改就自動一致；一旦其中一端
+  被改成非預設值而另一端沒有同步，agent 會繼續在它自己的 code 上寫入 zone，
+  但 central 端的 `ednszone.Get` 讀的是另一個 code，等於「沒有這個 option」——
+  查詢仍然「正常」回應，只是每一筆都回退到非 zone-aware 的一般答案，
+  且沒有任何一端的啟動流程能偵測出這個不一致（兩個值各自都通過各自的
+  範圍檢查）。改動任一端的 `edns0_code` 之前，先確認另一端會同時改。
 
 新增一個節點時，記得把它的 SPIFFE ID（由 SPIRE registration entry 決定，見
 central 部署一節）加進 `authorized_agent`；除役一個節點時記得從清單移除，

@@ -224,6 +224,30 @@ func TestNsAndExtraRecordsTTLRewritten(t *testing.T) {
 	}
 }
 
+// 即使上游答案自帶的 TTL 遠超過 maxTTL（例如同 zone 分支直接轉發上游答案，
+// TTL 可能長達數小時），實際存活時間也不可超過 maxTTL —— 否則一個名字被登記
+// 進 registry 或改了 zone 之後，節點會繼續回覆舊答案直到那個很長的 TTL 走完。
+func TestPutCapsTTLAtMax(t *testing.T) {
+	c, _ := New(16)
+	c.Put("payments.example.com.", dns.TypeA, "zone-a", reply("payments.example.com.", 3600, "10.96.0.7"), base)
+
+	// 剛存進去、還沒到 maxTTL 之前必須是 hit，且回傳的 TTL 以 maxTTL（不是
+	// 原始的 3600 秒）為準。
+	got, ok := c.Get("payments.example.com.", dns.TypeA, "zone-a", base.Add(1*time.Second))
+	if !ok {
+		t.Fatal("entry missing before the cap")
+	}
+	wantTTL := uint32(maxTTL/time.Second) - 1
+	if ttl := got.Answer[0].Header().Ttl; ttl != wantTTL {
+		t.Fatalf("ttl = %d, want %d (capped at maxTTL, not the upstream's 3600s)", ttl, wantTTL)
+	}
+
+	// 過了 maxTTL 之後必須是 miss，即使上游原本給的 TTL 遠遠沒到期。
+	if _, ok := c.Get("payments.example.com.", dns.TypeA, "zone-a", base.Add(maxTTL+time.Second)); ok {
+		t.Fatal("entry outlived maxTTL despite an upstream TTL far beyond it")
+	}
+}
+
 // Zone 匹配是大小寫敏感的 —— zone 標籤從 pod label 一路傳到 SPIFFE ID，大小寫必須一致。
 func TestZoneCaseSensitive(t *testing.T) {
 	c, _ := New(16)

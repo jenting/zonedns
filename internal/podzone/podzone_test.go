@@ -107,6 +107,22 @@ func TestHostNetworkPodIsNotIndexed(t *testing.T) {
 	}
 }
 
+// zone.a 是合法的 k8s label value，但帶點的字元不合 ednszone.Valid（見該套件
+// 的測試與註解），central 一定會把它的宣告當成不存在丟棄。這種 pod 必須跟沒有
+// zone label 的 pod 一樣不進表 —— 否則本機會回報 result="ok"、看起來一切正常，
+// 但 central 那一側其實從未採信過這個宣告，兩端的判定完全對不上。
+func TestPodWithInvalidZoneLabelIsNotIndexed(t *testing.T) {
+	w, stop := start(t, pod("payments-abc", "10.1.0.5", "zone.a", false))
+	defer stop()
+
+	if _, ok := w.Zone(netip.MustParseAddr("10.1.0.5")); ok {
+		t.Fatal("a pod whose zone label the wire format cannot carry must not resolve")
+	}
+	if w.Len() != 0 {
+		t.Fatalf("Len = %d, want 0 — an invalid zone label must not be indexed", w.Len())
+	}
+}
+
 func TestPodWithoutZoneLabelIsNotIndexed(t *testing.T) {
 	p := pod("legacy-abc", "10.1.0.6", "", false)
 	delete(p.Labels, zoneLabel)
@@ -275,6 +291,46 @@ func TestNotReadyResolvesNothing(t *testing.T) {
 	}
 	if _, ok := w.Zone(netip.MustParseAddr("10.1.0.5")); ok {
 		t.Fatal("an unready watcher must not resolve")
+	}
+}
+
+// resyncPeriod 過後，informer 必須重新對現有的 pod 送出 Update，並藉此修好
+// upsert/remove 上方描述的 IP 回收競態遺留下來的損壞狀態 —— 不是重新計數，是
+// 原地覆寫回目前真正的值。這裡直接破壞 byIP（模擬另一個 pod 的 Delete 事件
+// 在錯的時機把它清掉），確認 resync 能把它修回來，且 Len() 全程維持 1，證明
+// 是覆寫而不是疊加。
+func TestResyncRebuildsMapping(t *testing.T) {
+	origResync := resyncPeriod
+	// client-go clamps anything below 1s to 1s (with a warning); use a value
+	// just above that floor so the test both avoids the warning and still
+	// finishes quickly.
+	resyncPeriod = 1100 * time.Millisecond
+	defer func() { resyncPeriod = origResync }()
+
+	w, stop := start(t, pod("payments-abc", "10.1.0.5", "zone-a", false))
+	defer stop()
+
+	if zone, ok := w.Zone(netip.MustParseAddr("10.1.0.5")); !ok || zone != "zone-a" {
+		t.Fatalf("initial sync: got (%q,%v), want (zone-a,true)", zone, ok)
+	}
+
+	// 模擬競態遺留下來的損壞狀態：byPod 仍指向這個 IP（下面沒有動它），但
+	// byIP 這一側被清掉了 —— 見 upsert/remove 上方對這個競態的完整說明。
+	w.mu.Lock()
+	delete(w.byIP, netip.MustParseAddr("10.1.0.5"))
+	w.mu.Unlock()
+
+	if _, ok := w.Zone(netip.MustParseAddr("10.1.0.5")); ok {
+		t.Fatal("test setup failed to corrupt byIP")
+	}
+
+	waitUntil(t, func() bool {
+		zone, ok := w.Zone(netip.MustParseAddr("10.1.0.5"))
+		return ok && zone == "zone-a"
+	}, "periodic resync never rebuilt the corrupted mapping")
+
+	if got := w.Len(); got != 1 {
+		t.Fatalf("Len = %d after resync, want 1 — resync must reconcile in place, not double-count", got)
 	}
 }
 

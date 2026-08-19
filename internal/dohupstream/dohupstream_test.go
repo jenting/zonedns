@@ -2,10 +2,12 @@ package dohupstream
 
 import (
 	"context"
+	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/coredns/coredns/plugin/pkg/doh"
 	"github.com/miekg/dns"
@@ -152,6 +154,58 @@ func TestExchangeHonoursContextCancellation(t *testing.T) {
 
 	if _, err := NewWithHTTPClient(srv.URL, srv.Client()).Exchange(ctx, query()); err == nil {
 		t.Fatal("expected an error from a cancelled context")
+	}
+}
+
+// 一個掛住不回應的上游（網路分斷、防火牆丟包、central 掛死但連線沒斷）不可
+// 讓 Exchange 無限期卡住 —— 那會讓呼叫它的 goroutine 與底層 socket 永遠佔用。
+// buildHTTPClient 接上的 http.Client.Timeout 必須讓它在有限時間內回錯。
+func TestExchangeTimesOutOnHangingUpstream(t *testing.T) {
+	block := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-block
+	}))
+	// httptest.Server.Close blocks until every outstanding handler returns —
+	// the handler above is stuck on <-block until we close it, so block must
+	// be closed (deferred second, so it runs first) before srv.Close (deferred
+	// first, so it runs second) or Close itself would hang forever waiting on
+	// a handler that never returns.
+	defer srv.Close()
+	defer close(block)
+
+	hc := srv.Client()
+	hc.Timeout = 100 * time.Millisecond
+
+	start := time.Now()
+	_, err := NewWithHTTPClient(srv.URL, hc).Exchange(context.Background(), query())
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected an error from a hanging upstream")
+	}
+	// 給排程餘裕留一點空間，但必須遠低於「無限期卡住」的意思 —— 這裡用
+	// client 逾時的 10 倍當上限，遠低於這個套件過去任何一次會拿來模擬掛住的
+	// 秒數量級。
+	if elapsed > time.Second {
+		t.Fatalf("Exchange took %s to return an error, want well under 1s (client timeout was 100ms) — "+
+			"it appears to have blocked rather than honouring the client's Timeout", elapsed)
+	}
+}
+
+// buildHTTPClient 是 NewMTLS 的逾時邏輯拆出來的部分，讓它可以在不需要一個真的
+// 在跑的 SPIRE Workload API 的情況下單獨測試。
+func TestBuildHTTPClientDefaultsTimeout(t *testing.T) {
+	hc := buildHTTPClient(&tls.Config{}, 0)
+	if hc.Timeout != defaultQueryTimeout {
+		t.Fatalf("Timeout = %s, want the default %s when Config.Timeout is zero", hc.Timeout, defaultQueryTimeout)
+	}
+}
+
+func TestBuildHTTPClientHonoursConfiguredTimeout(t *testing.T) {
+	want := 2 * time.Second
+	hc := buildHTTPClient(&tls.Config{}, want)
+	if hc.Timeout != want {
+		t.Fatalf("Timeout = %s, want the configured %s", hc.Timeout, want)
 	}
 }
 

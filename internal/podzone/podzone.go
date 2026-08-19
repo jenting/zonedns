@@ -9,7 +9,9 @@ import (
 	"context"
 	"net/netip"
 	"sync"
+	"time"
 
+	"github.com/jenting/zonedns/internal/ednszone"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -54,9 +56,25 @@ func New(client kubernetes.Interface, nodeName, zoneLabel string) *Watcher {
 	}
 }
 
+// resyncPeriod 是 informer 定期重新送出（即使物件沒有真的變動）Update 事件的
+// 週期。可在測試中覆蓋，寫法比照這個 repo 其他地方的 timeNow/newUpstream 測試鉤子。
+//
+// 這是 upsert/remove 上方描述的 pod IP 回收競態的自癒機制：若一個回收 IP 的
+// Add 事件在舊 pod 的 Delete 之前抵達，Delete 會把新 pod 剛寫入的 byIP 項目
+// 清掉，而 byPod 仍指向那個 IP —— informer 只在物件「真的變動」時才重新送
+// 事件，沒有 resync 的話這個不一致會一直卡著，直到那個 pod 本身再有一次真正
+// 的變動為止（也就是完全不會自己修好）。resync 會強制對所有目前已知的物件重
+// 送一次 Update，讓 upsert 依當下真正的 PodIP 把 byIP 覆寫回正確值，即使物件
+// 本身沒有變。
+//
+// 10 分鐘是刻意選得比這個競態視窗（單次事件送達的先後差）長得多的值：節點端
+// pod 數量級是數十筆（見套件說明），每 10 分鐘全量重跑一次 upsert 的成本可
+// 忽略，同時足以把「卡住直到下次真正變動」的視窗收斂到有界。
+var resyncPeriod = 10 * time.Minute
+
 // Run 啟動 informer 並持續同步，直到 ctx 結束。
 func (w *Watcher) Run(ctx context.Context) error {
-	factory := informers.NewSharedInformerFactoryWithOptions(w.client, 0,
+	factory := informers.NewSharedInformerFactoryWithOptions(w.client, resyncPeriod,
 		informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
 			opts.FieldSelector = fields.OneTermEqualSelector("spec.nodeName", w.nodeName).String()
 		}))
@@ -95,11 +113,22 @@ func (w *Watcher) Run(ctx context.Context) error {
 
 // upsert 收下一個 pod 的最新狀態。
 //
-// 三種 pod 刻意不進表：
+// 四種 pod 刻意不進表：
 //   - hostNetwork：它的 IP 就是節點 IP，同節點上所有 hostNetwork pod 共用，
 //     分辨不出是誰，任何對應都是任意的
 //   - 沒有 zone label（或值為空字串）：不可對應到空字串 zone，那會被下游當成
 //     一個真的 zone
+//   - zone label 的值不合 ednszone.Valid（例如帶點的 "zone.a"，合法的 k8s
+//     label value 但線上格式承載不了）：跟 internal/registry 與
+//     plugin/zonedns/setup.go 拒絕同一批字串是同一個理由 —— 這種 pod 的 zone
+//     宣告送到 central 一定會被 ednszone.Get 判定不合法而丟棄（見該套件的
+//     Valid 註解），也就是說 central 那一側必然把它當成「沒有宣告」處理。
+//     若這裡仍然索引它，本機的 zone_resolution_total 會回報 result="ok"、
+//     answer 正常送出，看起來一切正常，實際上這個 pod 的 zone 宣告從來沒有
+//     被 central 採信過 —— agent 端「成功」的判定跟 central 端「失敗」的
+//     判定完全對不上，且沒有任何 metric 會指出這個落差。不索引、跟沒有 label
+//     一樣讓它落在 result="unknown"，才會如實反映「這個 pod 現在拿不到
+//     zone-aware 的答案」。
 //   - 還沒拿到 IP（Pending）：沒有可索引的鍵
 //
 // 這些條件不只決定「要不要新增」，也決定「要不要回收」：一個 pod 換了 IP、被
@@ -124,7 +153,7 @@ func (w *Watcher) upsert(obj any) {
 		qualifies = false
 	default:
 		z, hasLabel := pod.Labels[w.zoneLabel]
-		if !hasLabel || z == "" {
+		if !hasLabel || z == "" || !ednszone.Valid(z) {
 			qualifies = false
 			break
 		}

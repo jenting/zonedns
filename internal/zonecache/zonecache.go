@@ -16,6 +16,21 @@ import (
 	"github.com/miekg/dns"
 )
 
+// maxTTL 是任何一筆快取項目實際存活時間的上限，不論上游答案自己宣告的 TTL
+// 多長。
+//
+// spec §6.6 論證 central 的跨 zone 答案用 30 秒的 TTL 是刻意的：它是「服務搬
+// zone」或「zone GW VIP 變更」這類拓樸變化，從發生到所有節點都看見新答案為止
+// 的傳播延遲上限。但那個論證只涵蓋跨 zone 分支 —— 同 zone 分支的答案是原封不動
+// 轉發的上游答案，TTL 是上游自己設的，可能長達數小時。少了這個上限，一個名字
+// 被登記進 registry、或者改了 zone，這個節點會繼續回覆直連位址直到那個很長的
+// TTL 走完；zone 之間網路隔離，那段時間裡答案是錯的，後果是連不上，而不是有
+// 任何提示。
+//
+// 這裡選跟 central 端 defaultTTL（plugin/zonedns/setup.go）同一個量級的值，
+// 讓 spec 承諾的傳播延遲上限對兩個分支都成立，不只是跨 zone 那一半。
+const maxTTL = 30 * time.Second
+
 // Cache 是有大小上限的 zone-aware 答案快取，可安全併發使用。
 type Cache struct {
 	mu sync.Mutex
@@ -70,11 +85,16 @@ func (c *Cache) Put(qname string, qtype uint16, zone string, m *dns.Msg, now tim
 		return
 	}
 
+	ttl := time.Duration(minTTL) * time.Second
+	if ttl > maxTTL {
+		ttl = maxTTL
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.l.Add(makeKey(qname, qtype, zone), entry{
 		msg:    m.Copy(),
-		expiry: now.Add(time.Duration(minTTL) * time.Second),
+		expiry: now.Add(ttl),
 	})
 }
 

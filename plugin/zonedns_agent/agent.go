@@ -8,6 +8,7 @@ package zonedns_agent
 import (
 	"context"
 	"net/netip"
+	"strings"
 	"time"
 
 	clog "github.com/coredns/coredns/plugin/pkg/log"
@@ -80,6 +81,18 @@ func (a Agent) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (
 		log.Errorf("upstream exchange for %q failed: %v", state.Name(), err)
 		return dns.RcodeServerFailure, nil
 	}
+	// central's identity is pinned by mTLS (see dohupstream), but that pins
+	// *who* answered, not *what* they answered. A bug on central (e.g. a
+	// pipelining/correlation mistake that hands back another query's reply)
+	// would otherwise be forwarded, cached, and served as a well-formed
+	// answer to a question nobody asked. Treat it exactly like any other
+	// upstream failure rather than trusting content the agent has no
+	// independent way to verify.
+	if !answersQuestion(outbound, answer) {
+		upstreamErrorsTotal.Inc()
+		log.Errorf("upstream reply for %q did not answer the question that was asked (got %v)", state.Name(), answer.Question)
+		return dns.RcodeServerFailure, nil
+	}
 
 	a.Cache.Put(state.Name(), state.QType(), zone, answer, now)
 
@@ -112,6 +125,23 @@ func stripZoneOption(m *dns.Msg, code uint16) {
 		kept = append(kept, o)
 	}
 	opt.Option = kept
+}
+
+// answersQuestion 回報 answer 的 Question section 是否恰好對應到 outbound 送出的
+// 那個查詢 —— 同一個 qname（大小寫不敏感，DNS 名稱本來就不分大小寫）、同一個
+// qtype、同一個 qclass。central 的身分已經由 mTLS 釘住（見 dohupstream），但那
+// 只保證「是誰回的」，不保證「回的是不是這一題」。
+func answersQuestion(outbound, answer *dns.Msg) bool {
+	if len(answer.Question) != len(outbound.Question) {
+		return false
+	}
+	for i, q := range outbound.Question {
+		a := answer.Question[i]
+		if !strings.EqualFold(q.Name, a.Name) || q.Qtype != a.Qtype || q.Qclass != a.Qclass {
+			return false
+		}
+	}
+	return true
 }
 
 // resolveZone 判定來源的 zone 並記錄結果。

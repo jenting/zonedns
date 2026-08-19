@@ -8,6 +8,7 @@ package dohupstream
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/http"
@@ -26,12 +27,27 @@ import (
 // 上限時，SPIRE agent 尚未就緒會讓 CoreDNS 的設定解析整個卡住，沒有逾時也沒有日誌。
 const defaultDialTimeout = 10 * time.Second
 
+// defaultQueryTimeout 限制單一 DoH 查詢從送出到拿到回應的總時間，涵蓋 dial、
+// TLS 握手、寫入請求、讀取回應的全部階段。
+//
+// http.Client 預設沒有 Timeout：一個開始跟 central 三路握手就不回話的連線
+// （網路分斷、防火牆丟包、central 掛死但連線沒斷）會讓等在 Exchange 裡的那個
+// goroutine 與底層的那個 socket 永遠卡住，且卡住的數量隨查詢量線性累加，沒有
+// 任何日誌或 metric 會提示這件事在發生。5 秒鐘的選擇取自傳統 DNS resolver 的
+// 慣例（glibc /etc/resolv.conf 的 timeout 預設也是 5 秒）：長到足以吸收一次
+// TLS 握手加一次正常的網路延遲，短到讓呼叫端（node-local DNS 面對的 client）
+// 在它自己的等待耐性耗盡前就先拿到一個看起來正常的逾時，而不是一直掛著。
+const defaultQueryTimeout = 5 * time.Second
+
 // Config 是建立 mTLS client 所需的設定。
 type Config struct {
 	URL             string
 	WorkloadAPIAddr string
 	CentralSPIFFEID string
 	DialTimeout     time.Duration
+	// Timeout 限制每一次 DoH 查詢的總時間，見 defaultQueryTimeout。零值採用
+	// 該預設值。
+	Timeout time.Duration
 }
 
 // Client 對 central 發送 DoH 查詢。
@@ -75,9 +91,22 @@ func NewMTLS(ctx context.Context, cfg Config) (*Client, func(), error) {
 
 	// 憑證取自 X509Source 而非靜態檔案，SVID 輪替才不需要重新載入設定。
 	tlsCfg := tlsconfig.MTLSClientConfig(source, source, tlsconfig.AuthorizeID(id))
-	hc := &http.Client{Transport: &http.Transport{TLSClientConfig: tlsCfg}}
+	hc := buildHTTPClient(tlsCfg, cfg.Timeout)
 
 	return &Client{url: cfg.URL, hc: hc}, func() { source.Close() }, nil
+}
+
+// buildHTTPClient 組出送查詢用的 http.Client，把 mTLS 設定與逾時接上去。從
+// NewMTLS 拆出來，好讓逾時預設值的邏輯可以在不需要一個真的在跑的 SPIRE
+// Workload API 的情況下單獨測試。
+func buildHTTPClient(tlsCfg *tls.Config, timeout time.Duration) *http.Client {
+	if timeout == 0 {
+		timeout = defaultQueryTimeout
+	}
+	return &http.Client{
+		Transport: &http.Transport{TLSClientConfig: tlsCfg},
+		Timeout:   timeout,
+	}
 }
 
 // Exchange 送出查詢並回傳答案。

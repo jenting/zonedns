@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"strings"
 	"testing"
 
 	"github.com/coredns/coredns/plugin/pkg/dnstest"
@@ -27,6 +28,9 @@ type fakeUpstream struct {
 	// withAnswer 讓回應即使 rcode 非成功也帶著固定的 A record —— 用來測試快取
 	// 路徑在收到 in-band 失敗時的行為。
 	withAnswer bool
+	// mismatchQuestion 讓回應的 Question section 改成另一個名字，模擬 central
+	// 端一個把答案送錯查詢的 bug。
+	mismatchQuestion bool
 }
 
 func (f *fakeUpstream) Exchange(_ context.Context, m *dns.Msg) (*dns.Msg, error) {
@@ -37,6 +41,9 @@ func (f *fakeUpstream) Exchange(_ context.Context, m *dns.Msg) (*dns.Msg, error)
 	}
 	resp := new(dns.Msg)
 	resp.SetReply(m)
+	if f.mismatchQuestion {
+		resp.Question = []dns.Question{{Name: "other.example.com.", Qtype: dns.TypeA, Qclass: dns.ClassINET}}
+	}
 	if f.rcode != 0 {
 		resp.Rcode = f.rcode
 	}
@@ -253,6 +260,62 @@ func TestNodeIPSourceIsCounted(t *testing.T) {
 	}
 	if after := readCounter(t, zoneResolutionTotal, "node_ip"); after != before+1 {
 		t.Fatalf("node_ip counter = %v, want %v", after, before+1)
+	}
+}
+
+// central 的身分由 mTLS 釘住，但那不保證它回的答案真的是這次問的問題 —— 一個
+// central 端的 bug（例如把另一筆查詢的答案送錯連線）不可被原封不動地包成一筆
+// 看起來正常但答非所問的回應洗給 client。必須當成上游失敗處理，用同一個
+// metric 計數，而且不可以被存進快取。
+func TestServeDNSRejectsMismatchedUpstreamQuestion(t *testing.T) {
+	up := &fakeUpstream{mismatchQuestion: true}
+	a := newAgent(t, mapResolver{"10.1.0.5": "zone-a"}, up)
+
+	before := testutil.ToFloat64(upstreamErrorsTotal)
+	code, err := a.ServeDNS(context.Background(), writerFrom("10.1.0.5"), queryFor("payments.example.com."))
+	if err != nil {
+		t.Fatalf("ServeDNS: %v", err)
+	}
+	if code != dns.RcodeServerFailure {
+		t.Fatalf("rcode = %d, want SERVFAIL for a reply answering a different question", code)
+	}
+	if after := testutil.ToFloat64(upstreamErrorsTotal); after != before+1 {
+		t.Fatalf("upstreamErrorsTotal = %v, want %v", after, before+1)
+	}
+	if a.Cache.Len() != 0 {
+		t.Fatal("a mismatched reply must not be cached")
+	}
+}
+
+func TestAnswersQuestion(t *testing.T) {
+	q := queryFor("payments.example.com.")
+
+	matching := new(dns.Msg)
+	matching.SetReply(q)
+	if !answersQuestion(q, matching) {
+		t.Fatal("an unmodified reply must be considered a match")
+	}
+
+	wrongName := new(dns.Msg)
+	wrongName.SetReply(q)
+	wrongName.Question = []dns.Question{{Name: "other.example.com.", Qtype: dns.TypeA, Qclass: dns.ClassINET}}
+	if answersQuestion(q, wrongName) {
+		t.Fatal("a reply for a different qname must not match")
+	}
+
+	wrongType := new(dns.Msg)
+	wrongType.SetReply(q)
+	wrongType.Question = []dns.Question{{Name: q.Question[0].Name, Qtype: dns.TypeAAAA, Qclass: dns.ClassINET}}
+	if answersQuestion(q, wrongType) {
+		t.Fatal("a reply for a different qtype must not match")
+	}
+
+	// DNS 名稱大小寫不敏感，這裡不能被判定成不符。
+	caseDiffers := new(dns.Msg)
+	caseDiffers.SetReply(q)
+	caseDiffers.Question = []dns.Question{{Name: strings.ToUpper(q.Question[0].Name), Qtype: dns.TypeA, Qclass: dns.ClassINET}}
+	if !answersQuestion(q, caseDiffers) {
+		t.Fatal("qname comparison must be case-insensitive")
 	}
 }
 

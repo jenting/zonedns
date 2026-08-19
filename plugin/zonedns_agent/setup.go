@@ -110,6 +110,31 @@ var (
 // 次 nil 檢查的成本可以忽略。寫法上比照 agent.go 的 timeNow 變數。
 var resolverStoppedTestHook func()
 
+// newUpstream 建立 agent 對 central 的連線。可在測試中覆蓋 —— 寫法比照上面的
+// resolverStoppedTestHook 與 agent.go 的 timeNow 變數。central 端的 SPIRE 連線
+// 是惰性的（見 plugin/zonedns/setup.go 的 dialSPIRE），可以直接測；這裡的
+// dohupstream.NewMTLS 不同，它一定會卡住等一個真實的 Workload API 回應第一筆
+// SVID，沒有這一層間接，setup() 本身就沒有任何測試能跑，包括
+// CheckDirectiveOrder 有沒有被呼叫、VM 模式的就緒 gauge 有沒有設對、以及每一條
+// 錯誤路徑有沒有正確地把 cancel/cleanup 收乾淨。
+var newUpstream = dohupstream.NewMTLS
+
+// wireResolverReadyLifecycle 讓 resolverReady gauge 的生命週期跟著 ctx 走：立刻
+// 標記 gen 這個世代為就緒，並在 ctx 結束時嘗試把它清空（是否真的清空由世代比較
+// 決定，見 resolverGeneration 與 markResolverStopped 上方的註解）。
+//
+// VM 模式沒有非同步的載入階段，一建立解析器就是就緒的，但仍然要走跟 k8s 模式
+// 相同的世代保護，兩種模式的 shutdown 才不會互相蓋掉彼此寫入的 gauge —— 例如
+// reload 前後兩個 instance 一個是 k8s 模式、一個是 vm 模式時。
+func wireResolverReadyLifecycle(ctx context.Context) {
+	gen := resolverGeneration.Add(1)
+	markResolverReady(gen)
+	go func() {
+		<-ctx.Done()
+		markResolverStopped(gen)
+	}()
+}
+
 // markResolverReady 記錄 gen 這個世代已經同步完成。呼叫端一律可以直接標成
 // 就緒，因為 OnReady 只會在真正同步完成時觸發一次，永遠代表目前已知最新的
 // 事實 —— 不需要跟任何人比較。仍然要拿 resolverReadyMu，理由見它上面的
@@ -155,7 +180,7 @@ func setup(c *caddy.Controller) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	up, cleanup, err := dohupstream.NewMTLS(ctx, dohupstream.Config{
+	up, cleanup, err := newUpstream(ctx, dohupstream.Config{
 		URL:             cfg.upstreamURL,
 		WorkloadAPIAddr: cfg.workloadAPI,
 		CentralSPIFFEID: cfg.centralSPIFFEID,
@@ -169,8 +194,11 @@ func setup(c *caddy.Controller) error {
 	switch cfg.mode {
 	case modeVM:
 		resolver = NewStaticResolver(cfg.zone)
-		// VM 模式沒有非同步的載入階段，解析器一建立就是就緒的。
-		resolverReady.Set(1)
+		// VM 模式沒有非同步的載入階段，解析器一建立就是就緒的；wireResolverReadyLifecycle
+		// 立刻標成就緒，並在 shutdown（ctx.Done()）時比照 k8s 模式把 gauge 清掉 ——
+		// 少了這一步，VM 模式的節點關閉之後 resolver_ready 會繼續卡在 1，跟已經
+		// 停止回答的事實不符。
+		wireResolverReadyLifecycle(ctx)
 	case modeK8s:
 		restCfg, err := rest.InClusterConfig()
 		if err != nil {
@@ -324,6 +352,24 @@ func parseConfig(c *caddy.Controller) (*config, error) {
 				}
 				cfg.nodeIP = addr
 
+			case "edns0_code":
+				if !c.NextArg() {
+					return nil, c.ArgErr()
+				}
+				// 驗證邏輯與 plugin/zonedns/setup.go 的 edns0_code 完全一致 ——
+				// 兩端的值必須相同（見 spec §6.6），錯開任何一端的驗證規則都可能
+				// 讓一個值在其中一端被接受、在另一端被拒絕，兩邊就再也對不上。
+				// strconv.ParseUint（不同於 fmt.Sscanf 的 "%d"）會直接拒絕
+				// 尾隨的垃圾字元，而不是靜默停在第一個非數字字元。
+				code, err := strconv.ParseUint(c.Val(), 10, 16)
+				if err != nil {
+					return nil, c.Errf("invalid edns0_code %q: %v", c.Val(), err)
+				}
+				if code < 65001 || code > 65534 {
+					return nil, c.Errf("edns0_code %d is outside the local/experimental range 65001-65534", code)
+				}
+				cfg.edns0Code = uint16(code)
+
 			default:
 				return nil, c.Errf("unknown property %q", c.Val())
 			}
@@ -370,9 +416,25 @@ func parseConfig(c *caddy.Controller) (*config, error) {
 			return nil, c.Errf("zone %q is not a valid zone name (letters, digits, '-' and '_' only, at most %d bytes)",
 				cfg.zone, ednszone.MaxLen)
 		}
+		// node_name 只有 k8s 模式的 podzone.Watcher 會用到。讓它在 vm 模式底下
+		// 悄悄解析成功、卻完全不起作用，會讓操作者以為 Corefile 裡寫的
+		// node_name 有意義，實際上這台機器的 zone 完全由 zone 選項決定 ——
+		// Corefile 表達的意圖跟實際行為對不上，必須在啟動時就攤開來講。
+		if cfg.nodeName != "" {
+			return nil, c.Err("node_name is not valid in vm mode; vm mode declares the zone once via " +
+				"the zone option, not per-query from pod labels")
+		}
 	case modeK8s:
 		if cfg.nodeName == "" {
 			return nil, c.Err("k8s mode requires node_name")
+		}
+		// 對稱地，zone 只有 vm 模式的 StaticResolver 會用到。k8s 模式下這個節點
+		// 混跑多個 zone 是常態，逐查詢由 pod label 決定 —— 若 Corefile 寫了
+		// zone zone-c，操作者可能誤以為這個節點只服務 zone-c，實際上該選項
+		// 被整個忽略。
+		if cfg.zone != "" {
+			return nil, c.Err("zone is not valid in k8s mode; k8s mode determines the zone per-query " +
+				"from pod labels, not from a fixed zone option")
 		}
 	}
 
