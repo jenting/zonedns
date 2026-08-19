@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"sync"
 	"sync/atomic"
 
 	"github.com/coredns/caddy"
@@ -71,9 +72,9 @@ func CheckDirectiveOrder(directives []string) error {
 	return nil
 }
 
-// resolverGeneration 為每一次啟動 k8s watcher 配發一個遞增的世代編號；
-// resolverReadyGeneration 記錄「最近一次被標成就緒」的是哪個世代。兩者都是
-// package 層級、跨越多次 setup() 呼叫共用的狀態。
+// resolverGeneration 為每一次啟動 k8s watcher 配發一個遞增的世代編號。它是
+// package 層級、跨越多次 setup() 呼叫共用的狀態，本身只是單純遞增，不需要
+// 額外保護 —— 遞增沒有「讀了再決定要不要寫」這種步驟。
 //
 // 理由：reload 期間新舊兩個 watcher 的生命週期會重疊 —— coredns/caddy 的
 // Instance.Restart 先把新 instance 完整啟動（含這裡的 c.OnStartup）成功之後，
@@ -83,24 +84,56 @@ func CheckDirectiveOrder(directives []string) error {
 // 歸零會蓋掉較新世代已經回報的就緒狀態，而且蓋掉之後不會再有任何事件把它
 // 修回來（每個 watcher 的 OnReady 只呼叫一次）。世代編號讓「要歸零」的那一刻
 // 可以自問「我是不是最後一個真正就緒的世代」，不是的話就什麼都不做。
+var resolverGeneration atomic.Uint64
+
+// resolverReadyMu 保護 resolverReadyGeneration，也讓它跟 resolverReady 這個
+// gauge 的寫入綁在同一個不可分割的臨界區裡。
+//
+// 「讀出目前最新的就緒世代、跟自己的世代比較、決定要不要寫入 gauge」這一整
+// 串動作必須當成單一原子操作，不能拆成「先讀、再寫」兩步 —— 光是把
+// resolverReadyGeneration 換成 atomic.Uint64 並不夠：atomic 保證的是單一
+// Load 或單一 Store 各自不可分割，不保證「Load 之後根據結果決定的 Store」
+// 整體不可分割。若中間留了窗口，較舊世代可能在讀到「我還是最新」之後、還
+// 沒來得及寫入 0 之前，被較新世代插進來把自己標成就緒；等較舊世代接著執行
+// 它已經決定好的動作，會把較新世代剛寫好的「就緒」蓋掉 —— 蓋掉之後同樣不會
+// 再有任何事件修正它，直到下一次 reload，是原本這個機制要避免的「卡在 0」
+// 錯誤，只是窗口從整個 reload 縮小成這一個 check-then-act 的瞬間。
+// TestResolverReadyGuardTOCTOU 會用 resolverStoppedTestHook 強制重現這個窗口。
 var (
-	resolverGeneration      atomic.Uint64
-	resolverReadyGeneration atomic.Uint64
+	resolverReadyMu         sync.Mutex
+	resolverReadyGeneration uint64 // 由 resolverReadyMu 保護
 )
+
+// resolverStoppedTestHook 不是 nil 時，會在 markResolverStopped 讀出目前的
+// 就緒世代、比較之後、真正寫入 gauge 之前被呼叫一次。它唯一的用途是讓測試
+// 能夠強制重現 check-then-act 需要的那個交錯時機；正式環境永遠是 nil，多一
+// 次 nil 檢查的成本可以忽略。寫法上比照 agent.go 的 timeNow 變數。
+var resolverStoppedTestHook func()
 
 // markResolverReady 記錄 gen 這個世代已經同步完成。呼叫端一律可以直接標成
 // 就緒，因為 OnReady 只會在真正同步完成時觸發一次，永遠代表目前已知最新的
-// 事實 —— 不需要跟任何人比較。
+// 事實 —— 不需要跟任何人比較。仍然要拿 resolverReadyMu，理由見它上面的
+// 註解：這個函式跟 markResolverStopped 寫的是同一個世代編號與同一個 gauge，
+// 兩邊必須共用同一把鎖才能互相排除，不然這裡的寫入本身也可能被
+// markResolverStopped 的 check-then-act 夾在中間。
 func markResolverReady(gen uint64) {
-	resolverReadyGeneration.Store(gen)
+	resolverReadyMu.Lock()
+	defer resolverReadyMu.Unlock()
+	resolverReadyGeneration = gen
 	resolverReady.Set(1)
 }
 
 // markResolverStopped 記錄 gen 這個世代的 watcher 已經停止。只有在還沒有
-// 更新的世代取得就緒狀態時才把 gauge 歸零，理由見 resolverGeneration 上的
-// 註解。
+// 更新的世代取得就緒狀態時才把 gauge 歸零。「比較世代」與「寫入 gauge」在
+// 同一把鎖底下完成，理由見 resolverReadyMu 上的註解。
 func markResolverStopped(gen uint64) {
-	if resolverReadyGeneration.Load() == gen {
+	resolverReadyMu.Lock()
+	defer resolverReadyMu.Unlock()
+	stillLatest := resolverReadyGeneration == gen
+	if resolverStoppedTestHook != nil {
+		resolverStoppedTestHook()
+	}
+	if stillLatest {
 		resolverReady.Set(0)
 	}
 }

@@ -1,8 +1,10 @@
 package zonedns_agent
 
 import (
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/coredns/caddy"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -317,11 +319,11 @@ func TestParseRejectsUnknownProperty(t *testing.T) {
 // 運作。
 func TestResolverReadyGuardIgnoresStaleShutdown(t *testing.T) {
 	resolverGeneration.Store(0)
-	resolverReadyGeneration.Store(0)
+	resetResolverReadyGeneration(t)
 	resolverReady.Set(0)
 	defer func() {
 		resolverGeneration.Store(0)
-		resolverReadyGeneration.Store(0)
+		resetResolverReadyGeneration(t)
 		resolverReady.Set(0)
 	}()
 
@@ -349,5 +351,82 @@ func TestResolverReadyGuardIgnoresStaleShutdown(t *testing.T) {
 	markResolverStopped(gen2)
 	if got := testutil.ToFloat64(resolverReady); got != 0 {
 		t.Fatalf("resolverReady = %v after gen2 stopped, want 0", got)
+	}
+}
+
+// resetResolverReadyGeneration 把 resolverReadyGeneration 歸零，用 white-box
+// 測試的方式直接拿 resolverReadyMu，而不是透過 markResolverReady/
+// markResolverStopped —— 這裡只是測試前後的清理，不是要重現任何交錯時機。
+func resetResolverReadyGeneration(t *testing.T) {
+	t.Helper()
+	resolverReadyMu.Lock()
+	resolverReadyGeneration = 0
+	resolverReadyMu.Unlock()
+}
+
+// TestResolverReadyGuardTOCTOU 重現一個 check-then-act 的競態：gen1 讀到「我
+// 還是最新世代」之後、還沒來得及依這個結論寫入 gauge 之前，gen2 搶先透過
+// markResolverReady 取代它成為最新世代；接著 gen1 才執行它已經決定好（但此刻
+// 已經過時）的動作。
+//
+// 這是 TestResolverReadyGuardIgnoresStaleShutdown 沒有覆蓋到的情境：那個測試
+// 依序呼叫 markResolverReady(gen1)、markResolverReady(gen2)、
+// markResolverStopped(gen1)，三次呼叫互不重疊，只驗證「讀」與「寫」各自的
+// 結果、不驗證兩者之間有沒有窗口。這裡改用 resolverStoppedTestHook，強制在
+// markResolverStopped(gen1) 讀出「還是最新」之後、真正寫入 gauge 之前，插入
+// 一次完整的 markResolverReady(gen2) 呼叫 —— 若「讀、比較、寫」不是同一個不
+// 可分割的臨界區，gen1 接下來就會把 gen2 剛寫好的「就緒」蓋掉，而且蓋掉之後
+// 不會再有任何事件修正它，直到下一次 reload：跟這整套機制原本要避免的
+// 「卡在 0」錯誤一樣，只是窗口從整個 reload 縮小成這一個 check-then-act 的
+// 瞬間。
+//
+// hook 裡用獨立的 goroutine 去呼叫 markResolverReady(gen2)，而不是在這裡同步
+// 呼叫：修好之後 markResolverReady 需要拿 markResolverStopped(gen1) 正持有的
+// 同一把 resolverReadyMu，同步呼叫會讓呼叫端自己卡死在一個不可重入的鎖上。
+// 開一個 goroutine 讓它去搶鎖，用 channel 確認它至少已經開始執行，再用一小段
+// 排程餘裕，讓它有機會在還沒修好的版本上真的搶先寫完 —— 這段時間對修好的版本
+// 沒有影響：它會卡在 Lock() 直到 gen1 放手為止。
+func TestResolverReadyGuardTOCTOU(t *testing.T) {
+	resolverReady.Set(0)
+	resetResolverReadyGeneration(t)
+	defer func() {
+		resolverStoppedTestHook = nil
+		resetResolverReadyGeneration(t)
+		resolverReady.Set(0)
+	}()
+
+	gen1 := resolverGeneration.Add(1)
+	markResolverReady(gen1)
+
+	gen2 := resolverGeneration.Add(1)
+
+	started := make(chan struct{})
+	done := make(chan struct{})
+	resolverStoppedTestHook = func() {
+		go func() {
+			close(started)
+			markResolverReady(gen2)
+			close(done)
+		}()
+		<-started
+		runtime.Gosched()
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	markResolverStopped(gen1)
+	// gen2's markResolverReady is guaranteed to eventually complete once
+	// markResolverStopped(gen1) has returned and released resolverReadyMu, so
+	// this cannot hang even if the guard is broken.
+	<-done
+
+	if got := testutil.ToFloat64(resolverReady); got != 1 {
+		t.Fatalf("resolverReady = %v after gen2 superseded gen1's in-flight stop, want 1 "+
+			"(gen2 is newer and reported ready; gen1's stale decision must not win)", got)
+	}
+	resolverReadyMu.Lock()
+	gotGen := resolverReadyGeneration
+	resolverReadyMu.Unlock()
+	if gotGen != gen2 {
+		t.Fatalf("resolverReadyGeneration = %d, want %d (gen2)", gotGen, gen2)
 	}
 }
