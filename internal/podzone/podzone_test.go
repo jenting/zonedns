@@ -30,6 +30,18 @@ func pod(name, ip, zone string, hostNetwork bool) *corev1.Pod {
 	}
 }
 
+// waitUntil 輪詢 cond 直到為真或逾時，逾時就讓測試失敗。
+func waitUntil(t *testing.T, cond func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal(msg)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // start 啟動 watcher 並等到就緒，回傳停止函式。
 func start(t *testing.T, pods ...*corev1.Pod) (*Watcher, func()) {
 	t.Helper()
@@ -117,7 +129,40 @@ func TestPodWithoutIPIsNotIndexed(t *testing.T) {
 }
 
 // 刪除必須立刻讓映射失效。IP 會被回收給新的 pod，沿用舊值會回答錯誤的 zone。
+//
+// 這裡刻意放兩個 pod：只清單一個被刪除 pod 的映射還不夠，必須確認刪除事件
+// 沒有波及其他還活著的 pod —— 一個「刪除時清空整張表」的錯誤實作，如果只有
+// 一個 pod 在場，測試也會通過。
 func TestDeleteRemovesTheMapping(t *testing.T) {
+	p := pod("payments-abc", "10.1.0.5", "zone-a", false)
+	sibling := pod("checkout-def", "10.1.0.7", "zone-b", false)
+	client := fake.NewSimpleClientset(p, sibling)
+
+	w := New(client, nodeName, zoneLabel)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.Run(ctx)
+
+	waitUntil(t, w.Ready, "watcher never became ready")
+
+	if err := client.CoreV1().Pods("prod").Delete(ctx, "payments-abc", metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	waitUntil(t, func() bool {
+		_, ok := w.Zone(netip.MustParseAddr("10.1.0.5"))
+		return !ok
+	}, "mapping survived the pod's deletion")
+
+	if zone, ok := w.Zone(netip.MustParseAddr("10.1.0.7")); !ok || zone != "zone-b" {
+		t.Fatalf("an unrelated pod's mapping was disturbed by its sibling's deletion: zone=%q ok=%v", zone, ok)
+	}
+}
+
+// pod IP 會改變（例如重建但沿用同一個 Deployment/Name，或 CNI 重新配發）。
+// upsert 若只新增不回收，舊 IP 會永遠停留在表裡 —— 和刪除沒有清乾淨是同一種錯誤，
+// 只是從「更新」這個方向進來。
+func TestPodIPChangeRemovesOldMapping(t *testing.T) {
 	p := pod("payments-abc", "10.1.0.5", "zone-a", false)
 	client := fake.NewSimpleClientset(p)
 
@@ -126,28 +171,100 @@ func TestDeleteRemovesTheMapping(t *testing.T) {
 	defer cancel()
 	go w.Run(ctx)
 
-	deadline := time.Now().Add(2 * time.Second)
-	for !w.Ready() {
-		if time.Now().After(deadline) {
-			t.Fatal("watcher never became ready")
-		}
-		time.Sleep(5 * time.Millisecond)
+	waitUntil(t, w.Ready, "watcher never became ready")
+
+	updated := p.DeepCopy()
+	updated.Status.PodIP = "10.1.0.6"
+	if _, err := client.CoreV1().Pods("prod").Update(ctx, updated, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update: %v", err)
 	}
 
-	if err := client.CoreV1().Pods("prod").Delete(ctx, "payments-abc", metav1.DeleteOptions{}); err != nil {
-		t.Fatalf("delete: %v", err)
+	waitUntil(t, func() bool {
+		_, ok := w.Zone(netip.MustParseAddr("10.1.0.6"))
+		return ok
+	}, "new IP never took effect after the pod's IP changed")
+
+	if zone, ok := w.Zone(netip.MustParseAddr("10.1.0.5")); ok {
+		t.Fatalf("STALE: old IP 10.1.0.5 still resolves to zone %q", zone)
+	}
+	if zone, _ := w.Zone(netip.MustParseAddr("10.1.0.6")); zone != "zone-a" {
+		t.Fatalf("zone = %q, want zone-a", zone)
+	}
+}
+
+// 拿掉 zone label（IP 不變）必須讓映射跟著失效，理由和 pod 被刪除時一樣：
+// 沿用舊值會回答一個不再成立的 zone，而那個答案看起來完全正常。
+func TestZoneLabelRemovedStopsResolving(t *testing.T) {
+	p := pod("payments-abc", "10.1.0.5", "zone-a", false)
+	client := fake.NewSimpleClientset(p)
+
+	w := New(client, nodeName, zoneLabel)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.Run(ctx)
+
+	waitUntil(t, w.Ready, "watcher never became ready")
+
+	updated := p.DeepCopy()
+	delete(updated.Labels, zoneLabel)
+	if _, err := client.CoreV1().Pods("prod").Update(ctx, updated, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update: %v", err)
 	}
 
-	deadline = time.Now().Add(2 * time.Second)
-	for {
-		if _, ok := w.Zone(netip.MustParseAddr("10.1.0.5")); !ok {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("mapping survived the pod's deletion")
-		}
-		time.Sleep(5 * time.Millisecond)
+	waitUntil(t, func() bool {
+		_, ok := w.Zone(netip.MustParseAddr("10.1.0.5"))
+		return !ok
+	}, "STALE: IP still resolves after its pod's zone label was removed")
+}
+
+// 把 zone label 的值改成空字串，效果必須和拿掉 label 一樣：不可索引，
+// 因為空字串一樣會被下游當成一個真的 zone。
+func TestZoneLabelEmptiedStopsResolving(t *testing.T) {
+	p := pod("payments-abc", "10.1.0.5", "zone-a", false)
+	client := fake.NewSimpleClientset(p)
+
+	w := New(client, nodeName, zoneLabel)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.Run(ctx)
+
+	waitUntil(t, w.Ready, "watcher never became ready")
+
+	updated := p.DeepCopy()
+	updated.Labels[zoneLabel] = ""
+	if _, err := client.CoreV1().Pods("prod").Update(ctx, updated, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update: %v", err)
 	}
+
+	waitUntil(t, func() bool {
+		_, ok := w.Zone(netip.MustParseAddr("10.1.0.5"))
+		return !ok
+	}, "STALE: IP still resolves after its pod's zone label was emptied")
+}
+
+// 改標成另一個非空 zone 是合格的轉換：同一個 IP 鍵被覆寫即可，這條路徑本來就
+// 是對的。把它釘住，避免之後的重構（例如改成先刪後寫）不小心破壞它。
+func TestRelabelToDifferentZoneResolvesNewZone(t *testing.T) {
+	p := pod("payments-abc", "10.1.0.5", "zone-a", false)
+	client := fake.NewSimpleClientset(p)
+
+	w := New(client, nodeName, zoneLabel)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.Run(ctx)
+
+	waitUntil(t, w.Ready, "watcher never became ready")
+
+	updated := p.DeepCopy()
+	updated.Labels[zoneLabel] = "zone-b"
+	if _, err := client.CoreV1().Pods("prod").Update(ctx, updated, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	waitUntil(t, func() bool {
+		zone, ok := w.Zone(netip.MustParseAddr("10.1.0.5"))
+		return ok && zone == "zone-b"
+	}, "IP never resolved to the pod's new zone after relabel")
 }
 
 // 尚未就緒時一律回 false —— 「還不知道」與「查得到但不在表裡」是不同的答案。
