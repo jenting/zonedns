@@ -157,3 +157,83 @@ func TestNewRejectsNonPositiveSize(t *testing.T) {
 		t.Fatal("expected an error for a zero-sized cache")
 	}
 }
+
+// 在過期的精確邊界（remaining == 0）時，Get 必須失敗。實作不能用 < 0，必須用 <= 0。
+func TestExactBoundaryExpiry(t *testing.T) {
+	c, _ := New(16)
+	c.Put("payments.example.com.", dns.TypeA, "zone-a", reply("payments.example.com.", 30, "10.96.0.7"), base)
+
+	// 在精確的過期時刻，必須失敗
+	if _, ok := c.Get("payments.example.com.", dns.TypeA, "zone-a", base.Add(30*time.Second)); ok {
+		t.Fatal("entry served at exact expiry boundary — must check remaining <= 0, not < 0")
+	}
+}
+
+// Put 拒絕快取 TTL 為 0 的回應。
+func TestPutRefusesZeroTTL(t *testing.T) {
+	c, _ := New(16)
+	m := reply("payments.example.com.", 0, "10.96.0.7")
+	c.Put("payments.example.com.", dns.TypeA, "zone-a", m, base)
+
+	if c.Len() != 0 {
+		t.Fatal("Put cached an entry with zero minTTL — it must refuse zero-TTL entries")
+	}
+	if _, ok := c.Get("payments.example.com.", dns.TypeA, "zone-a", base); ok {
+		t.Fatal("Get returned a zero-TTL entry that should not have been cached")
+	}
+}
+
+// Ns 和 Extra 記錄的 TTL 也要扣掉，但 OPT 虛擬紀錄的 TTL 欄位是 EDNS0 旗標，不可改。
+func TestNsAndExtraRecordsTTLRewritten(t *testing.T) {
+	c, _ := New(16)
+	m := reply("payments.example.com.", 30, "10.96.0.7")
+
+	// 加入 Ns 記錄
+	m.Ns = []dns.RR{&dns.NS{
+		Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 30},
+		Ns:  "ns1.example.com.",
+	}}
+
+	// 加入 OPT 虛擬紀錄（TTL 欄位存放 EDNS0 擴展版本和旗標）
+	m.Extra = []dns.RR{&dns.OPT{
+		Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT, Class: 512, Ttl: 0x00008000},
+	}}
+
+	c.Put("payments.example.com.", dns.TypeA, "zone-a", m, base)
+
+	got, ok := c.Get("payments.example.com.", dns.TypeA, "zone-a", base.Add(10*time.Second))
+	if !ok {
+		t.Fatal("entry missing")
+	}
+
+	// Ns 記錄的 TTL 要扣掉時間
+	if len(got.Ns) == 0 {
+		t.Fatal("Ns record missing from copy")
+	}
+	if ttl := got.Ns[0].Header().Ttl; ttl != 20 {
+		t.Fatalf("Ns TTL = %d, want 20 (should be decremented)", ttl)
+	}
+
+	// OPT 虛擬紀錄的 TTL 欄位不能改（包含 EDNS0 擴展版本和旗標）
+	if len(got.Extra) == 0 {
+		t.Fatal("OPT record missing from copy")
+	}
+	opt := got.Extra[0].(*dns.OPT)
+	if opt.Hdr.Ttl != 0x00008000 {
+		t.Fatalf("OPT TTL incorrectly modified to %d, want 0x00008000 (unchanged)", opt.Hdr.Ttl)
+	}
+}
+
+// Zone 匹配是大小寫敏感的 —— zone 標籤從 pod label 一路傳到 SPIFFE ID，大小寫必須一致。
+func TestZoneCaseSensitive(t *testing.T) {
+	c, _ := New(16)
+	c.Put("payments.example.com.", dns.TypeA, "zone-a", reply("payments.example.com.", 30, "10.96.0.7"), base)
+
+	// 不同大小寫的 zone 必須是不同的 key —— 不應該命中
+	if _, ok := c.Get("payments.example.com.", dns.TypeA, "Zone-A", base); ok {
+		t.Fatal("zone case folding occurred — zone must be case-sensitive")
+	}
+	if _, ok := c.Get("payments.example.com.", dns.TypeA, "ZONE-A", base); ok {
+		t.Fatal("zone case folding occurred — zone must be case-sensitive")
+	}
+}
