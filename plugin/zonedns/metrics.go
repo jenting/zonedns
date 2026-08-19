@@ -48,4 +48,15 @@ var (
 		Name:      "registry_ready",
 		Help:      "1 when a registry snapshot is loaded, 0 otherwise.",
 	})
+
+	// registryPollErrors 是連續輪詢失敗次數（見 registry.Poller.ConsecutivePollErrors）。
+	// 失敗時 Store 沿用上一份快照，registryReady 與 registryNames 都不會變 ——
+	// 這是 SPIRE 變得不可達（admin SVID 過期、admin 權限被收回、網路分斷）時
+	// 唯一會動的 metric，非 0 即應告警，見 spec §6.2。
+	registryPollErrors = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: plugin.Namespace,
+		Subsystem: "zonedns",
+		Name:      "registry_poll_errors",
+		Help:      "Consecutive SPIRE Entry API poll failures. Non-zero means the registry snapshot is stale.",
+	})
 )

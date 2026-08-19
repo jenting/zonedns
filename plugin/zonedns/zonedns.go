@@ -87,6 +87,11 @@ func (z ZoneDNS) answerGateway(state request.Request, gw string) (int, error) {
 	m := new(dns.Msg)
 	m.SetReply(state.Req)
 	m.Authoritative = true
+	// 查詢一定帶 OPT record — 它是攜帶 zone 宣告的 EDNS0 option 所在，走到這裡
+	// 代表宣告已經讀出來了。SizeAndDo 依請求的 OPT 在回應上補回對應的 OPT
+	// record；漏了這一步會讓每個 gateway 答案都變成對一個帶 EDNS0 查詢的
+	// 非 EDNS 回應，部分 resolver 會視為格式錯誤而重試或報錯。
+	state.SizeAndDo(m)
 
 	hdr := dns.RR_Header{
 		Name:  state.QName(),

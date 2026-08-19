@@ -200,6 +200,7 @@ https://example.com:443 {
 | `coredns_zonedns_decision_total{action="servfail"}` | 任何非零增長 | 某個 zone 缺 gateway 設定 |
 | `coredns_zonedns_registry_conflicts` | > 0 | 有 FQDN 被宣告成多個 zone，這些名字目前不可解析 |
 | `coredns_zonedns_registry_ready` | == 0 持續超過一個 `poll_interval` | registry 未載入，全部查詢退回非 zone-aware |
+| `coredns_zonedns_registry_poll_errors` | > 0 | 連續輪詢 SPIRE Entry API 失敗（admin SVID 過期、`admin: true` 被收回、網路分斷…）。Store 會沿用上一份快照，`registry_ready` 與 `registry_names` 都不會變 —— 這是這種失效唯一會動的 metric，新註冊或改 zone 的名稱會持續查不到而靜默走非 zone-aware 路徑，直到輪詢恢復 |
 | `coredns_zonedns_source_zone_total{reason="no_tls"}` | 遷移完成後仍持續增長 | 有 client 沒走 mTLS 路徑 |
 
 `coredns_zonedns_registry_names`（目前可解析的名稱數）雖非告警項，掉到 0 或

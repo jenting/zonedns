@@ -53,6 +53,31 @@ func TestBuildSnapshotSkipsEntriesWithoutZone(t *testing.T) {
 	}
 }
 
+// k8s label value 允許點字元，但 ednszone.Valid（identity 端驗證 agent 宣告的
+// source zone 所用的同一套規則）拒絕。這個 entry 若被放進可查詢的快照，這個
+// zone 就能正常當 dest zone 用，但該 zone 裡每一個 workload 當 source 發問時，
+// 它們的 source zone 宣告都會在 identity.SourceZone 被判定不合法而丟棄 ——
+// 必須跟「沒有 zone 段」一樣，整個 entry 計進 Skipped。
+func TestBuildSnapshotSkipsEntriesWithNonConformingZone(t *testing.T) {
+	snap, stats := BuildSnapshot([]Entry{
+		{SPIFFEIDPath: "/zone/zone.a/ns/prod/sa/legacy", DNSNames: []string{"legacy.example.com"}},
+		{SPIFFEIDPath: "/zone/zone-a/ns/prod/sa/payments", DNSNames: []string{"payments.example.com"}},
+	})
+
+	if _, ok := snap.Lookup("legacy.example.com."); ok {
+		t.Fatal("entry with a non-conforming zone must not enter the registry")
+	}
+	if _, ok := snap.Lookup("payments.example.com."); !ok {
+		t.Fatal("valid entry missing from snapshot")
+	}
+	if stats.Skipped != 1 {
+		t.Fatalf("Skipped = %d, want 1", stats.Skipped)
+	}
+	if stats.Names != 1 {
+		t.Fatalf("Names = %d, want 1", stats.Names)
+	}
+}
+
 // 兩筆 entry 對同一個名字宣告不同 zone：不可任選一個，該名字整個視為不可解析。
 func TestBuildSnapshotConflictMakesNameUnresolvable(t *testing.T) {
 	snap, stats := BuildSnapshot([]Entry{

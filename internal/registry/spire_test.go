@@ -233,7 +233,7 @@ func TestRunTracksConsecutivePollErrors(t *testing.T) {
 	var sawFailure, sawReset bool
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if n := ConsecutivePollErrors(); n > 0 {
+		if n := p.ConsecutivePollErrors(); n > 0 {
 			sawFailure = true
 		} else if sawFailure {
 			sawReset = true
@@ -254,6 +254,105 @@ func TestRunTracksConsecutivePollErrors(t *testing.T) {
 	}
 	if !sawReset {
 		t.Fatal("expected ConsecutivePollErrors() to reset to 0 after a subsequent successful poll")
+	}
+}
+
+// pollErrors 是 Poller 各自的欄位，不是套件層級的單一計數器 —— 兩個 Poller
+// 各自失敗，彼此的連續失敗次數互不影響。這是把 pollErrors 從套件變數改成
+// Poller 欄位之後，唯一能證明「確實互相獨立」的測試；改回套件層級變數會讓
+// 這個測試失敗。
+func TestPollErrorsAreIndependentPerPoller(t *testing.T) {
+	// pollErrors is only ever mutated inside Run's loop (PollOnce itself is
+	// I/O-free and side-effect-free with respect to the counter), so this
+	// drives each Poller through Run rather than calling PollOnce directly.
+	failing := &fakeLister{err: errors.New("spire unavailable")}
+	ok := &fakeLister{pages: [][]Entry{
+		{{SPIFFEIDPath: "/zone/zone-a/ns/prod/sa/payments", DNSNames: []string{"payments.example.com"}}},
+	}}
+
+	pFail := NewPoller(failing, NewStore(), time.Hour) // long interval: Run's immediate first poll is all that runs
+	pOK := NewPoller(ok, NewStore(), time.Hour)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	doneFail := make(chan struct{})
+	doneOK := make(chan struct{})
+	go func() { pFail.Run(ctx); close(doneFail) }()
+	go func() { pOK.Run(ctx); close(doneOK) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && pFail.ConsecutivePollErrors() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+
+	if n := pFail.ConsecutivePollErrors(); n != 1 {
+		t.Fatalf("pFail.ConsecutivePollErrors() = %d, want 1", n)
+	}
+	if n := pOK.ConsecutivePollErrors(); n != 0 {
+		t.Fatalf("pOK.ConsecutivePollErrors() = %d, want 0 — a failure on another Poller must not leak into this one", n)
+	}
+
+	cancel()
+	for _, done := range []chan struct{}{doneFail, doneOK} {
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("Run did not return after context cancellation")
+		}
+	}
+}
+
+// OnPollErrors 是 registry_poll_errors gauge 的唯一資料來源：它必須在成功與
+// 失敗時都被呼叫（成功時歸零、失敗時往上發布），只在其中一種情況呼叫都會讓
+// gauge 卡在舊值。
+func TestRunCallsOnPollErrorsOnBothOutcomes(t *testing.T) {
+	lister := &flakyLister{failUntil: 2}
+	p := NewPoller(lister, NewStore(), 2*time.Millisecond)
+
+	var mu sync.Mutex
+	var saw []int64
+	p.OnPollErrors = func(count int64) {
+		mu.Lock()
+		saw = append(saw, count)
+		mu.Unlock()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { p.Run(ctx); close(done) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(saw)
+		mu.Unlock()
+		if n >= 4 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return after context cancellation")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	var sawPositive, sawZero bool
+	for _, n := range saw {
+		if n > 0 {
+			sawPositive = true
+		} else {
+			sawZero = true
+		}
+	}
+	if !sawPositive {
+		t.Fatalf("OnPollErrors never reported a positive count: %v", saw)
+	}
+	if !sawZero {
+		t.Fatalf("OnPollErrors never reported 0 after recovery: %v", saw)
 	}
 }
 

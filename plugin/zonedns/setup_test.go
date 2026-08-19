@@ -3,6 +3,7 @@ package zonedns
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/coredns/caddy"
 	"github.com/coredns/coredns/core/dnsserver"
@@ -105,6 +106,21 @@ func TestParseCorefileRejectsDuplicateGateway(t *testing.T) {
 	}`)
 	if _, err := parseConfig(c); err == nil {
 		t.Fatal("expected error for a zone with two gateway declarations")
+	}
+}
+
+// k8s label value 允許點字元，但 ednszone.Valid（identity 用來驗證 agent
+// 宣告的 source zone 的同一套規則）拒絕。若 gateway 端不擋，一個帶點的 zone
+// 名稱能正常當 dest zone 使用，卻會讓該 zone 裡每一個 workload 的 source zone
+// 宣告永遠被判定不合法而丟棄，靜默降級成 zone-盲。必須在設定解析時就拒絕。
+func TestParseCorefileRejectsNonConformingGatewayZoneName(t *testing.T) {
+	c := caddy.NewTestController("dns", `zonedns {
+		spire_server unix:///tmp/spire-server/private/api.sock
+		authorized_agent spiffe://example.org/node/n1
+		gateway zone.a 203.0.113.10
+	}`)
+	if _, err := parseConfig(c); err == nil {
+		t.Fatal("expected error for a gateway zone name that ednszone.Valid rejects")
 	}
 }
 
@@ -225,7 +241,8 @@ func TestParseCorefileAcceptsSpireServerIDForNetworkAddress(t *testing.T) {
 // 插進 "cache" 之前（滿足 CheckDirectiveOrder），跑完立刻還原。本套件沒有任何
 // 測試使用 t.Parallel()，因此這個暫時性的全域修改不會與其他測試競爭。
 func TestSetupResetsRegistryReadyGauge(t *testing.T) {
-	registryReady.Set(1) // 模擬前一個 instance 已經就緒過。
+	registryReady.Set(1)      // 模擬前一個 instance 已經就緒過。
+	registryPollErrors.Set(3) // 模擬前一個 instance 曾經連續輪詢失敗過。
 
 	origDirectives := dnsserver.Directives
 	extended := make([]string, 0, len(origDirectives)+1)
@@ -259,6 +276,46 @@ func TestSetupResetsRegistryReadyGauge(t *testing.T) {
 
 	if got := testutil.ToFloat64(registryReady); got != 0 {
 		t.Fatalf("registryReady = %v, want 0", got)
+	}
+	// Same reasoning as registryReady above: a fresh Poller starts with zero
+	// consecutive failures, so a stale non-zero reading left over from a
+	// previous instance would misreport a healthy reload as still degraded.
+	if got := testutil.ToFloat64(registryPollErrors); got != 0 {
+		t.Fatalf("registryPollErrors = %v, want 0", got)
+	}
+}
+
+// go-spiffe 的 NewX509Source 文件明載會阻塞到第一筆 Workload API 更新抵達為止，
+// 且不帶任何逾時 —— 若 dialSPIRE 用 context.Background() 呼叫它，一個沒起來的
+// agent socket 會讓 setup() 永遠卡住（啟動時整個掛住、reload 時卡住 reload
+// 本身）。這裡把 workloadAPIDialTimeout 縮短成測試可接受的長度，指向一個確定
+// 不存在的 unix socket，驗證 dialSPIRE 會在這段時間內回傳錯誤，而不是一直等
+// 下去；並驗證錯誤訊息指名 workload_api，讓操作者知道要檢查什麼。
+func TestDialSPIRETimesOutWhenWorkloadAPIUnavailable(t *testing.T) {
+	origTimeout := workloadAPIDialTimeout
+	workloadAPIDialTimeout = 200 * time.Millisecond
+	defer func() { workloadAPIDialTimeout = origTimeout }()
+
+	cfg := &config{
+		spireServer:   "spire-server.example.org:8443",
+		spireServerID: "spiffe://example.org/spire/server",
+		workloadAPI:   "unix:///tmp/zonedns-test-nonexistent-agent.sock",
+	}
+
+	start := time.Now()
+	_, _, err := dialSPIRE(cfg)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected an error when the workload_api socket does not exist")
+	}
+	if !strings.Contains(err.Error(), "workload_api") {
+		t.Fatalf("error should name the workload_api option so the operator knows what to check: %v", err)
+	}
+	// Generous upper bound: this must be well under NewX509Source's unbounded
+	// default, not exactly workloadAPIDialTimeout to the millisecond.
+	if elapsed > 5*time.Second {
+		t.Fatalf("dialSPIRE took %s, want bounded by workloadAPIDialTimeout (%s)", elapsed, workloadAPIDialTimeout)
 	}
 }
 

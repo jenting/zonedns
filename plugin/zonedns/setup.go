@@ -33,6 +33,17 @@ const (
 	defaultTTL          = uint32(30)
 )
 
+// workloadAPIDialTimeout 限制 dialSPIRE 等待本機 SPIRE agent 的 Workload API
+// 交出第一筆 X509 SVID 更新的時間。
+//
+// go-spiffe 的 NewX509Source 文件明載：它會阻塞到第一筆更新抵達為止，且不帶
+// 任何逾時。若 agent socket 沒起來（路徑寫錯、agent 還沒啟動、agent 掛了），
+// setup() 會永遠卡住整個 Corefile 解析 —— 啟動時 CoreDNS 永遠起不來且沒有任何
+// 錯誤訊息；`reload` 時則卡住 reload 本身，而舊的 instance 仍在提供服務，
+// 讓卡住這件事更難被發現。改成變數（而非 const）是為了讓測試能縮短它，不必
+// 真的等滿逾時。
+var workloadAPIDialTimeout = 10 * time.Second
+
 func init() { plugin.Register("zonedns", setup) }
 
 // config 是從 Corefile 解析出來的設定。
@@ -108,12 +119,15 @@ func setup(c *caddy.Controller) error {
 	}
 
 	store := registry.NewStore()
-	// registryReady is a package-level gauge shared across Corefile reloads. Without
-	// this reset it would keep reporting the *previous* instance's readiness (1) for
-	// up to a full poll_interval after a reload, while the new (empty) Store silently
-	// takes the non-zone-aware path on every query — the metric would lie exactly
-	// when it matters most.
+	// registryReady and registryPollErrors are package-level gauges shared across
+	// Corefile reloads. Without this reset registryReady would keep reporting the
+	// *previous* instance's readiness (1) for up to a full poll_interval after a
+	// reload, while the new (empty) Store silently takes the non-zone-aware path on
+	// every query; registryPollErrors would similarly keep reporting the previous
+	// instance's error streak against a brand new Poller that has not failed at
+	// all yet — either way the metric would lie exactly when it matters most.
 	registryReady.Set(0)
+	registryPollErrors.Set(0)
 
 	conn, cleanup, err := dialSPIRE(cfg)
 	if err != nil {
@@ -128,6 +142,12 @@ func setup(c *caddy.Controller) error {
 		if s.Conflicts > 0 {
 			log.Warningf("%d DNS names have conflicting zone declarations and are unresolvable", s.Conflicts)
 		}
+	}
+	// OnPollErrors fires after every poll attempt, success or failure alike —
+	// unlike OnSnapshot it must run on both outcomes, otherwise this gauge can
+	// only ever go up (never reset to 0 on recovery) or never move at all.
+	poller.OnPollErrors = func(count int64) {
+		registryPollErrors.Set(float64(count))
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -184,10 +204,18 @@ func dialSPIRE(cfg *config) (*grpc.ClientConn, func(), error) {
 		return nil, nil, fmt.Errorf("invalid spire_server_id %q: %w", cfg.spireServerID, err)
 	}
 
-	source, err := workloadapi.NewX509Source(context.Background(),
+	// NewX509Source blocks until the first Workload API update arrives, with
+	// no timeout of its own — bound it here so a down or misconfigured agent
+	// socket fails setup() loudly instead of hanging it forever (see
+	// workloadAPIDialTimeout above).
+	dialCtx, cancel := context.WithTimeout(context.Background(), workloadAPIDialTimeout)
+	defer cancel()
+	source, err := workloadapi.NewX509Source(dialCtx,
 		workloadapi.WithClientOptions(workloadapi.WithAddr(cfg.workloadAPI)))
 	if err != nil {
-		return nil, nil, fmt.Errorf("create X509Source from %q: %w", cfg.workloadAPI, err)
+		return nil, nil, fmt.Errorf("create X509Source from workload_api %q: waited %s for the SPIRE "+
+			"Workload API to hand back the first SVID update and it did not arrive — check that the SPIRE "+
+			"agent is running and its socket is reachable at that path: %w", cfg.workloadAPI, workloadAPIDialTimeout, err)
 	}
 
 	// AuthorizeID pins the exact SPIFFE ID that must present the server certificate.
@@ -288,6 +316,18 @@ func parseConfig(c *caddy.Controller) (*config, error) {
 				args := c.RemainingArgs()
 				if len(args) != 2 {
 					return nil, c.Errf("gateway needs a zone and an address, got %d arguments", len(args))
+				}
+				// ednszone.Valid 是 registry 端（spiffezone.FromPath）也隱含依賴的
+				// 字元集邊界：一個帶點的 zone 名稱（k8s label value 允許，但
+				// ednszone.Valid 拒絕，見其註解與測試 "zone.a"）能在 gateway 表與
+				// registry 裡運作良好，卻會讓每一筆從該 zone 送來的 source zone
+				// 宣告在 identity.SourceZone 被 ednszone.Get 判定為不合法而丟棄
+				// （ReasonNoDeclaration）——那些 workload 從此永遠拿到 zone-盲的
+				// 答案，而且沒有被告警的 metric。在設定解析時就用同一套規則拒絕，
+				// 讓不合規的 zone 在啟動時就爆炸，而不是在執行期悄悄降級。
+				if !ednszone.Valid(args[0]) {
+					return nil, c.Errf("gateway zone %q is not a valid zone name (must match the "+
+						"identity/registry zone character set, see ednszone.Valid)", args[0])
 				}
 				if _, dup := gateways[args[0]]; dup {
 					return nil, c.Errf("gateway for zone %q is already configured", args[0])

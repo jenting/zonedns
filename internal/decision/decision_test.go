@@ -63,6 +63,28 @@ func TestDecideTable(t *testing.T) {
 	}
 }
 
+// Action.String() 的輸出是 Prometheus metric decision_total 的 action label
+// value；調整 iota 順序會在不知不覺間改名 metric，並讓 docs/deployment.md
+// 要求的 action="servfail" 告警（唯一會抓到「zone 缺 gateway 設定」的告警）
+// 悄悄失效。每個常數的字串都要單獨鎖住，外加一個 out-of-range 值鎖住 default
+// 分支 —— internal/identity 的 Reason.String() 已有這個測試，這是缺的另一半。
+func TestActionString(t *testing.T) {
+	cases := []struct {
+		action Action
+		want   string
+	}{
+		{ActionPassThrough, "passthrough"},
+		{ActionAnswerGateway, "gateway"},
+		{ActionServFail, "servfail"},
+		{Action(999), "unknown"},
+	}
+	for _, c := range cases {
+		if got := c.action.String(); got != c.want {
+			t.Fatalf("Action(%d).String() = %q, want %q", c.action, got, c.want)
+		}
+	}
+}
+
 // 同 zone 不查 gateway 表 — 若查了，未設定 gateway 的 zone 會誤觸 SERVFAIL。
 func TestSameZoneDoesNotConsultGatewayTable(t *testing.T) {
 	called := false

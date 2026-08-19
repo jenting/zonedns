@@ -167,6 +167,23 @@ func TestServeDNSCrossZoneAnswersGateway(t *testing.T) {
 	}
 }
 
+// gateway 答案必須帶回 OPT record —— 觸發這個分支的查詢一定帶了 EDNS0（zone
+// 宣告本身就是靠 EDNS0 option 攜帶的），如果回應漏了 OPT，就是對一個帶 EDNS0
+// 的查詢回一個非 EDNS 的答案，部分 resolver 會視為格式錯誤。
+func TestServeDNSCrossZoneAnswerPreservesEDNS0(t *testing.T) {
+	next := &nextCalled{}
+	h := newHandler(t, next)
+
+	r, w := newRequest(t, "payments.example.com.", dns.TypeA, "zone-b")
+
+	if _, err := h.ServeDNS(context.Background(), w, r); err != nil {
+		t.Fatalf("ServeDNS: %v", err)
+	}
+	if opt := w.Msg.IsEdns0(); opt == nil {
+		t.Fatal("gateway answer dropped the OPT record from an EDNS0 query")
+	}
+}
+
 // answerGateway 呼叫 state.W.WriteMsg 失敗時（例如 client 中途斷線），不可讓
 // ServeDNS panic 或回傳跟成功時不一致的結果 —— 呼叫端（CoreDNS 的 server 迴圈）
 // 只看 (rcode, error) 這兩個回傳值，錯誤已經在內部記錄成 log 就足夠了。
@@ -271,6 +288,55 @@ func TestServeDNSNoIdentityPassesThrough(t *testing.T) {
 	}
 	if !next.called {
 		t.Fatal("query without identity must reach the next plugin")
+	}
+}
+
+// zonedns.go 的 `SourceOK: reason == identity.ReasonOK` 是整個信任邊界在
+// ServeDNS 這一層唯一的把關點：把它改成 `reason != identity.ReasonNoTLS`
+// 仍然編譯得過，且會讓「有憑證但不在授權清單」與「有憑證且沒有宣告」都被
+// 誤判成可信 —— 之前完全沒有 ServeDNS 層級的測試用「格式正確、但 SPIFFE ID
+// 不在授權清單內」的憑證跑過跨 zone 查詢，只有 internal/identity 單獨測過這個
+// reason，plugin 層的測試則只用過已授權憑證或完全沒有憑證。這裡補上：未授權
+// agent 對跨 zone 名稱發問，必須拿到下游（一般路徑）的答案，而不是 gateway
+// VIP —— 斷言的是回應內容，不是只看 reason 或 rcode。
+func TestServeDNSUnauthorizedAgentDoesNotGetGatewayAnswer(t *testing.T) {
+	next := &nextCalled{}
+	h := newHandler(t, next)
+
+	m := new(dns.Msg)
+	m.SetQuestion("payments.example.com.", dns.TypeA)
+	ednszone.Set(m, ednszone.DefaultCode, "zone-b") // 宣告跨 zone，若被誤信會觸發 gateway 答案
+
+	// 憑證格式完全合法（恰好一個 spiffe URI SAN），只是這個 SPIFFE ID 不在
+	// newHandler 設定的 authorized_agent 清單（只有 testAgentID）裡。
+	unauthorizedID := "spiffe://example.org/node/intruder"
+	certs := []*x509.Certificate{testcerts.New(t, unauthorizedID)}
+	w := &dotWriter{
+		ResponseWriter: &test.ResponseWriter{},
+		state:          &tls.ConnectionState{PeerCertificates: certs},
+	}
+
+	code, err := h.ServeDNS(context.Background(), w, m)
+	if err != nil {
+		t.Fatalf("ServeDNS: %v", err)
+	}
+	if code != dns.RcodeSuccess {
+		t.Fatalf("rcode = %d, want NOERROR", code)
+	}
+	if !next.called {
+		t.Fatal("unauthorized agent's declaration must be ignored — query must reach the next plugin")
+	}
+	if w.Msg == nil || len(w.Msg.Answer) != 1 {
+		t.Fatalf("answers = %v, want exactly 1", w.Msg)
+	}
+	a, isA := w.Msg.Answer[0].(*dns.A)
+	if !isA {
+		t.Fatalf("answer is %T, want *dns.A", w.Msg.Answer[0])
+	}
+	// 必須是下游那顆一般答案（10.96.0.7，見 nextCalled.ServeDNS），不能是
+	// zone-a 的 gateway VIP（203.0.113.10）——後者代表未授權的 zone 宣告被採信了。
+	if a.A.String() != "10.96.0.7" {
+		t.Fatalf("answer = %s, want the downstream answer 10.96.0.7 (not the gateway VIP)", a.A)
 	}
 }
 

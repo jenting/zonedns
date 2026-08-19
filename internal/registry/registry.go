@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/jenting/zonedns/internal/ednszone"
 	"github.com/jenting/zonedns/internal/spiffezone"
 )
 
@@ -22,7 +23,7 @@ type Entry struct {
 type Stats struct {
 	Names     int // 可解析的名稱數
 	Conflicts int // 因 zone 衝突而被移除的名稱數
-	Skipped   int // 因 SPIFFE ID 沒有 zone 段而略過的 entry 數
+	Skipped   int // 因 SPIFFE ID 沒有 zone 段、或 zone 字串不合 ednszone.Valid 而略過的 entry 數
 }
 
 // Snapshot 是某個時間點的唯讀對照表。
@@ -51,6 +52,19 @@ func BuildSnapshot(entries []Entry) (*Snapshot, Stats) {
 	for _, e := range entries {
 		zone, err := spiffezone.FromPath(e.SPIFFEIDPath)
 		if err != nil {
+			stats.Skipped++
+			continue
+		}
+		// ednszone.Valid 是 identity.SourceZone 用來驗證 agent 宣告的 source
+		// zone 字元集的同一套規則（見 ednszone.Get）。若在這裡放行一個不合此
+		// 規則的 zone（例如 k8s label value 允許但 ednszone.Valid 拒絕的
+		// "zone.a"），它會在 gateway 表與這份 registry 裡都能正常查得到、正常
+		// 當 dest zone 使用，但該 zone 裡的每一個 workload 當 source 發問時，
+		// 它們 agent 宣告的 source zone 都會被 ednszone.Get 判成不合法而丟棄
+		// （ReasonNoDeclaration）—— 於是這些 workload 永遠拿到 zone-盲的答案，
+		// 且沒有告警。因此兩側必須用同一套驗證，不合規的 zone 一律視同「沒有
+		// zone 段」處理，計進 Skipped 而非放進可查詢的快照。
+		if !ednszone.Valid(zone) {
 			stats.Skipped++
 			continue
 		}

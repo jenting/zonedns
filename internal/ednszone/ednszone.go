@@ -62,21 +62,33 @@ func Set(m *dns.Msg, code uint16, zone string) {
 }
 
 // Get 讀出 source zone。zone 不合法時回 ok=false，與「不存在」同樣處理。
+//
+// 出現兩個以上帶同一個 code 的 option 時也回 ok=false，即使其中之一內容合法 ——
+// Set 會防止單一呼叫端疊加出這種訊息，但 central 端解析的是線上位元組，
+// 惡意或有 bug 的 agent 送出的封包不受 Set 保護。任選其中一個（例如「取第一個」）
+// 等於接受一個可能已被攻擊者插入的宣告冒充另一個，與本專案在
+// SPIFFEIDFromCert 拒絕多個 URI SAN 憑證的理由相同：模糊就是要 fail closed，
+// 不嘗試挑出「最合理」的那個。
 func Get(m *dns.Msg, code uint16) (string, bool) {
 	opt := m.IsEdns0()
 	if opt == nil {
 		return "", false
 	}
+	var zone string
+	matches := 0
 	for _, o := range opt.Option {
 		l, isLocal := o.(*dns.EDNS0_LOCAL)
 		if !isLocal || l.Code != code {
 			continue
 		}
-		zone := string(l.Data)
-		if !Valid(zone) {
+		matches++
+		if matches > 1 {
 			return "", false
 		}
-		return zone, true
+		zone = string(l.Data)
 	}
-	return "", false
+	if matches != 1 || !Valid(zone) {
+		return "", false
+	}
+	return zone, true
 }

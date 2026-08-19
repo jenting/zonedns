@@ -18,17 +18,6 @@ import (
 
 var log = clog.NewWithPlugin("zonedns")
 
-// pollErrors 記錄連續失敗次數，由 plugin 層讀出成 metric。
-//
-// 這是套件層級的單一計數器，由「本 process 中每一個 Poller」共用，而不是每個
-// Poller 各自一份。目前的部署只會建立一個 Poller，所以這剛好等於該 Poller 的
-// 連續失敗次數；但如果將來有第二個 Poller，它會跟第一個共用同一個計數器，
-// 而不是各自獨立計數。
-var pollErrors atomic.Int64
-
-// ConsecutivePollErrors 回傳連續輪詢失敗次數。0 表示最近一次輪詢成功。
-func ConsecutivePollErrors() int64 { return pollErrors.Load() }
-
 // EntryLister 取得一頁 registration entry。
 //
 // 抽成介面是為了讓輪詢邏輯（分頁、錯誤處理、快照替換）可以脫離 gRPC 測試。
@@ -99,18 +88,46 @@ type Poller struct {
 	store    *Store
 	interval time.Duration
 
+	// pollErrors 記錄這個 Poller 連續輪詢失敗的次數。
+	//
+	// 這是 Poller 的欄位而非套件層級變數 —— 目前的部署只會建立一個 Poller，
+	// 兩種做法效果相同，但套件層級的單一計數器會被「本 process 中每一個
+	// Poller」共用：將來若有第二個 Poller（例如同時輪詢兩個 SPIRE Server），
+	// 它會跟第一個共用同一個計數器而非各自獨立計數，讓 ConsecutivePollErrors
+	// 這個「連續失敗次數」的意義變得不可靠。做成欄位讓每個 Poller 天生互相
+	// 獨立，不必等到真的出現第二個 Poller 才發現這個問題。
+	pollErrors atomic.Int64
+
 	// OnSnapshot 在每次成功輪詢後被呼叫，帶入該次快照的 Stats。
 	//
 	// 這是 Run 把統計值交給外層（例如 plugin 層要把它們發布成 Prometheus
 	// gauge）的唯一管道 —— PollOnce 的回傳值只在呼叫端手動呼叫時看得到，
 	// Run 內部的輪詢迴圈本身不會回傳任何東西。可留空（nil）。
 	OnSnapshot func(Stats)
+
+	// OnPollErrors 在每次輪詢（成功或失敗）結束後被呼叫，帶入呼叫當下的連續
+	// 失敗次數（與 ConsecutivePollErrors() 同步）。
+	//
+	// 這是 registry_poll_errors gauge 的唯一資料來源：與 OnSnapshot 不同，
+	// 它在成功與失敗時都會被呼叫 —— 失敗時才能把次數往上發布，成功時才能把
+	// gauge 歸零，缺一都會讓這個 metric 卡在舊值或永遠是 0。可留空（nil）。
+	OnPollErrors func(count int64)
 }
 
 // NewPoller 建立 Poller。
 func NewPoller(lister EntryLister, store *Store, interval time.Duration) *Poller {
 	return &Poller{lister: lister, store: store, interval: interval}
 }
+
+// ConsecutivePollErrors 回傳這個 Poller 連續輪詢失敗的次數。0 表示最近一次
+// 輪詢成功（或還沒輪詢過）。
+//
+// spec §6.2 要求輪詢失敗時「沿用上一份快照並遞增 metric」——這個方法（經
+// OnPollErrors 或呼叫端輪詢）就是那個 metric 唯一的資料來源。SPIRE 變得不可
+// 達（admin SVID 過期、admin 權限被收回、網路分斷）時，Store 會無限期沿用
+// 最後一份快照：registry_ready 停在 1、registry_names 停在最後的值，唯一的
+// 訊號就是這個計數器。
+func (p *Poller) ConsecutivePollErrors() int64 { return p.pollErrors.Load() }
 
 // PollOnce 拉取全部 entry 並替換快照。
 //
@@ -161,13 +178,16 @@ func (p *Poller) Run(ctx context.Context) {
 	for {
 		stats, err := p.PollOnce(ctx)
 		if err != nil {
-			pollErrors.Add(1)
+			p.pollErrors.Add(1)
 			log.Warningf("registry poll failed, keeping previous snapshot: %v", err)
 		} else {
-			pollErrors.Store(0)
+			p.pollErrors.Store(0)
 			if p.OnSnapshot != nil {
 				p.OnSnapshot(stats)
 			}
+		}
+		if p.OnPollErrors != nil {
+			p.OnPollErrors(p.pollErrors.Load())
 		}
 
 		select {

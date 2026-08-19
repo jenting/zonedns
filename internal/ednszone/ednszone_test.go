@@ -95,6 +95,39 @@ func TestGetRejectsInvalidZone(t *testing.T) {
 	}
 }
 
+// Pack/Unpack 讓兩個帶同一個 code 的 EDNS0_LOCAL option 存活下來（Set 本身
+// 防止單一呼叫端疊加出這種訊息，但 central 端解析的是線上位元組，不受 Set
+// 保護）。Get 必須回 ok=false 而不是任選其中一個 —— 見 spec §10 的「多個 EDNS0
+// option」adversarial 案例，以及本套件與 SPIFFEIDFromCert 一致的 fail-closed
+// 原則。
+func TestGetRejectsDuplicateOption(t *testing.T) {
+	m := newQuery()
+	opt := m.IsEdns0()
+	if opt == nil {
+		m.SetEdns0(dns.DefaultMsgSize, false)
+		opt = m.IsEdns0()
+	}
+	opt.Option = append(opt.Option,
+		&dns.EDNS0_LOCAL{Code: DefaultCode, Data: []byte("zone-a")},
+		&dns.EDNS0_LOCAL{Code: DefaultCode, Data: []byte("zone-b")},
+	)
+
+	// 往返一次 wire format，確認兩個 option 真的能在 Pack/Unpack 之後存活，
+	// 不是只在記憶體內的 slice 上才成立。
+	packed, err := m.Pack()
+	if err != nil {
+		t.Fatalf("Pack: %v", err)
+	}
+	unpacked := new(dns.Msg)
+	if err := unpacked.Unpack(packed); err != nil {
+		t.Fatalf("Unpack: %v", err)
+	}
+
+	if _, ok := Get(unpacked, DefaultCode); ok {
+		t.Fatal("Get accepted a message with two options carrying the same code")
+	}
+}
+
 func TestValid(t *testing.T) {
 	for _, good := range []string{"zone-a", "z", "zone_1", "ZoneA", strings.Repeat("z", MaxLen)} {
 		if !Valid(good) {
