@@ -2,29 +2,29 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 實作 zonedns 的中心端 CoreDNS plugin — 終結 mTLS DoH、驗證 agent 身分、依 source zone 與 dest zone 決定回一般答案或 zone gateway VIP。
+**Goal:** Implement zonedns's central CoreDNS plugin — terminate mTLS DoH, verify the agent's identity, and decide from the source zone and dest zone whether to return the ordinary answer or the zone gateway VIP.
 
-**Architecture:** 一個 CoreDNS plugin（`zonedns`），組合四個獨立可測的單元：`identity`（信任邊界，從 peer cert + EDNS0 取得 source zone）、`registry`（輪詢 SPIRE Entry API，維護 FQDN → dest zone）、`zonetable`（zone → gateway VIP 設定）、`decision`（純函式）。plugin 必須排在 `cache` 之前，此約束在啟動時強制檢查。
+**Architecture:** One CoreDNS plugin, `zonedns`, composing four independently testable units: `identity` (the trust boundary, deriving the source zone from the peer cert plus EDNS0), `registry` (polls the SPIRE Entry API and maintains FQDN → dest zone), `zonetable` (the zone → gateway VIP configuration) and `decision` (a pure function). The plugin must sort before `cache`, and that constraint is enforced at startup.
 
-**Tech Stack:** Go、CoreDNS plugin API、miekg/dns、spire-api-sdk（Entry API gRPC）、go-spiffe/v2（SVID 來源與 SPIFFE ID 解析）、Prometheus client。
+**Tech Stack:** Go, the CoreDNS plugin API, miekg/dns, spire-api-sdk (the Entry API over gRPC), go-spiffe/v2 (the SVID source and SPIFFE ID parsing), the Prometheus client.
 
 **Spec:** `docs/superpowers/specs/2026-08-18-zonedns-design.md`
 
 ## Global Constraints
 
-- Go module path：`github.com/jenting/zonedns`
-- Go 版本：1.25（對齊 `sigs.k8s.io/node-local-dns` 的 `go 1.25.0`，子專案 2 要共用套件）
-- CoreDNS 版本：`github.com/coredns/coredns v1.14.6`（對齊 node-local-dns 的 pin）
-- EDNS0 option code 預設 `65001`（local/experimental 區間 65001–65534），可經設定覆寫
-- 跨 zone 答案 TTL 預設 `30` 秒，可經設定覆寫
-- SPIFFE ID path 格式：`/zone/<zone>/...`，zone 為 path 的第二段
-- **`zonedns` 在 `dnsserver.Directives` 中必須排在 `cache` 之前**，違反時啟動失敗
-- 共用套件放 `internal/`（子專案 2 在同一 module 內，可正常匯入）
-- 所有 metric 前綴 `zonedns_`，subsystem 遵循 CoreDNS 慣例
+- Go module path: `github.com/jenting/zonedns`
+- Go version: 1.25, matching `sigs.k8s.io/node-local-dns`'s `go 1.25.0`, since subproject 2 shares these packages
+- CoreDNS version: `github.com/coredns/coredns v1.14.6`, matching node-local-dns's pin
+- The EDNS0 option code defaults to `65001` (the local/experimental range is 65001–65534) and can be overridden by configuration
+- The TTL of a cross-zone answer defaults to `30` seconds and can be overridden by configuration
+- SPIFFE ID path format: `/zone/<zone>/...`, with the zone as the path's second segment
+- **`zonedns` must sort before `cache` in `dnsserver.Directives`**, and startup fails when it does not
+- Shared packages go in `internal/`; subproject 2 is in the same module and can import them normally
+- Every metric carries the `zonedns_` prefix, with the subsystem following CoreDNS convention
 
 ---
 
-### Task 1: 專案骨架 + `spiffezone`（從 SPIFFE ID 取 zone）
+### Task 1: project skeleton plus `spiffezone`, extracting the zone from a SPIFFE ID
 
 **Files:**
 - Create: `go.mod`
@@ -32,13 +32,13 @@
 - Test: `internal/spiffezone/spiffezone_test.go`
 
 **Interfaces:**
-- Consumes: 無（第一個任務）
+- Consumes: nothing (this is the first task)
 - Produces:
   - `spiffezone.FromPath(path string) (string, error)`
   - `spiffezone.FromID(id string) (string, error)`
   - `spiffezone.ErrNoZone error`
 
-- [ ] **Step 1: 建立 module**
+- [ ] **Step 1: Create the module**
 
 ```bash
 cd /Users/jenting/go/src/github.com/jenting/zonedns
@@ -46,9 +46,9 @@ go mod init github.com/jenting/zonedns
 go mod edit -go=1.25
 ```
 
-- [ ] **Step 2: 寫失敗的測試**
+- [ ] **Step 2: Write the failing test**
 
-建立 `internal/spiffezone/spiffezone_test.go`：
+Create `internal/spiffezone/spiffezone_test.go`:
 
 ```go
 package spiffezone
@@ -105,21 +105,23 @@ func TestFromIDRejectsNonSPIFFE(t *testing.T) {
 }
 ```
 
-- [ ] **Step 3: 執行測試確認失敗**
+- [ ] **Step 3: Run the test and confirm it fails**
 
 Run: `go test ./internal/spiffezone/ -v`
 Expected: FAIL — `undefined: FromPath`
 
-- [ ] **Step 4: 寫最小實作**
+- [ ] **Step 4: Write the minimal implementation**
 
-建立 `internal/spiffezone/spiffezone.go`：
+Create `internal/spiffezone/spiffezone.go`:
 
 ```go
-// Package spiffezone 從 SPIFFE ID 取出 zone。
+// Package spiffezone extracts the zone from a SPIFFE ID.
 //
-// 約定：zone 是 SPIFFE ID path 的第一組 key/value，形如 /zone/<zone>/...
-// 這個約定同時被 central plugin（取 dest zone）與 agent plugin（取 source zone）
-// 使用，因此放在共用套件裡，避免兩邊各寫一份而發生解析差異。
+// The convention: the zone is the first key/value pair in the SPIFFE ID path,
+// of the form /zone/<zone>/... Both the central plugin (for the dest zone) and
+// the agent plugin (for the source zone) rely on this convention, so it lives
+// in a shared package — two independent copies could drift apart in how they
+// parse it.
 package spiffezone
 
 import (
@@ -129,10 +131,10 @@ import (
 	"strings"
 )
 
-// ErrNoZone 表示 path 裡沒有合法的 zone 段。
+// ErrNoZone reports that the path contains no valid zone segment.
 var ErrNoZone = errors.New("spiffezone: no zone segment in path")
 
-// FromPath 從 SPIFFE ID 的 path 取出 zone。
+// FromPath extracts the zone from the path of a SPIFFE ID.
 func FromPath(path string) (string, error) {
 	segs := strings.Split(strings.TrimPrefix(path, "/"), "/")
 	if len(segs) < 2 || segs[0] != "zone" || segs[1] == "" {
@@ -141,7 +143,7 @@ func FromPath(path string) (string, error) {
 	return segs[1], nil
 }
 
-// FromID 從完整的 SPIFFE ID 取出 zone。
+// FromID extracts the zone from a complete SPIFFE ID.
 func FromID(id string) (string, error) {
 	u, err := url.Parse(id)
 	if err != nil {
@@ -154,10 +156,10 @@ func FromID(id string) (string, error) {
 }
 ```
 
-- [ ] **Step 5: 執行測試確認通過**
+- [ ] **Step 5: Run the test and confirm it passes**
 
 Run: `go test ./internal/spiffezone/ -v`
-Expected: PASS，全部子測試綠燈
+Expected: PASS, every subtest green
 
 - [ ] **Step 6: Commit**
 
@@ -168,18 +170,19 @@ git commit -m "feat(spiffezone): extract zone from SPIFFE ID path"
 
 ---
 
-### Task 2: `ednszone` — EDNS0 契約編解碼
+### Task 2: `ednszone` — encoding and decoding the EDNS0 contract
 
-這是子專案 1 與子專案 2 之間**唯一的相容性介面**（spec §6.6）。兩端都用這個套件，
-所以編碼與解碼寫在一起、一起測試，不會有一邊改了另一邊沒改的情況。
+This is the **sole compatibility interface** between subprojects 1 and 2 (spec
+§6.6). Both ends use this package, so encoding and decoding are written together
+and tested together, and neither side can change without the other.
 
 **Files:**
 - Create: `internal/ednszone/ednszone.go`
 - Test: `internal/ednszone/ednszone_test.go`
-- Modify: `go.mod`（加入 `github.com/miekg/dns`）
+- Modify: `go.mod` — add `github.com/miekg/dns`
 
 **Interfaces:**
-- Consumes: 無
+- Consumes: nothing
 - Produces:
   - `ednszone.DefaultCode uint16 = 65001`
   - `ednszone.Get(m *dns.Msg, code uint16) (string, bool)`
@@ -187,15 +190,15 @@ git commit -m "feat(spiffezone): extract zone from SPIFFE ID path"
   - `ednszone.Valid(zone string) bool`
   - `ednszone.MaxLen int = 63`
 
-- [ ] **Step 1: 加入相依套件**
+- [ ] **Step 1: Add the dependency**
 
 ```bash
 go get github.com/miekg/dns@latest
 ```
 
-- [ ] **Step 2: 寫失敗的測試**
+- [ ] **Step 2: Write the failing test**
 
-建立 `internal/ednszone/ednszone_test.go`：
+Create `internal/ednszone/ednszone_test.go`:
 
 ```go
 package ednszone
@@ -235,7 +238,7 @@ func TestSetIsIdempotent(t *testing.T) {
 	if !ok || got != "zone-b" {
 		t.Fatalf("got (%q,%v), want (zone-b,true)", got, ok)
 	}
-	// 不可累積出兩個同 code 的 option
+	// Two options with the same code must not accumulate
 	opt := m.IsEdns0()
 	n := 0
 	for _, o := range opt.Option {
@@ -250,7 +253,7 @@ func TestSetIsIdempotent(t *testing.T) {
 
 func TestSetPreservesExistingOPT(t *testing.T) {
 	m := newQuery()
-	m.SetEdns0(4096, true) // 既有的 OPT，帶 DO bit
+	m.SetEdns0(4096, true) // an existing OPT, with the DO bit set
 	Set(m, DefaultCode, "zone-a")
 
 	opt := m.IsEdns0()
@@ -271,7 +274,7 @@ func TestGetMissing(t *testing.T) {
 	}
 
 	m := newQuery()
-	m.SetEdns0(4096, false) // 有 OPT 但沒有我們的 option
+	m.SetEdns0(4096, false) // an OPT, but not carrying our option
 	if _, ok := Get(m, DefaultCode); ok {
 		t.Fatal("expected ok=false when option absent")
 	}
@@ -304,40 +307,47 @@ func TestValid(t *testing.T) {
 }
 ```
 
-- [ ] **Step 3: 執行測試確認失敗**
+- [ ] **Step 3: Run the test and confirm it fails**
 
 Run: `go test ./internal/ednszone/ -v`
 Expected: FAIL — `undefined: Set`
 
-- [ ] **Step 4: 寫最小實作**
+- [ ] **Step 4: Write the minimal implementation**
 
-建立 `internal/ednszone/ednszone.go`：
+Create `internal/ednszone/ednszone.go`:
 
 ```go
-// Package ednszone 定義 agent 與 central 之間傳遞 source zone 的線上格式。
+// Package ednszone defines the wire format that carries the source zone between
+// the agent and central.
 //
-// 這是兩個子專案唯一的相容性介面（spec §6.6）：agent 用 Set 寫入，central 用 Get
-// 讀出。編碼與解碼刻意放在同一個套件並一起測試，避免任一端單方面改動。
+// This is the only compatibility interface between the two subprojects (spec
+// §6.6): the agent writes with Set, central reads with Get. Encoding and
+// decoding deliberately live in one package and are tested together, so that
+// neither end can change the format on its own.
 //
-// 選 EDNS0 而非 EDNS Client Subnet：ECS 的語意是網段而非身分，且會被中間的
-// resolver 依 RFC 7871 改寫。選 local/experimental 區間的 option code：該區間
-// (65001-65534) 由 IANA 保留給私有用途，不會與標準 option 衝突。
+// EDNS0 rather than EDNS Client Subnet: ECS means a network prefix, not an
+// identity, and intermediate resolvers rewrite it per RFC 7871. An option code
+// from the local/experimental range: IANA reserves that range (65001-65534) for
+// private use, so it cannot collide with a standard option.
 package ednszone
 
 import (
 	"github.com/miekg/dns"
 )
 
-// DefaultCode 是預設的 EDNS0 option code，取自 IANA 的 local/experimental 區間。
+// DefaultCode is the default EDNS0 option code, taken from IANA's
+// local/experimental range.
 const DefaultCode uint16 = 65001
 
-// MaxLen 是 zone 字串的長度上限，與 k8s label value 的上限一致。
+// MaxLen bounds the length of a zone string, matching the limit on a Kubernetes
+// label value.
 const MaxLen = 63
 
-// Valid 回報 zone 字串是否合法。
+// Valid reports whether a zone string is well formed.
 //
-// 這道檢查在解碼端也會執行 — 即使宣告來自已驗證的 agent，字串內容仍是外部輸入，
-// 不可直接用於後續的 map 查詢或日誌輸出。
+// The decoding side runs this check too: even when the declaration comes from a
+// verified agent, the string itself is external input and must not go straight
+// into a map lookup or a log line.
 func Valid(zone string) bool {
 	if zone == "" || len(zone) > MaxLen {
 		return false
@@ -356,10 +366,12 @@ func Valid(zone string) bool {
 	return true
 }
 
-// Set 在訊息上寫入 source zone，必要時建立 OPT record。
+// Set writes the source zone onto a message, creating an OPT record if needed.
 //
-// 已存在的 OPT record 會被保留（含 UDP size 與 DO bit），同 code 的舊 option 會被
-// 取代而非附加 — 否則重試或轉發路徑上可能累積出多個彼此矛盾的宣告。
+// An existing OPT record is preserved along with its UDP size and DO bit, and an
+// older option with the same code is replaced rather than appended — otherwise a
+// retry or forwarding path could accumulate several declarations that contradict
+// each other.
 func Set(m *dns.Msg, code uint16, zone string) {
 	opt := m.IsEdns0()
 	if opt == nil {
@@ -377,7 +389,8 @@ func Set(m *dns.Msg, code uint16, zone string) {
 	opt.Option = append(kept, &dns.EDNS0_LOCAL{Code: code, Data: []byte(zone)})
 }
 
-// Get 讀出 source zone。zone 不合法時回 ok=false，與「不存在」同樣處理。
+// Get reads the source zone. An invalid zone returns ok=false, handled the same
+// way as one that is absent.
 func Get(m *dns.Msg, code uint16) (string, bool) {
 	opt := m.IsEdns0()
 	if opt == nil {
@@ -398,7 +411,7 @@ func Get(m *dns.Msg, code uint16) (string, bool) {
 }
 ```
 
-- [ ] **Step 5: 執行測試確認通過**
+- [ ] **Step 5: Run the test and confirm it passes**
 
 Run: `go test ./internal/ednszone/ -v`
 Expected: PASS
@@ -412,23 +425,23 @@ git commit -m "feat(ednszone): define EDNS0 wire contract for source zone"
 
 ---
 
-### Task 3: `zonetable` — zone 到 gateway VIP
+### Task 3: `zonetable` — zone to gateway VIP
 
 **Files:**
 - Create: `internal/zonetable/zonetable.go`
 - Test: `internal/zonetable/zonetable_test.go`
 
 **Interfaces:**
-- Consumes: 無
+- Consumes: nothing
 - Produces:
-  - `zonetable.Table` 型別
+  - the `zonetable.Table` type
   - `zonetable.New(entries map[string]netip.Addr) *Table`
   - `(*Table).Gateway(zone string) (netip.Addr, bool)`
   - `(*Table).Len() int`
 
-- [ ] **Step 1: 寫失敗的測試**
+- [ ] **Step 1: Write the failing test**
 
-建立 `internal/zonetable/zonetable_test.go`：
+Create `internal/zonetable/zonetable_test.go`:
 
 ```go
 package zonetable
@@ -456,7 +469,8 @@ func TestGateway(t *testing.T) {
 func TestGatewayMissing(t *testing.T) {
 	tbl := New(map[string]netip.Addr{"zone-a": netip.MustParseAddr("203.0.113.10")})
 
-	// 未設定的 zone 必須回 false，讓決策層產生 SERVFAIL 而非靜默放行。
+	// An unconfigured zone must return false so the decision layer produces a
+	// SERVFAIL rather than silently letting the query through.
 	if _, ok := tbl.Gateway("zone-z"); ok {
 		t.Fatal("unconfigured zone must not resolve")
 	}
@@ -484,30 +498,33 @@ func TestNewCopiesInput(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 執行測試確認失敗**
+- [ ] **Step 2: Run the test and confirm it fails**
 
 Run: `go test ./internal/zonetable/ -v`
 Expected: FAIL — `undefined: New`
 
-- [ ] **Step 3: 寫最小實作**
+- [ ] **Step 3: Write the minimal implementation**
 
-建立 `internal/zonetable/zonetable.go`：
+Create `internal/zonetable/zonetable.go`:
 
 ```go
-// Package zonetable 保存 zone 到 zone gateway VIP 的對照。
+// Package zonetable holds the mapping from zone to zone gateway VIP.
 //
-// 這份資料來自設定檔，項目數量級是 zone 數（數十筆），啟動後不變 — 因此是唯讀的、
-// 不需要鎖。重新載入設定時建立新的 Table 取代舊的。
+// The data comes from the config file, the entry count is on the order of the
+// number of zones (a few dozen), and it never changes after startup — so the
+// table is read-only and needs no locking. Reloading config builds a new Table
+// that replaces the old one.
 package zonetable
 
 import "net/netip"
 
-// Table 是 zone 到 gateway VIP 的唯讀對照。
+// Table is a read-only mapping from zone to gateway VIP.
 type Table struct {
 	gw map[string]netip.Addr
 }
 
-// New 建立 Table。輸入的 map 會被複製，呼叫端之後的修改不影響已建立的 Table。
+// New builds a Table. The input map is copied, so later changes by the caller
+// do not affect the Table that was built.
 func New(entries map[string]netip.Addr) *Table {
 	gw := make(map[string]netip.Addr, len(entries))
 	for z, a := range entries {
@@ -516,20 +533,21 @@ func New(entries map[string]netip.Addr) *Table {
 	return &Table{gw: gw}
 }
 
-// Gateway 回傳該 zone 的 gateway VIP。
+// Gateway returns the gateway VIP for a zone.
 //
-// 找不到時回 ok=false。呼叫端必須把這個情況當成設定錯誤處理（SERVFAIL），
-// 不可退回一般答案 — 見 spec §6.4 第四列。
+// A miss returns ok=false. The caller must treat that as a configuration error
+// (SERVFAIL) and must not fall back to an ordinary answer — see spec §6.4,
+// fourth row.
 func (t *Table) Gateway(zone string) (netip.Addr, bool) {
 	a, ok := t.gw[zone]
 	return a, ok
 }
 
-// Len 回傳已設定的 zone 數量。
+// Len returns the number of configured zones.
 func (t *Table) Len() int { return len(t.gw) }
 ```
 
-- [ ] **Step 4: 執行測試確認通過**
+- [ ] **Step 4: Run the test and confirm it passes**
 
 Run: `go test ./internal/zonetable/ -v`
 Expected: PASS
@@ -543,26 +561,27 @@ git commit -m "feat(zonetable): map zone to gateway VIP"
 
 ---
 
-### Task 4: `decision` — 純決策函式
+### Task 4: `decision` — the pure decision function
 
-實作 spec §6.4 的五列決策表。這是整個 plugin 的核心邏輯，刻意做成無 I/O 的純函式，
-可以窮舉測試。
+Implements the five-row decision table of spec §6.4. This is the plugin's core
+logic, deliberately a pure function with no I/O so it can be tested
+exhaustively.
 
 **Files:**
 - Create: `internal/decision/decision.go`
 - Test: `internal/decision/decision_test.go`
 
 **Interfaces:**
-- Consumes: 無
+- Consumes: nothing
 - Produces:
-  - `decision.Action` 型別與常數 `ActionPassThrough`、`ActionAnswerGateway`、`ActionServFail`
-  - `decision.Decision` 結構（欄位 `Action Action`、`Gateway netip.Addr`）
-  - `decision.Input` 結構（欄位 `SourceZone string`、`SourceOK bool`、`DestZone string`、`DestOK bool`）
+  - the `decision.Action` type with the constants `ActionPassThrough`, `ActionAnswerGateway` and `ActionServFail`
+  - the `decision.Decision` struct, with fields `Action Action` and `Gateway netip.Addr`
+  - the `decision.Input` struct, with fields `SourceZone string`, `SourceOK bool`, `DestZone string` and `DestOK bool`
   - `decision.Decide(in Input, gateway func(string) (netip.Addr, bool)) Decision`
 
-- [ ] **Step 1: 寫失敗的測試**
+- [ ] **Step 1: Write the failing test**
 
-建立 `internal/decision/decision_test.go`：
+Create `internal/decision/decision_test.go`:
 
 ```go
 package decision
@@ -574,7 +593,7 @@ import (
 
 var gwA = netip.MustParseAddr("203.0.113.10")
 
-// gateways 模擬 zonetable：只有 zone-a 有 gateway 設定。
+// gateways stands in for zonetable: only zone-a has a gateway configured.
 func gateways(zone string) (netip.Addr, bool) {
 	if zone == "zone-a" {
 		return gwA, true
@@ -630,7 +649,8 @@ func TestDecideTable(t *testing.T) {
 	}
 }
 
-// 同 zone 不查 gateway 表 — 若查了，未設定 gateway 的 zone 會誤觸 SERVFAIL。
+// The same-zone path must not consult the gateway table — if it did, a zone
+// with no configured gateway would wrongly SERVFAIL.
 func TestSameZoneDoesNotConsultGatewayTable(t *testing.T) {
 	called := false
 	gw := func(string) (netip.Addr, bool) {
@@ -647,33 +667,35 @@ func TestSameZoneDoesNotConsultGatewayTable(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 執行測試確認失敗**
+- [ ] **Step 2: Run the test and confirm it fails**
 
 Run: `go test ./internal/decision/ -v`
 Expected: FAIL — `undefined: Decide`
 
-- [ ] **Step 3: 寫最小實作**
+- [ ] **Step 3: Write the minimal implementation**
 
-建立 `internal/decision/decision.go`：
+Create `internal/decision/decision.go`:
 
 ```go
-// Package decision 實作 zonedns 的核心決策邏輯（spec §6.4）。
+// Package decision implements zonedns's core decision logic (spec §6.4).
 //
-// 刻意做成無 I/O 的純函式：所有外部狀態都由呼叫端先查好再傳進來。這讓決策表可以
-// 被窮舉測試，也讓「什麼情況該做什麼」這件事集中在一個地方，不散落在 ServeDNS 裡。
+// Deliberately a pure function with no I/O: the caller looks up all external
+// state and passes it in. That lets the decision table be tested exhaustively,
+// and keeps "what to do in which situation" in one place rather than scattered
+// through ServeDNS.
 package decision
 
 import "net/netip"
 
-// Action 是決策結果要採取的動作。
+// Action is the action a decision calls for.
 type Action int
 
 const (
-	// ActionPassThrough 把查詢交給 plugin chain 的下一個 plugin。
+	// ActionPassThrough hands the query to the next plugin in the chain.
 	ActionPassThrough Action = iota
-	// ActionAnswerGateway 直接以 zone gateway VIP 回答。
+	// ActionAnswerGateway answers directly with the zone gateway VIP.
 	ActionAnswerGateway
-	// ActionServFail 回 SERVFAIL。
+	// ActionServFail returns SERVFAIL.
 	ActionServFail
 )
 
@@ -690,52 +712,58 @@ func (a Action) String() string {
 	}
 }
 
-// Input 是做決策所需的全部資訊。
+// Input is everything needed to make a decision.
 type Input struct {
 	SourceZone string
-	SourceOK   bool // 是否成功取得可信的 source zone
+	SourceOK   bool // whether a trustworthy source zone was obtained
 	DestZone   string
-	DestOK     bool // 該 FQDN 是否在 registry 中
+	DestOK     bool // whether the FQDN is present in the registry
 }
 
-// Decision 是決策結果。Gateway 只在 Action 為 ActionAnswerGateway 時有意義。
+// Decision is the result. Gateway is meaningful only when Action is
+// ActionAnswerGateway.
 type Decision struct {
 	Action  Action
 	Gateway netip.Addr
 }
 
-// Decide 實作 spec §6.4 的決策表。
+// Decide implements the decision table in spec §6.4.
 //
-// gateway 是 zone 到 gateway VIP 的查詢函式（通常是 zonetable.Table.Gateway）。
+// gateway looks up the gateway VIP for a zone (normally
+// zonetable.Table.Gateway).
 func Decide(in Input, gateway func(string) (netip.Addr, bool)) Decision {
-	// source zone 未知 — 這是非 zone-aware 的正常路徑，不是錯誤。
+	// Source zone unknown — this is the ordinary non-zone-aware path, not an error.
 	if !in.SourceOK {
 		return Decision{Action: ActionPassThrough}
 	}
-	// 這個名字不歸我們管（例如外部網域）。
+	// This name is not ours to handle (an external domain, say).
 	if !in.DestOK {
 		return Decision{Action: ActionPassThrough}
 	}
-	// 同 zone — 交給下游回一般答案。刻意不查 gateway 表：同 zone 根本不需要
-	// gateway，若查了，未設定 gateway 的 zone 會在自己人互打時誤觸 SERVFAIL。
+	// Same zone — let downstream return the ordinary answer. The gateway table
+	// is deliberately not consulted: a same-zone lookup needs no gateway at all,
+	// and consulting it would make a zone with no configured gateway SERVFAIL
+	// when its own workloads talk to each other.
 	if in.DestZone == in.SourceZone {
 		return Decision{Action: ActionPassThrough}
 	}
-	// 跨 zone — 必須有 gateway 設定。
+	// Cross-zone — a gateway must be configured.
 	gw, ok := gateway(in.DestZone)
 	if !ok {
-		// registry 說這個 zone 存在，但設定檔沒有它的 gateway。這是設定漏掉，
-		// 靜默回一般答案等於無聲破壞 zone 隔離，因此刻意不 fail-open。
+		// The registry says this zone exists but the config file has no gateway
+		// for it. That is a missing configuration, and silently returning the
+		// ordinary answer would break zone isolation without a sound — so this
+		// path deliberately does not fail open.
 		return Decision{Action: ActionServFail}
 	}
 	return Decision{Action: ActionAnswerGateway, Gateway: gw}
 }
 ```
 
-- [ ] **Step 4: 執行測試確認通過**
+- [ ] **Step 4: Run the test and confirm it passes**
 
 Run: `go test ./internal/decision/ -v`
-Expected: PASS，六個子測試全綠
+Expected: PASS, all six subtests green
 
 - [ ] **Step 5: Commit**
 
@@ -746,34 +774,35 @@ git commit -m "feat(decision): implement zone routing decision table"
 
 ---
 
-### Task 5: `identity` — peer certificate 取得
+### Task 5: `identity` — obtaining the peer certificate
 
-處理 DoT 與 DoH 兩種傳輸取得 client certificate 的差異（spec §6.1）。
-分成獨立任務是因為這裡有一個容易踩錯的細節：DoH 必須從 context 取 HTTP request，
-不能對 `dns.ResponseWriter` 做型別斷言 — 上游 plugin 可能包裝過 writer。
+Handles the difference between how DoT and DoH obtain a client certificate (spec
+§6.1). It is a task of its own because of one detail that is easy to get wrong:
+DoH must take the HTTP request from the context and must not type-assert the
+`dns.ResponseWriter`, since an upstream plugin may have wrapped it.
 
 **Files:**
 - Create: `internal/identity/peercert.go`
 - Test: `internal/identity/peercert_test.go`
-- Test: `internal/identity/testdata_test.go`（測試用憑證產生器）
-- Modify: `go.mod`（加入 `github.com/coredns/coredns`）
+- Test: `internal/identity/testdata_test.go` — the test certificate generator
+- Modify: `go.mod` — add `github.com/coredns/coredns`
 
 **Interfaces:**
-- Consumes: 無
+- Consumes: nothing
 - Produces:
   - `identity.PeerCertificates(ctx context.Context, w dns.ResponseWriter) ([]*x509.Certificate, bool)`
   - `identity.SPIFFEIDFromCert(cert *x509.Certificate) (string, bool)`
-  - 測試輔助：`newTestCert(t *testing.T, uri string) *x509.Certificate`
+  - the test helper `newTestCert(t *testing.T, uri string) *x509.Certificate`
 
-- [ ] **Step 1: 加入 CoreDNS 相依**
+- [ ] **Step 1: Add the CoreDNS dependency**
 
 ```bash
 go get github.com/coredns/coredns@v1.14.6
 ```
 
-- [ ] **Step 2: 寫測試用憑證產生器**
+- [ ] **Step 2: Write the test certificate generator**
 
-建立 `internal/identity/testdata_test.go`：
+Create `internal/identity/testdata_test.go`:
 
 ```go
 package identity
@@ -790,7 +819,8 @@ import (
 	"time"
 )
 
-// newTestCert 產生一張帶指定 URI SAN 的憑證。uri 為空字串時不帶 URI SAN。
+// newTestCert produces a certificate carrying the given URI SAN. An empty uri
+// means no URI SAN at all.
 func newTestCert(t *testing.T, uri string) *x509.Certificate {
 	t.Helper()
 
@@ -825,9 +855,9 @@ func newTestCert(t *testing.T, uri string) *x509.Certificate {
 }
 ```
 
-- [ ] **Step 3: 寫失敗的測試**
+- [ ] **Step 3: Write the failing test**
 
-建立 `internal/identity/peercert_test.go`：
+Create `internal/identity/peercert_test.go`:
 
 ```go
 package identity
@@ -843,10 +873,10 @@ import (
 	"github.com/miekg/dns"
 )
 
-// plainWriter 模擬一般（非 TLS）的 ResponseWriter。
+// plainWriter simulates an ordinary, non-TLS ResponseWriter.
 type plainWriter struct{ dns.ResponseWriter }
 
-// dotWriter 模擬 DoT 的 ResponseWriter，實作 dns.ConnectionStater。
+// dotWriter simulates a DoT ResponseWriter and implements dns.ConnectionStater.
 type dotWriter struct {
 	dns.ResponseWriter
 	state *tls.ConnectionState
@@ -870,8 +900,9 @@ func TestPeerCertificatesFromDoT(t *testing.T) {
 func TestPeerCertificatesFromDoH(t *testing.T) {
 	cert := newTestCert(t, "spiffe://example.org/node/n1")
 	req := &http.Request{TLS: &tls.ConnectionState{PeerCertificates: []*x509.Certificate{cert}}}
-	// CoreDNS 的 DoH server 會把 *http.Request 放進 context（server_https.go）。
-	// 從 context 取而非對 writer 做型別斷言，才不會被上游 plugin 的包裝影響。
+	// CoreDNS's DoH server puts the *http.Request into the context
+	// (server_https.go). Taking it from there rather than type-asserting the
+	// writer is what keeps an upstream plugin's wrapping from affecting it.
 	ctx := context.WithValue(context.Background(), dnsserver.HTTPRequestKey{}, req)
 
 	got, ok := PeerCertificates(ctx, &plainWriter{})
@@ -890,7 +921,7 @@ func TestPeerCertificatesNoTLS(t *testing.T) {
 }
 
 func TestPeerCertificatesTLSWithoutClientCert(t *testing.T) {
-	w := &dotWriter{state: &tls.ConnectionState{}} // 有 TLS 但沒有 client cert
+	w := &dotWriter{state: &tls.ConnectionState{}} // TLS, but no client cert
 	if _, ok := PeerCertificates(context.Background(), w); ok {
 		t.Fatal("TLS without a client certificate must yield ok=false")
 	}
@@ -903,7 +934,7 @@ func TestPeerCertificatesTLSWithoutClientCert(t *testing.T) {
 }
 
 func TestPeerCertificatesPlainHTTPRequest(t *testing.T) {
-	req := &http.Request{} // HTTP 沒有 TLS
+	req := &http.Request{} // HTTP with no TLS
 	ctx := context.WithValue(context.Background(), dnsserver.HTTPRequestKey{}, req)
 	if _, ok := PeerCertificates(ctx, &plainWriter{}); ok {
 		t.Fatal("non-TLS HTTP request must yield ok=false")
@@ -931,20 +962,21 @@ func TestSPIFFEIDFromCertRejectsNonSPIFFE(t *testing.T) {
 }
 ```
 
-- [ ] **Step 4: 執行測試確認失敗**
+- [ ] **Step 4: Run the test and confirm it fails**
 
 Run: `go test ./internal/identity/ -v`
 Expected: FAIL — `undefined: PeerCertificates`
 
-- [ ] **Step 5: 寫最小實作**
+- [ ] **Step 5: Write the minimal implementation**
 
-建立 `internal/identity/peercert.go`：
+Create `internal/identity/peercert.go`:
 
 ```go
-// Package identity 是 zonedns 的信任邊界（spec §6.1）。
+// Package identity is zonedns's trust boundary (spec §6.1).
 //
-// 整套 zone 隔離是否可被繞過，只取決於這個套件是否正確。任何修改都必須連帶檢視
-// 這裡的測試是否仍然涵蓋對應的攻擊情境。
+// Whether the whole of zone isolation can be bypassed depends on nothing but
+// this package being correct. Any change must come with a review of whether the
+// tests here still cover the corresponding attack.
 package identity
 
 import (
@@ -957,18 +989,20 @@ import (
 	"github.com/miekg/dns"
 )
 
-// PeerCertificates 取出這次查詢的 client certificate 鏈。
+// PeerCertificates returns the client certificate chain for this query.
 //
-// 兩種傳輸的取法不同：
+// The two transports differ in how it is obtained:
 //
-//   - DoH：CoreDNS 的 HTTPS server 會把 *http.Request 放進 context。從 context 取
-//     而不是對 writer 做型別斷言 — 上游 plugin（例如 metrics）可能包裝過
-//     ResponseWriter，型別斷言會失敗，而失敗的方式是「安靜地回 false」，
-//     結果是 zone 驗證整個失效卻沒有任何錯誤。
-//   - DoT：writer 實作 dns.ConnectionStater。
+//   - DoH: CoreDNS's HTTPS server puts the *http.Request into the context. It is
+//     taken from the context rather than by type-asserting the writer — an
+//     upstream plugin (metrics, for one) may have wrapped the ResponseWriter, in
+//     which case the assertion fails, and it fails by quietly returning false.
+//     Zone verification would be entirely disabled without a single error.
+//   - DoT: the writer implements dns.ConnectionStater.
 //
-// 沒有 TLS、或有 TLS 但對方沒有出示憑證時回 ok=false。呼叫端必須把這個情況當成
-// 「非 zone-aware 的正常路徑」，而不是錯誤。
+// Returns ok=false when there is no TLS, or TLS but no certificate presented.
+// The caller must treat that as the ordinary non-zone-aware path, not an
+// error.
 func PeerCertificates(ctx context.Context, w dns.ResponseWriter) ([]*x509.Certificate, bool) {
 	if req, isDoH := ctx.Value(dnsserver.HTTPRequestKey{}).(*http.Request); isDoH && req != nil {
 		return certsFromState(req.TLS)
@@ -986,10 +1020,11 @@ func certsFromState(st *tls.ConnectionState) ([]*x509.Certificate, bool) {
 	return st.PeerCertificates, true
 }
 
-// SPIFFEIDFromCert 取出憑證的 SPIFFE ID（URI SAN）。
+// SPIFFEIDFromCert returns the certificate's SPIFFE ID (its URI SAN).
 //
-// 只接受 spiffe scheme：憑證可以帶任意 URI SAN，若不檢查 scheme，一張帶著
-// https:// URI 的憑證就能冒充成身分來源。
+// Only the spiffe scheme is accepted: a certificate may carry any URI SAN, and
+// without checking the scheme one carrying an https:// URI could pass itself off
+// as a source of identity.
 func SPIFFEIDFromCert(cert *x509.Certificate) (string, bool) {
 	for _, u := range cert.URIs {
 		if u != nil && u.Scheme == "spiffe" {
@@ -1000,7 +1035,7 @@ func SPIFFEIDFromCert(cert *x509.Certificate) (string, bool) {
 }
 ```
 
-- [ ] **Step 6: 執行測試確認通過**
+- [ ] **Step 6: Run the test and confirm it passes**
 
 Run: `go test ./internal/identity/ -v`
 Expected: PASS
@@ -1014,10 +1049,11 @@ git commit -m "feat(identity): extract peer certificate for DoT and DoH"
 
 ---
 
-### Task 6: `identity.SourceZone` — 完整信任邊界
+### Task 6: `identity.SourceZone` — the complete trust boundary
 
-把 Task 5 的憑證取得、授權 agent 清單比對、EDNS0 讀取串成 spec §6.1 的五個步驟。
-**這是整個專案測試密度最高的地方** — 每一種繞過方式都要有對應的測試。
+Chains Task 5's certificate extraction, the authorized agent list comparison and
+the EDNS0 read into the five steps of spec §6.1. **This is the most densely
+tested place in the project** — every bypass must have a test of its own.
 
 **Files:**
 - Create: `internal/identity/identity.go`
@@ -1025,17 +1061,17 @@ git commit -m "feat(identity): extract peer certificate for DoT and DoH"
 
 **Interfaces:**
 - Consumes:
-  - `identity.PeerCertificates`、`identity.SPIFFEIDFromCert`（Task 5）
-  - `ednszone.Get`、`ednszone.DefaultCode`（Task 2）
+  - `identity.PeerCertificates` and `identity.SPIFFEIDFromCert` (Task 5)
+  - `ednszone.Get` and `ednszone.DefaultCode` (Task 2)
 - Produces:
-  - `identity.Reason` 型別與常數 `ReasonOK`、`ReasonNoTLS`、`ReasonUnauthorizedAgent`、`ReasonNoDeclaration`
-  - `identity.Config` 結構（欄位 `AuthorizedAgents []string`、`EDNS0Code uint16`）
+  - the `identity.Reason` type with the constants `ReasonOK`, `ReasonNoTLS`, `ReasonUnauthorizedAgent` and `ReasonNoDeclaration`
+  - the `identity.Config` struct, with fields `AuthorizedAgents []string` and `EDNS0Code uint16`
   - `identity.NewConfig(agents []string, code uint16) Config`
   - `(Config).SourceZone(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (string, Reason)`
 
-- [ ] **Step 1: 寫失敗的測試**
+- [ ] **Step 1: Write the failing test**
 
-建立 `internal/identity/identity_test.go`：
+Create `internal/identity/identity_test.go`:
 
 ```go
 package identity
@@ -1056,7 +1092,8 @@ func cfg() Config {
 	return NewConfig([]string{agentID}, ednszone.DefaultCode)
 }
 
-// query 建立一個帶 source zone 宣告的查詢；zone 為空字串時不加宣告。
+// query builds a query carrying a source zone declaration; an empty zone adds
+// no declaration.
 func query(zone string) *dns.Msg {
 	m := new(dns.Msg)
 	m.SetQuestion("payments.example.com.", dns.TypeA)
@@ -1066,7 +1103,7 @@ func query(zone string) *dns.Msg {
 	return m
 }
 
-// tlsWriter 建立一個帶指定憑證的 DoT writer。
+// tlsWriter builds a DoT writer carrying the given certificates.
 func tlsWriter(t *testing.T, uri string) dns.ResponseWriter {
 	t.Helper()
 	certs := []*x509.Certificate{newTestCert(t, uri)}
@@ -1083,7 +1120,7 @@ func TestSourceZoneHappyPath(t *testing.T) {
 	}
 }
 
-// 沒有 TLS 就沒有身分 — 這是非 zone-aware listener 的正常路徑。
+// No TLS means no identity — the ordinary path for a non-zone-aware listener.
 func TestSourceZoneNoTLS(t *testing.T) {
 	zone, reason := cfg().SourceZone(context.Background(), &plainWriter{}, query("zone-a"))
 	if reason != ReasonNoTLS {
@@ -1094,8 +1131,8 @@ func TestSourceZoneNoTLS(t *testing.T) {
 	}
 }
 
-// 核心攻擊情境：憑證有效（TLS 層驗過），但不是授權的 agent。
-// 它的 EDNS0 宣告必須被完全忽略。
+// The core attack: the certificate is valid (the TLS layer verified it) but it
+// is not an authorized agent. Its EDNS0 declaration must be ignored entirely.
 func TestSourceZoneUnauthorizedAgentDeclarationIgnored(t *testing.T) {
 	w := tlsWriter(t, "spiffe://example.org/workload/attacker")
 	zone, reason := cfg().SourceZone(context.Background(), w, query("zone-a"))
@@ -1107,7 +1144,7 @@ func TestSourceZoneUnauthorizedAgentDeclarationIgnored(t *testing.T) {
 	}
 }
 
-// 授權清單必須是精確比對，不可用前綴。
+// The authorized list must match exactly, never by prefix.
 func TestSourceZoneAuthorizedListIsExactMatch(t *testing.T) {
 	for _, id := range []string{
 		agentID + "/extra",
@@ -1145,7 +1182,7 @@ func TestSourceZoneRejectsMalformedZone(t *testing.T) {
 	}
 }
 
-// 憑證沒有 SPIFFE ID 時不可被當成授權 agent。
+// A certificate without a SPIFFE ID must not count as an authorized agent.
 func TestSourceZoneCertWithoutSPIFFEID(t *testing.T) {
 	_, reason := cfg().SourceZone(context.Background(), tlsWriter(t, ""), query("zone-a"))
 	if reason != ReasonUnauthorizedAgent {
@@ -1153,7 +1190,8 @@ func TestSourceZoneCertWithoutSPIFFEID(t *testing.T) {
 	}
 }
 
-// 只檢查葉憑證。中繼 CA 憑證即使帶著授權的 SPIFFE ID 也不算。
+// Only the leaf is examined. An intermediate CA certificate does not count even
+// when it carries an authorized SPIFFE ID.
 func TestSourceZoneOnlyLeafCertificateCounts(t *testing.T) {
 	leaf := newTestCert(t, "spiffe://example.org/workload/attacker")
 	intermediate := newTestCert(t, agentID)
@@ -1167,7 +1205,8 @@ func TestSourceZoneOnlyLeafCertificateCounts(t *testing.T) {
 	}
 }
 
-// 空的授權清單表示沒有任何 agent 被授權，不是「全部放行」。
+// An empty authorized list means no agent is authorized, not "let everyone
+// through".
 func TestSourceZoneEmptyAuthorizedListDeniesAll(t *testing.T) {
 	c := NewConfig(nil, ednszone.DefaultCode)
 	_, reason := c.SourceZone(context.Background(), tlsWriter(t, agentID), query("zone-a"))
@@ -1176,7 +1215,8 @@ func TestSourceZoneEmptyAuthorizedListDeniesAll(t *testing.T) {
 	}
 }
 
-// option code 設定不一致時，宣告必須被忽略而非誤讀。
+// When the configured option codes disagree, the declaration must be ignored
+// rather than misread.
 func TestSourceZoneRespectsConfiguredOptionCode(t *testing.T) {
 	c := NewConfig([]string{agentID}, 65002)
 	_, reason := c.SourceZone(context.Background(), tlsWriter(t, agentID), query("zone-a"))
@@ -1186,14 +1226,14 @@ func TestSourceZoneRespectsConfiguredOptionCode(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 執行測試確認失敗**
+- [ ] **Step 2: Run the test and confirm it fails**
 
 Run: `go test ./internal/identity/ -run TestSourceZone -v`
 Expected: FAIL — `undefined: NewConfig`
 
-- [ ] **Step 3: 寫最小實作**
+- [ ] **Step 3: Write the minimal implementation**
 
-建立 `internal/identity/identity.go`：
+Create `internal/identity/identity.go`:
 
 ```go
 package identity
@@ -1205,17 +1245,21 @@ import (
 	"github.com/miekg/dns"
 )
 
-// Reason 說明 SourceZone 為何得到（或得不到）結果。呼叫端用它輸出 metric。
+// Reason explains why SourceZone did (or did not) produce a result. Callers use
+// it as a metric label.
 type Reason int
 
 const (
-	// ReasonOK 成功取得可信的 source zone。
+	// ReasonOK: a trustworthy source zone was obtained.
 	ReasonOK Reason = iota
-	// ReasonNoTLS 連線沒有 client certificate — 非 zone-aware 的正常路徑。
+	// ReasonNoTLS: the connection carries no client certificate — the ordinary
+	// non-zone-aware path.
 	ReasonNoTLS
-	// ReasonUnauthorizedAgent 憑證有效但不在授權清單中。這是攻擊訊號，需告警。
+	// ReasonUnauthorizedAgent: the certificate is valid but absent from the
+	// authorized list. This is an attack signal and must be alerted on.
 	ReasonUnauthorizedAgent
-	// ReasonNoDeclaration agent 已授權，但沒有帶宣告、或宣告的 zone 不合法。
+	// ReasonNoDeclaration: the agent is authorized but carried no declaration, or
+	// declared an invalid zone.
 	ReasonNoDeclaration
 )
 
@@ -1234,16 +1278,16 @@ func (r Reason) String() string {
 	}
 }
 
-// Config 是信任邊界的設定。
+// Config configures the trust boundary.
 type Config struct {
 	authorized map[string]struct{}
 	code       uint16
 }
 
-// NewConfig 建立 Config。
+// NewConfig builds a Config.
 //
-// agents 為空表示「沒有任何 agent 被授權」，不是「全部放行」— 設定漏掉時必須是
-// 拒絕而非開放。
+// An empty agents list means "no agent is authorized", not "let everyone
+// through" — a missing configuration must deny rather than open up.
 func NewConfig(agents []string, code uint16) Config {
 	set := make(map[string]struct{}, len(agents))
 	for _, a := range agents {
@@ -1252,19 +1296,24 @@ func NewConfig(agents []string, code uint16) Config {
 	return Config{authorized: set, code: code}
 }
 
-// SourceZone 取得這次查詢可信的 source zone，實作 spec §6.1 的五個步驟。
+// SourceZone obtains a trustworthy source zone for this query, implementing the
+// five steps of spec §6.1.
 //
-// 步驟順序不可調換 —— 特別是「先確認 agent 已授權，才讀 EDNS0 宣告」。若把讀取
-// 提前，未授權者的宣告就會流進後續邏輯。
+// The order of the steps must not be rearranged — in particular, the agent is
+// confirmed authorized before the EDNS0 declaration is read. Reading it earlier
+// would let an unauthorized party's declaration flow into the logic that
+// follows.
 func (c Config) SourceZone(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (string, Reason) {
-	// 步驟 1、2：取得 client certificate。憑證鏈本身已由 TLS 層以 SPIRE trust
-	// bundle 驗證過，這裡不重複驗證。
+	// Steps 1 and 2: obtain the client certificate. The chain itself has already
+	// been verified by the TLS layer against the SPIRE trust bundle, so it is not
+	// verified again here.
 	certs, ok := PeerCertificates(ctx, w)
 	if !ok {
 		return "", ReasonNoTLS
 	}
 
-	// 步驟 3：只看葉憑證。中繼憑證帶什麼身分都與呼叫者無關。
+	// Step 3: look only at the leaf. Whatever identity an intermediate carries has
+	// nothing to do with the caller.
 	id, ok := SPIFFEIDFromCert(certs[0])
 	if !ok {
 		return "", ReasonUnauthorizedAgent
@@ -1273,7 +1322,8 @@ func (c Config) SourceZone(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 		return "", ReasonUnauthorizedAgent
 	}
 
-	// 步驟 4、5：通過授權才讀宣告。ednszone.Get 內含格式驗證，不合法時回 false。
+	// Steps 4 and 5: read the declaration only once authorization passes.
+	// ednszone.Get validates the format and returns false when it is invalid.
 	zone, ok := ednszone.Get(r, c.code)
 	if !ok {
 		return "", ReasonNoDeclaration
@@ -1282,15 +1332,15 @@ func (c Config) SourceZone(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 }
 ```
 
-- [ ] **Step 4: 執行測試確認通過**
+- [ ] **Step 4: Run the test and confirm it passes**
 
 Run: `go test ./internal/identity/ -v`
-Expected: PASS，全部測試綠燈
+Expected: PASS, the whole suite green
 
-- [ ] **Step 5: 加上競態檢查**
+- [ ] **Step 5: Add the race check**
 
 Run: `go test ./internal/identity/ -race -v`
-Expected: PASS，無競態報告
+Expected: PASS, with no race reported
 
 - [ ] **Step 6: Commit**
 
@@ -1301,32 +1351,33 @@ git commit -m "feat(identity): enforce trust boundary for source zone declaratio
 
 ---
 
-### Task 7: `registry` — 記憶體快照與衝突處理
+### Task 7: `registry` — the in-memory snapshot and conflict handling
 
-先做不依賴 SPIRE 的部分：從一組 entry 建立快照、正規化 DNS 名稱、偵測衝突、
-提供執行緒安全的原子替換。Task 8 才接上真正的 SPIRE 輪詢。
+Start with the part that does not depend on SPIRE: building a snapshot from a set
+of entries, normalising DNS names, detecting conflicts, and providing
+thread-safe atomic replacement. Task 8 connects the real SPIRE polling.
 
 **Files:**
 - Create: `internal/registry/registry.go`
 - Test: `internal/registry/registry_test.go`
 
 **Interfaces:**
-- Consumes: `spiffezone.FromPath`（Task 1）
+- Consumes: `spiffezone.FromPath` (Task 1)
 - Produces:
-  - `registry.Entry` 結構（欄位 `SPIFFEIDPath string`、`DNSNames []string`）
-  - `registry.Snapshot` 型別
+  - the `registry.Entry` struct, with fields `SPIFFEIDPath string` and `DNSNames []string`
+  - the `registry.Snapshot` type
   - `registry.BuildSnapshot(entries []Entry) (*Snapshot, Stats)`
-  - `registry.Stats` 結構（欄位 `Names int`、`Conflicts int`、`Skipped int`）
+  - the `registry.Stats` struct, with fields `Names int`, `Conflicts int` and `Skipped int`
   - `(*Snapshot).Lookup(fqdn string) (string, bool)`
-  - `registry.Store` 型別
+  - the `registry.Store` type
   - `registry.NewStore() *Store`
   - `(*Store).Replace(s *Snapshot)`
   - `(*Store).Lookup(fqdn string) (string, bool)`
   - `(*Store).Ready() bool`
 
-- [ ] **Step 1: 寫失敗的測試**
+- [ ] **Step 1: Write the failing test**
 
-建立 `internal/registry/registry_test.go`：
+Create `internal/registry/registry_test.go`:
 
 ```go
 package registry
@@ -1341,7 +1392,8 @@ func TestLookupNormalizesName(t *testing.T) {
 		{SPIFFEIDPath: "/zone/zone-a/ns/prod/sa/payments", DNSNames: []string{"payments.example.com"}},
 	})
 
-	// DNS 查詢帶結尾點且大小寫不定，registry 的 key 來自 SPIRE entry 則不帶點。
+	// A DNS query carries a trailing dot and arbitrary case, while the registry's
+	// keys come from SPIRE entries and carry none.
 	for _, q := range []string{
 		"payments.example.com.",
 		"payments.example.com",
@@ -1384,7 +1436,8 @@ func TestBuildSnapshotSkipsEntriesWithoutZone(t *testing.T) {
 	}
 }
 
-// 兩筆 entry 對同一個名字宣告不同 zone：不可任選一個，該名字整個視為不可解析。
+// Two entries declaring one name into different zones: neither may be picked,
+// and the name becomes unresolvable entirely.
 func TestBuildSnapshotConflictMakesNameUnresolvable(t *testing.T) {
 	snap, stats := BuildSnapshot([]Entry{
 		{SPIFFEIDPath: "/zone/zone-a/ns/prod/sa/payments", DNSNames: []string{"payments.example.com"}},
@@ -1399,7 +1452,7 @@ func TestBuildSnapshotConflictMakesNameUnresolvable(t *testing.T) {
 	}
 }
 
-// 同一個 zone 的多個副本共用一個名字是正常的，不算衝突。
+// Several replicas in one zone sharing a name is normal and not a conflict.
 func TestBuildSnapshotSameZoneIsNotConflict(t *testing.T) {
 	snap, stats := BuildSnapshot([]Entry{
 		{SPIFFEIDPath: "/zone/zone-a/ns/prod/sa/payments", DNSNames: []string{"payments.example.com"}},
@@ -1444,7 +1497,8 @@ func TestBuildSnapshotIgnoresEmptyDNSName(t *testing.T) {
 	}
 }
 
-// 未就緒的 Store 一律回 false — 啟動期間必須走非 zone-aware 路徑，不可猜測。
+// A Store that is not ready always returns false — during startup the query must
+// take the non-zone-aware path rather than guess.
 func TestStoreNotReady(t *testing.T) {
 	st := NewStore()
 	if st.Ready() {
@@ -1501,21 +1555,22 @@ func TestStoreConcurrentReadWrite(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 執行測試確認失敗**
+- [ ] **Step 2: Run the test and confirm it fails**
 
 Run: `go test ./internal/registry/ -v`
 Expected: FAIL — `undefined: BuildSnapshot`
 
-- [ ] **Step 3: 寫最小實作**
+- [ ] **Step 3: Write the minimal implementation**
 
-建立 `internal/registry/registry.go`：
+Create `internal/registry/registry.go`:
 
 ```go
-// Package registry 維護 FQDN 到 dest zone 的對照（spec §6.2）。
+// Package registry maintains the mapping from FQDN to dest zone (spec §6.2).
 //
-// 資料來源是 SPIRE Server 的 registration entry：entry 的 dns_names 提供名稱，
-// entry 的 spiffe_id path 提供 zone。本套件只處理「一組 entry → 可查詢的快照」，
-// 取得 entry 的方式在 spire.go。
+// The data comes from SPIRE Server registration entries: an entry's dns_names
+// supply the names, and its spiffe_id path supplies the zone. This package only
+// turns a set of entries into a queryable snapshot; how the entries are fetched
+// is in spire.go.
 package registry
 
 import (
@@ -1525,37 +1580,40 @@ import (
 	"github.com/jenting/zonedns/internal/spiffezone"
 )
 
-// Entry 是建立快照所需的 SPIRE registration entry 欄位。
+// Entry holds the SPIRE registration entry fields needed to build a snapshot.
 type Entry struct {
 	SPIFFEIDPath string
 	DNSNames     []string
 }
 
-// Stats 描述一次快照建立的結果，供 metric 使用。
+// Stats describes the outcome of building one snapshot, for use as metrics.
 type Stats struct {
-	Names     int // 可解析的名稱數
-	Conflicts int // 因 zone 衝突而被移除的名稱數
-	Skipped   int // 因 SPIFFE ID 沒有 zone 段而略過的 entry 數
+	Names     int // resolvable names
+	Conflicts int // names removed because their zones conflicted
+	Skipped   int // entries skipped for having no zone segment in the SPIFFE ID
 }
 
-// Snapshot 是某個時間點的唯讀對照表。
+// Snapshot is a read-only mapping as of one point in time.
 type Snapshot struct {
 	zoneOf map[string]string
 }
 
-// normalize 把 DNS 名稱轉成統一的查詢 key：小寫、無結尾點。
+// normalize turns a DNS name into a uniform lookup key: lowercase, no trailing
+// dot.
 //
-// 需要這一步是因為兩端格式不同 — DNS 查詢的 qname 帶結尾點且大小寫不定，
-// SPIRE entry 的 dns_names 則是不帶點的一般字串。
+// It is needed because the two sides differ in format — a DNS query's qname
+// carries a trailing dot and arbitrary case, while a SPIRE entry's dns_names are
+// ordinary strings without one.
 func normalize(name string) string {
 	return strings.ToLower(strings.TrimSuffix(name, "."))
 }
 
-// BuildSnapshot 從一組 entry 建立快照。
+// BuildSnapshot builds a snapshot from a set of entries.
 //
-// 同一個名稱被宣告成不同 zone 時，該名稱會被整個移除而非任選一個 —— 這種情況下
-// 任何選擇都可能是錯的，而錯誤的 zone 會把流量導向錯誤的 gateway。回傳的 Stats
-// 讓呼叫端把衝突數輸出成 metric 以便告警。
+// When one name is declared into different zones, the name is removed entirely
+// rather than one of them being picked — any choice could be the wrong one, and
+// a wrong zone sends traffic to the wrong gateway. The returned Stats let the
+// caller publish the conflict count as a metric to alert on.
 func BuildSnapshot(entries []Entry) (*Snapshot, Stats) {
 	var stats Stats
 	zoneOf := make(map[string]string)
@@ -1589,33 +1647,36 @@ func BuildSnapshot(entries []Entry) (*Snapshot, Stats) {
 	return &Snapshot{zoneOf: zoneOf}, stats
 }
 
-// Lookup 查出該 FQDN 所屬的 zone。
+// Lookup finds the zone an FQDN belongs to.
 func (s *Snapshot) Lookup(fqdn string) (string, bool) {
 	zone, ok := s.zoneOf[normalize(fqdn)]
 	return zone, ok
 }
 
-// Store 持有目前生效的快照，支援讀取與原子替換併發進行。
+// Store holds the snapshot currently in effect, supporting concurrent reads and
+// atomic replacement.
 //
-// 讀取路徑在每次 DNS 查詢上，因此用 atomic.Pointer 而非 mutex：替換是低頻的
-// （每個輪詢週期一次），讀取是高頻的。
+// The read path runs on every DNS query, so this uses an atomic.Pointer rather
+// than a mutex: replacement is rare (once per poll interval) and reads are
+// frequent.
 type Store struct {
 	cur atomic.Pointer[Snapshot]
 }
 
-// NewStore 建立尚未就緒的 Store。
+// NewStore creates a Store that is not yet ready.
 func NewStore() *Store { return &Store{} }
 
-// Replace 換上新的快照，並使 Store 進入就緒狀態。
+// Replace installs a new snapshot and brings the Store into the ready state.
 func (st *Store) Replace(s *Snapshot) { st.cur.Store(s) }
 
-// Ready 回報是否已有快照。
+// Ready reports whether a snapshot is present.
 func (st *Store) Ready() bool { return st.cur.Load() != nil }
 
-// Lookup 查詢目前的快照。
+// Lookup queries the current snapshot.
 //
-// 尚未就緒時一律回 false —— 啟動期間或首次輪詢失敗時，查詢會走非 zone-aware
-// 路徑（回一般答案），而不是猜一個可能錯誤的 zone。
+// Before the Store is ready it always returns false: during startup, or when the
+// first poll fails, queries take the non-zone-aware path and get the ordinary
+// answer rather than a guessed zone that could be wrong.
 func (st *Store) Lookup(fqdn string) (string, bool) {
 	s := st.cur.Load()
 	if s == nil {
@@ -1625,10 +1686,10 @@ func (st *Store) Lookup(fqdn string) (string, bool) {
 }
 ```
 
-- [ ] **Step 4: 執行測試確認通過**
+- [ ] **Step 4: Run the test and confirm it passes**
 
 Run: `go test ./internal/registry/ -race -v`
-Expected: PASS，含併發測試，無競態報告
+Expected: PASS, including the concurrency tests, with no race reported
 
 - [ ] **Step 5: Commit**
 
@@ -1639,32 +1700,32 @@ git commit -m "feat(registry): build FQDN to zone snapshots with conflict detect
 
 ---
 
-### Task 8: `registry/spire` — SPIRE Entry API 輪詢器
+### Task 8: `registry/spire` — the SPIRE Entry API poller
 
 **Files:**
 - Create: `internal/registry/spire.go`
 - Test: `internal/registry/spire_test.go`
-- Modify: `go.mod`（加入 `github.com/spiffe/spire-api-sdk`）
+- Modify: `go.mod` — add `github.com/spiffe/spire-api-sdk`
 
 **Interfaces:**
-- Consumes: `registry.Entry`、`registry.BuildSnapshot`、`registry.Store`（Task 7）
+- Consumes: `registry.Entry`, `registry.BuildSnapshot` and `registry.Store` (Task 7)
 - Produces:
-  - `registry.EntryLister` 介面：`ListEntries(ctx context.Context, pageToken string) ([]Entry, string, error)`
-  - `registry.Poller` 型別
+  - the `registry.EntryLister` interface: `ListEntries(ctx context.Context, pageToken string) ([]Entry, string, error)`
+  - the `registry.Poller` type
   - `registry.NewPoller(lister EntryLister, store *Store, interval time.Duration) *Poller`
   - `(*Poller).PollOnce(ctx context.Context) (Stats, error)`
   - `(*Poller).Run(ctx context.Context)`
   - `registry.NewSPIRELister(client entryv1.EntryClient) EntryLister`
 
-- [ ] **Step 1: 加入 SPIRE SDK 相依**
+- [ ] **Step 1: Add the SPIRE SDK dependency**
 
 ```bash
 go get github.com/spiffe/spire-api-sdk@latest
 ```
 
-- [ ] **Step 2: 寫失敗的測試**
+- [ ] **Step 2: Write the failing test**
 
-建立 `internal/registry/spire_test.go`：
+Create `internal/registry/spire_test.go`:
 
 ```go
 package registry
@@ -1676,7 +1737,7 @@ import (
 	"time"
 )
 
-// fakeLister 依序回傳預先安排好的分頁，可注入錯誤。
+// fakeLister returns prearranged pages in order and can inject errors.
 type fakeLister struct {
 	pages [][]Entry
 	err   error
@@ -1690,7 +1751,7 @@ func (f *fakeLister) ListEntries(_ context.Context, token string) ([]Entry, stri
 	}
 	idx := 0
 	if token != "" {
-		// token 格式為 "page-<n>"
+		// tokens have the form "page-<n>"
 		idx = int(token[len(token)-1] - '0')
 	}
 	if idx >= len(f.pages) {
@@ -1727,7 +1788,8 @@ func TestPollOnceFollowsPagination(t *testing.T) {
 	}
 }
 
-// 輪詢失敗時必須保留上一份快照 —— SPIRE 短暫不可用不應讓全域 DNS 失去 zone 路由。
+// A failed poll must keep the previous snapshot — a brief SPIRE outage must not
+// cost DNS its zone routing everywhere.
 func TestPollOnceKeepsPreviousSnapshotOnError(t *testing.T) {
 	lister := &fakeLister{pages: [][]Entry{
 		{{SPIFFEIDPath: "/zone/zone-a/ns/prod/sa/payments", DNSNames: []string{"payments.example.com"}}},
@@ -1750,8 +1812,10 @@ func TestPollOnceKeepsPreviousSnapshotOnError(t *testing.T) {
 	}
 }
 
-// 首次輪詢就失敗時 Store 必須維持未就緒，不可變成空快照。
-// 空快照會讓所有查詢「查得到但都不在 registry」，與「還不知道」意義不同。
+// When the very first poll fails the Store must stay not-ready rather than
+// become an empty snapshot. An empty snapshot makes every query "resolvable but
+// absent from the registry", which means something different from "not known
+// yet".
 func TestPollOnceLeavesStoreUnreadyOnFirstFailure(t *testing.T) {
 	lister := &fakeLister{err: errors.New("spire unavailable")}
 	store := NewStore()
@@ -1784,14 +1848,14 @@ func TestRunStopsOnContextCancel(t *testing.T) {
 }
 ```
 
-- [ ] **Step 3: 執行測試確認失敗**
+- [ ] **Step 3: Run the test and confirm it fails**
 
 Run: `go test ./internal/registry/ -run 'TestPoll|TestRun' -v`
 Expected: FAIL — `undefined: NewPoller`
 
-- [ ] **Step 4: 寫最小實作**
+- [ ] **Step 4: Write the minimal implementation**
 
-建立 `internal/registry/spire.go`：
+Create `internal/registry/spire.go`:
 
 ```go
 package registry
@@ -1809,34 +1873,38 @@ import (
 
 var log = clog.NewWithPlugin("zonedns")
 
-// pollErrors 記錄連續失敗次數，由 plugin 層讀出成 metric。
+// pollErrors counts consecutive failures, read out by the plugin layer as a
+// metric.
 var pollErrors atomic.Int64
 
-// ConsecutivePollErrors 回傳連續輪詢失敗次數。0 表示最近一次輪詢成功。
+// ConsecutivePollErrors returns the number of consecutive polling failures. Zero
+// means the most recent poll succeeded.
 func ConsecutivePollErrors() int64 { return pollErrors.Load() }
 
-// EntryLister 取得一頁 registration entry。
+// EntryLister fetches one page of registration entries.
 //
-// 抽成介面是為了讓輪詢邏輯（分頁、錯誤處理、快照替換）可以脫離 gRPC 測試。
+// It is an interface so the polling logic — pagination, error handling, snapshot
+// replacement — can be tested without gRPC.
 type EntryLister interface {
 	ListEntries(ctx context.Context, pageToken string) ([]Entry, string, error)
 }
 
-// pageSize 是每次向 SPIRE 索取的 entry 數。
+// pageSize is how many entries are requested from SPIRE at a time.
 const pageSize = 500
 
 type spireLister struct {
 	client entryv1.EntryClient
 }
 
-// NewSPIRELister 以 SPIRE Entry API 實作 EntryLister。
+// NewSPIRELister implements EntryLister over the SPIRE Entry API.
 //
-// 注意 Entry API 沒有 watch/stream RPC：ListEntries 是分頁的一元呼叫，唯一的串流
-// RPC (SyncAuthorizedEntries) 是給 agent 同步自己被授權的 entry 用的，不能列出全部。
-// 因此這裡是輪詢而非監看。
+// Note that the Entry API has no watch or stream RPC: ListEntries is a paginated
+// unary call, and the one streaming RPC (SyncAuthorizedEntries) exists for an
+// agent to sync the entries it is authorized for — it cannot list them all. So
+// this polls rather than watches.
 //
-// 呼叫此 API 需要 admin SVID —— central 所在主機的 SPIRE registration entry 必須
-// 設定 admin: true。
+// Calling this API requires an admin SVID: the SPIRE registration entry for the
+// host central runs on must set admin: true.
 func NewSPIRELister(client entryv1.EntryClient) EntryLister {
 	return &spireLister{client: client}
 }
@@ -1845,7 +1913,8 @@ func (l *spireLister) ListEntries(ctx context.Context, pageToken string) ([]Entr
 	resp, err := l.client.ListEntries(ctx, &entryv1.ListEntriesRequest{
 		PageSize:  pageSize,
 		PageToken: pageToken,
-		// 只取需要的兩個欄位，避免把 selector 等大量無關資料拉過來。
+		// Request only the two fields needed, so selectors and other bulk we do not
+		// use are not pulled across.
 		OutputMask: &types.EntryMask{
 			SpiffeId: true,
 			DnsNames: true,
@@ -1868,23 +1937,26 @@ func (l *spireLister) ListEntries(ctx context.Context, pageToken string) ([]Entr
 	return out, resp.NextPageToken, nil
 }
 
-// Poller 週期性地把 SPIRE 的 entry 拉成新快照放進 Store。
+// Poller periodically pulls SPIRE's entries into a new snapshot in the Store.
 type Poller struct {
 	lister   EntryLister
 	store    *Store
 	interval time.Duration
 }
 
-// NewPoller 建立 Poller。
+// NewPoller builds a Poller.
 func NewPoller(lister EntryLister, store *Store, interval time.Duration) *Poller {
 	return &Poller{lister: lister, store: store, interval: interval}
 }
 
-// PollOnce 拉取全部 entry 並替換快照。
+// PollOnce fetches every entry and replaces the snapshot.
 //
-// 失敗時**不會**動到既有快照：SPIRE 短暫不可用不應讓所有 zone 路由消失。首次輪詢
-// 就失敗時 Store 維持未就緒（而非變成空快照），因為「還不知道」與「查得到但都不在
-// registry」是不同的意思，後者會讓所有跨 zone 查詢靜默地退回一般答案。
+// On failure it does NOT touch the existing snapshot: a brief SPIRE outage must
+// not make all zone routing disappear. When the very first poll fails the Store
+// stays not-ready rather than becoming an empty snapshot, because "not known
+// yet" and "resolvable but absent from the registry" mean different things, and
+// the latter would silently drop every cross-zone query back to the ordinary
+// answer.
 func (p *Poller) PollOnce(ctx context.Context) (Stats, error) {
 	var all []Entry
 	token := ""
@@ -1905,7 +1977,8 @@ func (p *Poller) PollOnce(ctx context.Context) (Stats, error) {
 	return stats, nil
 }
 
-// Run 依設定的間隔持續輪詢，直到 ctx 結束。啟動時立即輪詢一次。
+// Run polls at the configured interval until ctx ends, polling once immediately
+// at startup.
 func (p *Poller) Run(ctx context.Context) {
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
@@ -1927,7 +2000,7 @@ func (p *Poller) Run(ctx context.Context) {
 }
 ```
 
-- [ ] **Step 5: 執行測試確認通過**
+- [ ] **Step 5: Run the test and confirm it passes**
 
 Run: `go test ./internal/registry/ -race -v`
 Expected: PASS
@@ -1941,9 +2014,9 @@ git commit -m "feat(registry): poll SPIRE Entry API with pagination and failure 
 
 ---
 
-### Task 9: plugin 組裝 — setup、ServeDNS、順序檢查、metrics
+### Task 9: assembling the plugin — setup, ServeDNS, the order check, metrics
 
-把前八個任務接成一個真正的 CoreDNS plugin。
+Wires the previous eight tasks into an actual CoreDNS plugin.
 
 **Files:**
 - Create: `plugin/zonedns/zonedns.go`
@@ -1953,16 +2026,16 @@ git commit -m "feat(registry): poll SPIRE Entry API with pagination and failure 
 - Test: `plugin/zonedns/setup_test.go`
 
 **Interfaces:**
-- Consumes: `identity.Config`、`registry.Store`、`zonetable.Table`、`decision.Decide`、`ednszone.DefaultCode`
+- Consumes: `identity.Config`, `registry.Store`, `zonetable.Table`, `decision.Decide`, `ednszone.DefaultCode`
 - Produces:
-  - `zonedns.ZoneDNS` 結構（欄位 `Next plugin.Handler`、`Identity identity.Config`、`Registry *registry.Store`、`Zones *zonetable.Table`、`TTL uint32`）
+  - the `zonedns.ZoneDNS` struct, with fields `Next plugin.Handler`, `Identity identity.Config`, `Registry *registry.Store`, `Zones *zonetable.Table` and `TTL uint32`
   - `(ZoneDNS).Name() string`
   - `(ZoneDNS).ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error)`
   - `zonedns.CheckDirectiveOrder(directives []string) error`
 
-- [ ] **Step 1: 寫順序檢查的失敗測試**
+- [ ] **Step 1: Write the failing test for the order check**
 
-建立 `plugin/zonedns/setup_test.go`：
+Create `plugin/zonedns/setup_test.go`:
 
 ```go
 package zonedns
@@ -1980,8 +2053,9 @@ func TestCheckDirectiveOrder(t *testing.T) {
 	}
 }
 
-// 順序錯誤必須是啟動失敗，不能只是警告 —— cache 排在前面時，跨 zone 的 client
-// 會拿到別人快取的同 zone 答案，而這在執行期沒有任何徵兆。
+// A wrong order must fail startup, not merely warn — with cache first, a
+// cross-zone client receives a same-zone answer cached for somebody else, and
+// there is no sign of it at runtime.
 func TestCheckDirectiveOrderRejectsCacheFirst(t *testing.T) {
 	err := CheckDirectiveOrder([]string{"cache", "zonedns", "forward"})
 	if err == nil {
@@ -1998,7 +2072,7 @@ func TestCheckDirectiveOrderMissingZonedns(t *testing.T) {
 	}
 }
 
-// 沒有 cache 時順序無所謂。
+// Without cache present the order does not matter.
 func TestCheckDirectiveOrderWithoutCache(t *testing.T) {
 	if err := CheckDirectiveOrder([]string{"zonedns", "forward"}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -2035,7 +2109,8 @@ func TestParseCorefile(t *testing.T) {
 	}
 }
 
-// 沒有授權 agent 等於這個 plugin 永遠不會 zone-aware，是設定錯誤而非合法組態。
+// No authorized agent means this plugin can never be zone-aware: a
+// misconfiguration, not a legitimate setup.
 func TestParseCorefileRequiresAuthorizedAgent(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns {
 		spire_server unix:///tmp/spire-server/private/api.sock
@@ -2058,9 +2133,9 @@ func TestParseCorefileRejectsBadGatewayAddress(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 寫 ServeDNS 的失敗測試**
+- [ ] **Step 2: Write the failing test for ServeDNS**
 
-建立 `plugin/zonedns/zonedns_test.go`：
+Create `plugin/zonedns/zonedns_test.go`:
 
 ```go
 package zonedns
@@ -2083,7 +2158,7 @@ import (
 
 const testAgentID = "spiffe://example.org/node/n1"
 
-// nextCalled 是一個記錄自己是否被呼叫的下游 plugin。
+// nextCalled is a downstream plugin that records whether it was called.
 type nextCalled struct{ called bool }
 
 func (n *nextCalled) Name() string { return "next" }
@@ -2124,7 +2199,8 @@ func newHandler(t *testing.T, next plugin.Handler) ZoneDNS {
 	}
 }
 
-// request 建立一個來自已授權 agent、帶指定 source zone 的查詢。
+// request builds a query from an authorized agent carrying the given source
+// zone.
 func request(t *testing.T, qname string, qtype uint16, zone string) (*dns.Msg, dns.ResponseWriter) {
 	t.Helper()
 	m := new(dns.Msg)
@@ -2198,7 +2274,8 @@ func TestServeDNSUnknownNamePassesThrough(t *testing.T) {
 	}
 }
 
-// 沒有 client cert 的查詢走非 zone-aware 路徑，不是錯誤。
+// A query with no client cert takes the non-zone-aware path; that is not an
+// error.
 func TestServeDNSNoIdentityPassesThrough(t *testing.T) {
 	next := &nextCalled{}
 	h := newHandler(t, next)
@@ -2213,7 +2290,8 @@ func TestServeDNSNoIdentityPassesThrough(t *testing.T) {
 	}
 }
 
-// registry 有這個 zone，但設定檔沒有它的 gateway —— 必須 SERVFAIL，不可靜默放行。
+// The registry knows this zone but the config has no gateway for it — this must
+// SERVFAIL rather than quietly let the query through.
 func TestServeDNSMissingGatewayServfails(t *testing.T) {
 	next := &nextCalled{}
 	h := newHandler(t, next)
@@ -2231,8 +2309,9 @@ func TestServeDNSMissingGatewayServfails(t *testing.T) {
 	}
 }
 
-// IPv4 gateway 遇到 AAAA 查詢時回 NODATA（NOERROR + 空 answer），
-// 讓 client 正常退回 A。回 NXDOMAIN 會讓 client 認為這個名字不存在。
+// An IPv4 gateway meeting an AAAA query returns NODATA (NOERROR with an empty
+// answer) so the client falls back to A as usual. NXDOMAIN would tell the client
+// the name does not exist.
 func TestServeDNSCrossZoneAAAAWithIPv4GatewayReturnsNoData(t *testing.T) {
 	next := &nextCalled{}
 	h := newHandler(t, next)
@@ -2255,7 +2334,8 @@ func TestServeDNSCrossZoneAAAAWithIPv4GatewayReturnsNoData(t *testing.T) {
 	}
 }
 
-// 非 A/AAAA 的查詢型別不介入 —— 例如 SRV、TXT 應照常由下游回答。
+// Query types other than A/AAAA are left alone — SRV, TXT and the rest are
+// answered downstream as usual.
 func TestServeDNSOtherQtypePassesThrough(t *testing.T) {
 	next := &nextCalled{}
 	h := newHandler(t, next)
@@ -2270,12 +2350,14 @@ func TestServeDNSOtherQtypePassesThrough(t *testing.T) {
 }
 ```
 
-同時在 `plugin/zonedns/zonedns_test.go` 檔案開頭的 import 加入
-`"github.com/coredns/coredns/plugin/test"` 與 `"github.com/coredns/coredns/plugin/pkg/dnstest"`，
-並複製 Task 5 的憑證產生器（改名為 `newTestCertForAgent`，因為跨套件無法共用測試輔助）：
+At the same time, add `"github.com/coredns/coredns/plugin/test"` and
+`"github.com/coredns/coredns/plugin/pkg/dnstest"` to the imports at the top of
+`plugin/zonedns/zonedns_test.go`, and copy Task 5's certificate generator across,
+renamed to `newTestCertForAgent` because test helpers cannot be shared between
+packages:
 
 ```go
-// 於 plugin/zonedns/zonedns_test.go 末端加入：
+// Add at the end of plugin/zonedns/zonedns_test.go:
 func newTestCertForAgent(t *testing.T, uri string) *x509.Certificate {
 	t.Helper()
 
@@ -2306,14 +2388,14 @@ func newTestCertForAgent(t *testing.T, uri string) *x509.Certificate {
 }
 ```
 
-- [ ] **Step 3: 執行測試確認失敗**
+- [ ] **Step 3: Run the test and confirm it fails**
 
 Run: `go test ./plugin/zonedns/ -v`
 Expected: FAIL — `undefined: ZoneDNS`
 
-- [ ] **Step 4: 取得剩餘相依並寫 metrics**
+- [ ] **Step 4: Fetch the remaining dependencies and write the metrics**
 
-先安裝：
+First install them:
 
 ```bash
 go get github.com/prometheus/client_golang@latest
@@ -2321,9 +2403,9 @@ go get google.golang.org/grpc@latest
 go get github.com/spiffe/go-spiffe/v2@latest
 ```
 
-然後寫 metrics。
+Then write the metrics.
 
-建立 `plugin/zonedns/metrics.go`：
+Create `plugin/zonedns/metrics.go`:
 
 ```go
 package zonedns
@@ -2335,8 +2417,9 @@ import (
 )
 
 var (
-	// sourceZoneTotal 依判定結果分類。reason="unauthorized_agent" 是攻擊訊號，
-	// 應設定告警；reason="no_tls" 在遷移期間是正常的。
+	// sourceZoneTotal is broken down by verdict. reason="unauthorized_agent" is an
+	// attack signal and should be alerted on; reason="no_tls" is normal during a
+	// migration.
 	sourceZoneTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: plugin.Namespace,
 		Subsystem: "zonedns",
@@ -2344,8 +2427,8 @@ var (
 		Help:      "Count of source zone resolution attempts by outcome.",
 	}, []string{"reason"})
 
-	// decisionTotal 依動作分類。action="servfail" 表示設定漏了某個 zone 的
-	// gateway，應設定告警。
+	// decisionTotal is broken down by action. action="servfail" means the config is
+	// missing a gateway for some zone and should be alerted on.
 	decisionTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: plugin.Namespace,
 		Subsystem: "zonedns",
@@ -2353,7 +2436,8 @@ var (
 		Help:      "Count of routing decisions by action.",
 	}, []string{"action"})
 
-	// registryNames 是目前可解析的名稱數。掉到 0 表示 registry 出問題。
+	// registryNames is the number of currently resolvable names. Dropping to 0
+	// means something is wrong with the registry.
 	registryNames = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: plugin.Namespace,
 		Subsystem: "zonedns",
@@ -2361,7 +2445,8 @@ var (
 		Help:      "Number of resolvable names in the current registry snapshot.",
 	})
 
-	// registryConflicts 是因 zone 衝突而不可解析的名稱數。非 0 即為設定問題。
+	// registryConflicts is the number of names left unresolvable by a zone
+	// conflict. Anything but 0 is a configuration problem.
 	registryConflicts = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: plugin.Namespace,
 		Subsystem: "zonedns",
@@ -2369,7 +2454,7 @@ var (
 		Help:      "Number of names removed due to conflicting zone declarations.",
 	})
 
-	// registryReady 為 0 時所有查詢都走非 zone-aware 路徑。
+	// While registryReady is 0, every query takes the non-zone-aware path.
 	registryReady = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: plugin.Namespace,
 		Subsystem: "zonedns",
@@ -2379,19 +2464,22 @@ var (
 )
 ```
 
-- [ ] **Step 5: 寫 ServeDNS**
+- [ ] **Step 5: Write ServeDNS**
 
-建立 `plugin/zonedns/zonedns.go`：
+Create `plugin/zonedns/zonedns.go`:
 
 ```go
-// Package zonedns 是 zone-based DNS 的中心端 CoreDNS plugin。
+// Package zonedns is the central CoreDNS plugin for zone-based DNS.
 //
-// 它依查詢者的 zone（由 node-local agent 經 mTLS + EDNS0 宣告）與被查詢名稱所屬的
-// zone（來自 SPIRE registration entry）決定回應：同 zone 交給下游回一般答案，
-// 跨 zone 則回該 zone 的 gateway VIP。
+// It decides the response from the asking workload's zone — declared by the
+// node-local agent over mTLS with EDNS0 — and the zone the queried name belongs
+// to, which comes from SPIRE registration entries: within a zone it hands the
+// query downstream for the ordinary answer, and across zones it answers with that
+// zone's gateway VIP.
 //
-// 只有「跨 zone 且 gateway 已設定」這一種情況會改變答案，其餘一律不介入 ——
-// 這讓匯入本 plugin 的影響面盡可能小。
+// Only one case changes an answer, cross-zone with a configured gateway;
+// everything else passes through untouched, which keeps the blast radius of
+// importing this plugin as small as possible.
 package zonedns
 
 import (
@@ -2407,7 +2495,7 @@ import (
 	"github.com/miekg/dns"
 )
 
-// ZoneDNS 是 plugin 的處理器。
+// ZoneDNS is the plugin's handler.
 type ZoneDNS struct {
 	Next     plugin.Handler
 	Identity identity.Config
@@ -2416,15 +2504,15 @@ type ZoneDNS struct {
 	TTL      uint32
 }
 
-// Name 實作 plugin.Handler。
+// Name implements plugin.Handler.
 func (z ZoneDNS) Name() string { return "zonedns" }
 
-// ServeDNS 實作 plugin.Handler。
+// ServeDNS implements plugin.Handler.
 func (z ZoneDNS) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
 	state := request.Request{W: w, Req: r}
 
-	// 只處理位址查詢。SRV、TXT 等一律交給下游 —— 本 plugin 沒有能力為它們產生
-	// 有意義的跨 zone 答案。
+	// Address queries only. SRV, TXT and the rest go downstream — this plugin has
+	// no way to produce a meaningful cross-zone answer for them.
 	if state.QType() != dns.TypeA && state.QType() != dns.TypeAAAA {
 		return plugin.NextOrFailure(z.Name(), z.Next, ctx, w, r)
 	}
@@ -2454,11 +2542,12 @@ func (z ZoneDNS) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg)
 	}
 }
 
-// answerGateway 以 gateway VIP 回應。
+// answerGateway responds with the gateway VIP.
 //
-// gateway 是 IPv4 而查詢是 AAAA（或反之）時回 NODATA（NOERROR + 空 answer），
-// 讓 client 正常退回另一種位址族。回 NXDOMAIN 會讓 client 認為整個名字不存在，
-// 連 A 查詢也一併放棄。
+// When the gateway is IPv4 and the query is AAAA, or the other way round, it
+// returns NODATA (NOERROR with an empty answer) so the client falls back to the
+// other address family as usual. NXDOMAIN would tell the client the name does not
+// exist at all, and it would give up on the A query too.
 func (z ZoneDNS) answerGateway(state request.Request, gw string) (int, error) {
 	ip := net.ParseIP(gw)
 	isV4 := ip.To4() != nil
@@ -2487,9 +2576,9 @@ func (z ZoneDNS) answerGateway(state request.Request, gw string) (int, error) {
 }
 ```
 
-- [ ] **Step 6: 寫 setup**
+- [ ] **Step 6: Write setup**
 
-建立 `plugin/zonedns/setup.go`：
+Create `plugin/zonedns/setup.go`:
 
 ```go
 package zonedns
@@ -2528,7 +2617,7 @@ const (
 
 func init() { plugin.Register("zonedns", setup) }
 
-// config 是從 Corefile 解析出來的設定。
+// config is the configuration parsed out of the Corefile.
 type config struct {
 	spireServer      string
 	pollInterval     time.Duration
@@ -2536,17 +2625,19 @@ type config struct {
 	edns0Code        uint16
 	ttl              uint32
 	zones            *zonetable.Table
-	workloadAPI      string // 僅在 spire_server 為網路位址時需要
-	trustDomain      string // 同上，用於驗證 SPIRE Server 的身分
+	workloadAPI      string // needed only when spire_server is a network address
+	trustDomain      string // likewise, used to verify SPIRE Server's identity
 }
 
-// CheckDirectiveOrder 確認 zonedns 排在 cache 之前。
+// CheckDirectiveOrder confirms that zonedns sorts before cache.
 //
-// 這個順序不是偏好而是正確性要求：cache 若排在前面，它會用 (qname, qtype) 這個
-// 不含 zone 的 key 回答，於是跨 zone 的 client 會拿到別的 zone 快取的答案。這種
-// 錯誤在執行期沒有任何徵兆，因此必須在啟動時就擋下來。
+// The order is a correctness requirement, not a preference: were cache first, it
+// would answer from a (qname, qtype) key that carries no zone, and a cross-zone
+// client would receive an answer cached for another zone. That mistake leaves no
+// sign at runtime, so it has to be stopped at startup.
 //
-// 順序由編譯期的 plugin.cfg 決定，所以這是建置設定的檢查，不是使用者設定的檢查。
+// The order comes from plugin.cfg at compile time, making this a check on the
+// build configuration rather than on the user's.
 func CheckDirectiveOrder(directives []string) error {
 	zonednsAt, cacheAt := -1, -1
 	for i, d := range directives {
@@ -2609,16 +2700,19 @@ func setup(c *caddy.Controller) error {
 	return nil
 }
 
-// dialSPIRE 連上 SPIRE Server 的 Entry API。
+// dialSPIRE connects to SPIRE Server's Entry API.
 //
-// 兩種部署形態：
+// Two deployment shapes:
 //
-//   - unix:// — central 與 SPIRE Server 同機，走本機管理 socket。該 socket 的存取
-//     權由檔案權限控制，不需要 SVID。
-//   - 其他（host:port）— 走 mTLS，憑證取自本機 SPIRE agent 的 Workload API。此時
-//     central 自己的 registration entry 必須設 admin: true，否則 Entry API 會拒絕。
+//   - unix:// — central shares a machine with SPIRE Server and uses the local
+//     admin socket. Access to that socket is governed by file permissions and
+//     needs no SVID.
+//   - anything else (host:port) — mTLS, with certificates from the local SPIRE
+//     agent's Workload API. Central's own registration entry must then set
+//     admin: true, or the Entry API refuses.
 //
-// 憑證用 X509Source 而非靜態檔案，SVID 輪替才不需要重新載入設定。
+// Certificates come from an X509Source rather than static files, so SVID rotation
+// needs no configuration reload.
 func dialSPIRE(cfg *config) (*grpc.ClientConn, func(), error) {
 	if strings.HasPrefix(cfg.spireServer, "unix://") {
 		conn, err := grpc.NewClient(cfg.spireServer, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -2740,8 +2834,9 @@ func parseConfig(c *caddy.Controller) (*config, error) {
 	if cfg.spireServer == "" {
 		return nil, c.Err("spire_server is required")
 	}
-	// 沒有授權 agent 表示所有宣告都會被忽略，plugin 永遠不會 zone-aware。
-	// 這一定是設定錯誤，不是合法組態。
+	// With no authorized agent every declaration is ignored and the plugin can
+	// never be zone-aware. That is always a misconfiguration, never a legitimate
+	// setup.
 	if len(cfg.authorizedAgents) == 0 {
 		return nil, c.Err("at least one authorized_agent is required")
 	}
@@ -2751,30 +2846,30 @@ func parseConfig(c *caddy.Controller) (*config, error) {
 }
 ```
 
-- [ ] **Step 7: 執行測試確認通過**
+- [ ] **Step 7: Run the tests and confirm they pass**
 
 ```bash
 go test ./plugin/zonedns/ -race -v
 ```
 
-Expected: PASS，全部測試綠燈
+Expected: PASS, the whole suite green
 
-- [ ] **Step 8: 讓 Poller 回報 metric**
+- [ ] **Step 8: Have the Poller report metrics**
 
-修改 `internal/registry/spire.go` 的 `Run`，讓 plugin 層能取得統計。在 `Poller`
-加一個回呼欄位：
+Modify `Run` in `internal/registry/spire.go` so the plugin layer can obtain the
+statistics. Add a callback field to `Poller`:
 
 ```go
-// 於 Poller 結構加入欄位：
+// Add a field to the Poller struct:
 //   OnSnapshot func(Stats)
 
-// 於 Run 的成功分支加入：
+// Add to Run's success branch:
 //   if p.OnSnapshot != nil {
 //       p.OnSnapshot(stats)
 //   }
 ```
 
-並在 `plugin/zonedns/setup.go` 建立 poller 後接上：
+And wire it up after the poller is created in `plugin/zonedns/setup.go`:
 
 ```go
 poller.OnSnapshot = func(s registry.Stats) {
@@ -2787,7 +2882,7 @@ poller.OnSnapshot = func(s registry.Stats) {
 }
 ```
 
-- [ ] **Step 9: 執行完整測試**
+- [ ] **Step 9: Run the full test suite**
 
 Run: `go test ./... -race`
 Expected: PASS
@@ -2801,9 +2896,10 @@ git commit -m "feat(zonedns): wire plugin with setup, ServeDNS, ordering check a
 
 ---
 
-### Task 10: 端到端驗證與部署文件
+### Task 10: end-to-end verification and the deployment doc
 
-用真實的憑證與完整的 plugin chain 驗證整條路徑，並寫下部署所需的設定。
+Verify the whole path with real certificates and a complete plugin chain, and
+write down the configuration deployment requires.
 
 **Files:**
 - Create: `plugin/zonedns/e2e_test.go`
@@ -2811,12 +2907,12 @@ git commit -m "feat(zonedns): wire plugin with setup, ServeDNS, ordering check a
 - Create: `docs/deployment.md`
 
 **Interfaces:**
-- Consumes: 全部前述套件
-- Produces: 無新的程式介面
+- Consumes: all of the packages above
+- Produces: no new programmatic interface
 
-- [ ] **Step 1: 寫端到端測試**
+- [ ] **Step 1: Write the end-to-end test**
 
-建立 `plugin/zonedns/e2e_test.go`：
+Create `plugin/zonedns/e2e_test.go`:
 
 ```go
 package zonedns
@@ -2839,8 +2935,9 @@ import (
 	"github.com/miekg/dns"
 )
 
-// 走 DoH 路徑的完整流程：agent 憑證 → context 中的 http.Request → EDNS0 宣告
-// → registry 查詢 → gateway 答案。這是實際部署會走的路徑（傳輸為 DoH）。
+// The full DoH path: the agent certificate, the http.Request in the context, the
+// EDNS0 declaration, the registry lookup, the gateway answer. This is the path a
+// real deployment takes, since the transport is DoH.
 func TestEndToEndDoHCrossZone(t *testing.T) {
 	store := registry.NewStore()
 	snap, _ := registry.BuildSnapshot([]registry.Entry{
@@ -2857,7 +2954,8 @@ func TestEndToEndDoHCrossZone(t *testing.T) {
 		TTL:      30,
 	}
 
-	// agent 端會做的事：帶自己的 SVID 建立 mTLS 連線，並宣告 source zone。
+	// What the agent does: establish an mTLS connection with its own SVID and
+	// declare the source zone.
 	r := new(dns.Msg)
 	r.SetQuestion("payments.example.com.", dns.TypeA)
 	ednszone.Set(r, ednszone.DefaultCode, "zone-b")
@@ -2880,8 +2978,9 @@ func TestEndToEndDoHCrossZone(t *testing.T) {
 	}
 }
 
-// 同一個名字、同一份 registry，只有 source zone 不同就得到不同答案 ——
-// 這是整套設計的核心行為，值得單獨驗證一次。
+// One name and one registry, and differing only in source zone produces different
+// answers — the core behaviour of the whole design, worth verifying once on its
+// own.
 func TestEndToEndSameNameDifferentZones(t *testing.T) {
 	store := registry.NewStore()
 	snap, _ := registry.BuildSnapshot([]registry.Entry{
@@ -2899,7 +2998,7 @@ func TestEndToEndSameNameDifferentZones(t *testing.T) {
 		}
 	}
 
-	// zone-a 的 client：同 zone，交給下游。
+	// The zone-a client: same zone, handed downstream.
 	nextA := &nextCalled{}
 	rA, wA := request(t, "payments.example.com.", dns.TypeA, "zone-a")
 	if _, err := build(nextA).ServeDNS(context.Background(), dnstest.NewRecorder(wA), rA); err != nil {
@@ -2909,7 +3008,7 @@ func TestEndToEndSameNameDifferentZones(t *testing.T) {
 		t.Fatal("zone-a client should have been passed through")
 	}
 
-	// zone-b 的 client：跨 zone，回 gateway。
+	// The zone-b client: cross-zone, answered with the gateway.
 	nextB := &nextCalled{}
 	rB, wB := request(t, "payments.example.com.", dns.TypeA, "zone-b")
 	recB := dnstest.NewRecorder(wB)
@@ -2925,44 +3024,46 @@ func TestEndToEndSameNameDifferentZones(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 執行測試確認通過**
+- [ ] **Step 2: Run the test and confirm it passes**
 
 Run: `go test ./plugin/zonedns/ -race -run TestEndToEnd -v`
 Expected: PASS
 
-- [ ] **Step 3: 寫部署文件**
+- [ ] **Step 3: Write the deployment doc**
 
-建立 `docs/deployment.md`：
+Create `docs/deployment.md`:
 
 ````markdown
-# zonedns central 部署
+# Deploying zonedns central
 
-## 建置
+## Building
 
-zonedns 是 external CoreDNS plugin。CoreDNS 的 plugin 是編譯期連結的，沒有執行期
-載入機制，因此必須重新建置 CoreDNS binary。
+zonedns is an external CoreDNS plugin. CoreDNS plugins are linked at compile time
+with no runtime loading mechanism, so the CoreDNS binary has to be rebuilt.
 
-1. 取得 CoreDNS 原始碼（版本需與 `go.mod` 的 pin 一致）
-2. 在 `plugin.cfg` 中 **cache 之前** 加入一行：
+1. Fetch the CoreDNS source (the version must match the pin in `go.mod`)
+2. Add one line to `plugin.cfg`, **before cache**:
 
    ```
    zonedns:github.com/jenting/zonedns/plugin/zonedns
    ```
 
-   順序不可放在 `cache` 之後 —— plugin 啟動時會檢查並拒絕啟動。
+   It must not go after `cache` — the plugin checks at startup and refuses to
+   start.
 
-3. 建置：
+3. Build:
 
    ```bash
    go generate && go build
    ```
 
-## SPIRE 前置條件
+## SPIRE preconditions
 
-### 一、workload 的 registration entry（registry 的資料來源）
+### 1. Workload registration entries — the registry's data source
 
-zonedns 的 registry 完全來自 SPIRE registration entry：`dns_names` 提供名稱，
-`spiffe_id` 的 path 提供 zone。k8s 這一側用 `ClusterSPIFFEID` 產生：
+zonedns's registry comes entirely from SPIRE registration entries: `dns_names`
+supply the names and the `spiffe_id` path supplies the zone. On the Kubernetes
+side they are produced by a `ClusterSPIFFEID`:
 
 ```yaml
 apiVersion: spire.spiffe.io/v1alpha1
@@ -2970,9 +3071,10 @@ kind: ClusterSPIFFEID
 metadata:
   name: zonedns-workloads
 spec:
-  # 必要守衛：沒有這一行，未標 zonedns.io/host 的 pod 會渲染出空的 dns_names，
-  # SPIRE Server 以 ErrEmptyDomain 拒絕整筆 entry，該 pod 會拿不到 SVID ——
-  # 失效範圍遠大於 DNS。
+  # A required guard: without this line, a pod not labelled zonedns.io/host
+  # renders empty dns_names, SPIRE Server refuses the whole entry with
+  # ErrEmptyDomain, and that pod gets no SVID at all — damage reaching far beyond
+  # DNS.
   podSelector:
     matchExpressions:
       - {key: zonedns.io/host, operator: Exists}
@@ -2981,7 +3083,7 @@ spec:
     - '{{ index .PodMeta.Labels "zonedns.io/host" }}'
 ```
 
-對應的 Deployment pod template：
+The corresponding Deployment pod template:
 
 ```yaml
 metadata:
@@ -2990,7 +3092,8 @@ metadata:
     zonedns.io/host: payments.example.com
 ```
 
-VM 這一側的 entry 形式相同，registry 看不出差別：
+On the VM side the entry has the same shape and the registry cannot tell the
+difference:
 
 ```bash
 spire-server entry create \
@@ -3000,24 +3103,27 @@ spire-server entry create \
   -dns billing.example.com
 ```
 
-**一個 workload 只能有一個對外 FQDN。** 加第二個選配 label 會在未填時渲染出空字串
-導致 entry 被拒；開第二個 `ClusterSPIFFEID` 會因 SPIFFE ID 與 selector 相同而被
-`entriesMasked` 遮蔽。
+**A workload may have exactly one external FQDN.** A second optional label
+renders the empty string when unset and the entry is refused; a second
+`ClusterSPIFFEID` is masked by `entriesMasked` because its SPIFFE ID and selector
+are identical.
 
-### 二、central 自己存取 Entry API 的權限
+### 2. Central's own access to the Entry API
 
-兩種形態，Corefile 的 `spire_server` 決定走哪一種：
+Two shapes, chosen by `spire_server` in the Corefile:
 
-**同機（建議）** —— central 與 SPIRE Server 在同一台 VM，走本機管理 socket：
+**Same machine (recommended)** — central and SPIRE Server share a VM and use the
+local admin socket:
 
 ```
 spire_server unix:///run/spire/sockets/server.sock
 ```
 
-存取權由檔案權限控制，不需要 SVID，也不需要 `workload_api` / `trust_domain`。
+Access is governed by file permissions and needs no SVID, no `workload_api` and
+no `trust_domain`.
 
-**跨機** —— 走 mTLS，此時 central 需要 **admin SVID**，且必須設定 `workload_api`
-與 `trust_domain`：
+**Across machines** — mTLS, for which central needs an **admin SVID** and must set
+both `workload_api` and `trust_domain`:
 
 ```bash
 spire-server entry create \
@@ -3045,8 +3151,8 @@ example.com:853 {
         spire_server unix:///run/spire/sockets/server.sock
         poll_interval 30s
 
-        # 只有這些 SPIFFE ID 宣告的 source zone 會被採信。
-        # 精確比對，不支援前綴。
+        # Only source zones declared by these SPIFFE IDs are believed.
+        # Matched exactly; prefixes are not supported.
         authorized_agent spiffe://example.org/zone/infra/node/node-01
         authorized_agent spiffe://example.org/zone/infra/node/node-02
 
@@ -3066,76 +3172,82 @@ example.com:853 {
 }
 ```
 
-`client_auth require_and_verify` 是必要的 —— 沒有它，CoreDNS 不會要求 client 憑證，
-`identity` 取不到憑證就會讓所有查詢走非 zone-aware 路徑，**zone 路由會完全失效
-而且沒有錯誤訊息**。
+`client_auth require_and_verify` is required — without it CoreDNS does not ask for
+a client certificate, `identity` gets none, every query takes the non-zone-aware
+path, and **zone routing fails completely with no error message**.
 
-## 必要的告警
+## Required alerts
 
-| Metric | 條件 | 意義 |
+| Metric | Condition | Meaning |
 |---|---|---|
-| `coredns_zonedns_source_zone_total{reason="unauthorized_agent"}` | 任何非零增長 | 有未授權的來源在宣告 zone，這是攻擊訊號 |
-| `coredns_zonedns_decision_total{action="servfail"}` | 任何非零增長 | 某個 zone 缺 gateway 設定 |
-| `coredns_zonedns_registry_conflicts` | > 0 | 有 FQDN 被宣告成多個 zone，這些名字目前不可解析 |
-| `coredns_zonedns_registry_ready` | == 0 持續超過一個輪詢週期 | registry 未載入，全部查詢退回非 zone-aware |
-| `coredns_zonedns_source_zone_total{reason="no_tls"}` | 遷移完成後仍持續增長 | 有 client 沒走 mTLS 路徑 |
+| `coredns_zonedns_source_zone_total{reason="unauthorized_agent"}` | Any non-zero growth | An unauthorized source is declaring a zone; this is an attack signal |
+| `coredns_zonedns_decision_total{action="servfail"}` | Any non-zero growth | Some zone has no gateway configured |
+| `coredns_zonedns_registry_conflicts` | > 0 | An FQDN is declared into several zones, and those names are currently unresolvable |
+| `coredns_zonedns_registry_ready` | == 0 for longer than one poll interval | The registry has not loaded and every query falls back to non-zone-aware |
+| `coredns_zonedns_source_zone_total{reason="no_tls"}` | Still growing after the migration is complete | Some client is not using the mTLS path |
 
-## 不可回頭的前提
+## An irreversible precondition
 
-central 與各節點 agent 之間的路徑上**不得有任何終結 TLS 的設備**（L7 ingress、
-反向代理、TLS 終結負載平衡器）。若有，central 看到的 client 憑證會是該設備的，
-`authorized_agent` 比對會失敗或誤中，而**查詢仍會正常得到答案** —— 失效完全無聲。
+**No device may terminate TLS on the path between central and the node agents** —
+no L7 ingress, no reverse proxy, no TLS-terminating load balancer. With one in
+place, the client certificate central sees is that device's, the
+`authorized_agent` comparison either fails or matches the wrong thing, and
+**queries still return answers normally** — the failure is entirely silent.
 
-這一點應以測試持續驗證：定期以非授權憑證發出查詢，確認 zone 宣告確實被忽略。
+This should be verified continuously by test: issue queries periodically with an
+unauthorized certificate and confirm the zone declaration really is ignored.
 ````
 
-- [ ] **Step 4: 寫 README**
+- [ ] **Step 4: Write the README**
 
-建立 `README.md`：
+Create `README.md`:
 
 ```markdown
 # zonedns
 
 Zone-based DNS for mixed Kubernetes and VM environments, built on SPIFFE/SPIRE.
 
-同一個 zone 內的 workload 互打時回一般的服務位址；跨 zone 時回目標 zone 的
-gateway VIP。查詢者的 zone 由 node-local DNS 依 source pod IP 查出，經 mTLS DoH
-向中心宣告；被查詢名稱的 zone 來自 SPIRE registration entry。
+When workloads within one zone talk to each other, the answer is the ordinary
+service address; across zones it is the destination zone's gateway VIP. The
+asking workload's zone is determined by node-local DNS from the source pod IP and
+declared to central over mTLS DoH; the queried name's zone comes from its SPIRE
+registration entry.
 
-- 設計文件：`docs/superpowers/specs/2026-08-18-zonedns-design.md`
-- 部署說明：`docs/deployment.md`
+- Design document: `docs/superpowers/specs/2026-08-18-zonedns-design.md`
+- Deployment guide: `docs/deployment.md`
 
-## 元件
+## Components
 
-| 路徑 | 說明 |
+| Path | What it does |
 |---|---|
-| `plugin/zonedns` | 中心端 CoreDNS plugin：決策與回應 |
-| `internal/identity` | 信任邊界：驗證 agent 身分並讀取 source zone 宣告 |
-| `internal/registry` | 輪詢 SPIRE Entry API，維護 FQDN → zone |
-| `internal/zonetable` | zone → gateway VIP 設定 |
-| `internal/decision` | 核心決策表（純函式） |
-| `internal/ednszone` | agent 與 central 之間的 EDNS0 線上格式 |
-| `internal/spiffezone` | 從 SPIFFE ID path 取出 zone |
+| `plugin/zonedns` | The central CoreDNS plugin: deciding and responding |
+| `internal/identity` | The trust boundary: verifies the agent's identity and reads the source zone declaration |
+| `internal/registry` | Polls the SPIRE Entry API and maintains FQDN → zone |
+| `internal/zonetable` | The zone → gateway VIP configuration |
+| `internal/decision` | The core decision table (a pure function) |
+| `internal/ednszone` | The EDNS0 wire format between agent and central |
+| `internal/spiffezone` | Extracts the zone from a SPIFFE ID path |
 
-## 測試
+## Tests
 
 ```bash
 go test ./... -race
 ```
 
-`internal/identity` 的測試涵蓋各種繞過嘗試 —— 整套 zone 隔離是否成立只取決於
-該套件，修改前請先讀它的測試。
+`internal/identity`'s tests cover a range of bypass attempts — whether zone
+isolation holds at all depends on nothing but that package, so read its tests
+before changing it.
 ```
 
-- [ ] **Step 5: 執行完整測試與靜態檢查**
+- [ ] **Step 5: Run the full test suite and static checks**
 
 ```bash
 go vet ./...
 go test ./... -race -cover
 ```
 
-Expected: 無 vet 警告；全部測試通過；`internal/identity` 與 `internal/decision`
-的涵蓋率應在 90% 以上
+Expected: no vet warnings; the whole suite passes; coverage of
+`internal/identity` and `internal/decision` above 90%
 
 - [ ] **Step 6: Commit**
 
