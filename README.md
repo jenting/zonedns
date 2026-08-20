@@ -2,156 +2,181 @@
 
 Zone-based DNS for mixed Kubernetes and VM environments, built on SPIFFE/SPIRE.
 
-同一個 zone 內的 workload 互打時回一般的服務位址；跨 zone 時回目標 zone 的
-gateway VIP。查詢者的 zone 由 node-local DNS 依 source pod IP 查出，經 mTLS DoH
-向中心宣告；被查詢名稱的 zone 來自 SPIRE registration entry。
+When workloads within one zone talk to each other, the answer is the ordinary
+service address; across zones it is the destination zone's gateway VIP. The
+asking workload's zone is determined by node-local DNS from the source pod IP and
+declared to central over mTLS DoH; the queried name's zone comes from its SPIRE
+registration entry.
 
-zone 之間在網路層是隔離的，跨 zone 流量只能走 zone gateway —— 這個前提讓「答案
-判斷錯誤」的後果是連不上，而不是繞過政策。
+Zones are isolated at the network layer and cross-zone traffic can only go
+through a zone gateway — which is what makes a wrong answer a failure to connect
+rather than a policy bypass.
 
-## 文件
+## Documentation
 
-| 文件 | 內容 |
+| Document | Contents |
 |---|---|
-| `docs/superpowers/specs/2026-08-18-zonedns-design.md` | 設計與核心不變式、威脅模型、**已知限制** |
-| `docs/deployment.md` | 兩端的建置與部署、必要告警、兩端必須成對維護的設定 |
-| `deploy/k8s/` | 節點端可直接套用的 Kubernetes manifest |
-| `build/` | 兩份 Dockerfile 與注入 plugin 的 registration 檔 |
-| `Makefile` | 建置、測試、image、漂移檢查的入口（`make help`） |
+| `docs/superpowers/specs/2026-08-18-zonedns-design.md` | The design, core invariants, threat model and **known limitations** |
+| `docs/deployment.md` | Building and deploying both ends, required alerts, settings that must be maintained as a pair |
+| `deploy/k8s/` | Directly applyable Kubernetes manifests for the node side |
+| `build/` | Two Dockerfiles and the registration file that injects the plugin |
+| `Makefile` | The entry point for building, testing, images and the drift check (`make help`) |
 
-初次接觸建議先讀 spec 的 §3（核心不變式）與 §9（已知限制）—— 這個系統大部分的
-失效方式都是「回一個看起來合理的答案」而不是報錯，§9 列的就是那些。
+Coming to this for the first time, start with §3 of the spec (core invariants)
+and §9 (known limitations) — most of this system's failure modes return a
+plausible-looking answer rather than an error, and §9 is the list of them.
 
-## 架構
+## Architecture
 
 ```
-pod ──一般 UDP DNS──▶ node-local DNS + zonedns_agent
-                          │  source IP → 本機 pod → zone label
-                          │  以 (qname, qtype, zone) 為 key 快取
-                          ▼  mTLS DoH + EDNS0 帶 zone
-                      CoreDNS + zonedns（跑在 VM 上）
-                          │  驗證 agent 身分才採信宣告
-                          │  registry: FQDN → zone（輪詢 SPIRE Entry API）
-                          ▼  同 zone → 交給下游；跨 zone → 回 gateway VIP
+pod ──plain UDP DNS──▶ node-local DNS + zonedns_agent
+                          │  source IP → local pod → zone label
+                          │  cached under (qname, qtype, zone)
+                          ▼  mTLS DoH, zone carried in EDNS0
+                      CoreDNS + zonedns (running on a VM)
+                          │  the declaration is believed only from a verified agent
+                          │  registry: FQDN → zone (polls the SPIRE Entry API)
+                          ▼  same zone → downstream; cross zone → the gateway VIP
 ```
 
-## 部署前提
+## Deployment precondition
 
-**agent 與 central 之間的路徑上不得有任何終結 TLS 的設備**（L7 ingress、反向
-代理、TLS 終結負載平衡器）。整套 zone 隔離建立在 central 看到的 client 憑證就是
-agent 本人的 SVID —— 中間一旦有設備終結 TLS，central 看到的會是它的憑證。
+**No device may terminate TLS on the path between an agent and central** — no
+L7 ingress, no reverse proxy, no TLS-terminating load balancer. The whole of zone
+isolation rests on the client certificate central sees being the agent's own
+SVID; the moment something in between terminates TLS, what central sees is that
+device's certificate.
 
-（2026-08-20 已向環境負責人確認：本環境不會有 TLS termination 出現在打到 DNS
-server 的路徑上。）
+(Confirmed with the environment owner on 2026-08-20: this environment will have
+no TLS termination on the path to the DNS server.)
 
-這個前提不必靠定期測試維護，執行期本身就在驗證它，而且在每一次查詢上生效：
+This precondition needs no periodic test to maintain it. The runtime verifies it
+on every single query:
 
-- **agent → central 由建構方式擋住** —— agent 以 `AuthorizeID(central)` 釘死對方
-  的 SPIFFE ID，中間設備出示自己的憑證時握手直接失敗。這一側不可能靜默。
-- **central → agent 會降級但有訊號** —— `coredns_zonedns_source_zone_total{reason="unauthorized_agent"}`
-  會上升。
+- **agent → central is stopped by construction** — the agent pins the other
+  side's SPIFFE ID with `AuthorizeID(central)`, and a device presenting its own
+  certificate fails the handshake outright. This side cannot fail silently.
+- **central → agent degrades, but with a signal** —
+  `coredns_zonedns_source_zone_total{reason="unauthorized_agent"}` rises.
 
-**`unauthorized_agent` 告警的正確處置是移除那個未授權身分，絕不是把它的
-SPIFFE ID 加進 `authorized_agent` 讓告警消失。** 那一步之後該身分能宣告任意
-zone，整套隔離失效且從此完全無聲。這是程式碼防不住的一步 —— 設定說誰可信，
-central 就信誰。
+**The correct response to an `unauthorized_agent` alert is to remove that
+unauthorized identity, never to add its SPIFFE ID to `authorized_agent` to make
+the alert go away.** After that step the identity can declare any zone it likes,
+the whole of the isolation is defeated, and from then on it is entirely silent.
+This is the step no code can prevent — the configuration says who is trusted, and
+central trusts them.
 
-## 元件
+## Components
 
-**中心端**
+**Central side**
 
-| 路徑 | 說明 |
+| Path | What it does |
 |---|---|
-| `plugin/zonedns` | CoreDNS plugin：解析 Corefile、連上 SPIRE Server、決策與回應 |
-| `internal/identity` | 信任邊界：驗證 agent 身分並讀取 source zone 宣告 |
-| `internal/registry` | 輪詢 SPIRE Entry API，維護 FQDN → zone 的唯讀快照 |
-| `internal/zonetable` | zone → gateway VIP 設定 |
-| `internal/decision` | 核心決策表（純函式，無 I/O） |
+| `plugin/zonedns` | The CoreDNS plugin: parses the Corefile, connects to SPIRE Server, decides and responds |
+| `internal/identity` | The trust boundary: verifies the agent's identity and reads the source zone declaration |
+| `internal/registry` | Polls the SPIRE Entry API and maintains a read-only FQDN → zone snapshot |
+| `internal/zonetable` | The zone → gateway VIP configuration |
+| `internal/decision` | The core decision table (a pure function, no I/O) |
 
-**節點端**
+**Node side**
 
-| 路徑 | 說明 |
+| Path | What it does |
 |---|---|
-| `plugin/zonedns_agent` | CoreDNS plugin：判定來源 zone、以 zone 為 key 快取、向 central 宣告 |
-| `internal/podzone` | 本機 pod IP → zone（node-scoped informer） |
-| `internal/zonecache` | 以 `(qname, qtype, zone)` 為 key 的答案快取 |
-| `internal/dohupstream` | 釘住 central SPIFFE ID 的 mTLS DoH client |
+| `plugin/zonedns_agent` | The CoreDNS plugin: determines the source zone, keys the cache by it, declares it to central |
+| `internal/podzone` | Local pod IP → zone (a node-scoped informer) |
+| `internal/zonecache` | An answer cache keyed by `(qname, qtype, zone)` |
+| `internal/dohupstream` | The mTLS DoH client that pins central's SPIFFE ID |
 
-**共用**
+**Shared**
 
-| 路徑 | 說明 |
+| Path | What it does |
 |---|---|
-| `internal/ednszone` | 兩端之間的 EDNS0 線上格式 |
-| `internal/spiffezone` | 從 SPIFFE ID path 取出 zone |
-| `internal/testcerts` | 測試專用：產生帶指定 URI SAN 的拋棄式憑證，只被 `_test.go` 匯入 |
+| `internal/ednszone` | The EDNS0 wire format between the two ends |
+| `internal/spiffezone` | Extracts the zone from a SPIFFE ID path |
+| `internal/testcerts` | For tests only: throwaway certificates with a given URI SAN, imported only by `_test.go` |
 
-**工具**
+**Tools**
 
-| 路徑 | 說明 |
+| Path | What it does |
 |---|---|
-| `cmd/zonedns-drift` | 比對 VirtualService 的 `hosts:` 與 pod 的 `zonedns.io/host` label，抓出兩份宣告的漂移 |
-| `internal/drift` | 上面那支工具的比對與收集邏輯 |
+| `cmd/zonedns-drift` | Compares VirtualService `hosts:` against pods' `zonedns.io/host` labels and catches drift between the two declarations |
+| `internal/drift` | The comparison and collection logic behind that tool |
 
-節點端與中心端不共用程式碼，只共用 `internal/ednszone` 定義的線上格式（EDNS0
-option 裡怎麼編碼一個 zone 宣告）—— 這是兩者之間唯一的相容性介面。任何一邊
-單獨修改這個格式，另一邊都不會編譯失敗或執行期報錯，只會讓宣告的 zone 讀不
-出來，查詢安靜地走回非 zone-aware 路徑。
+The node side and the central side share no code, only the wire format defined by
+`internal/ednszone` — how a zone declaration is encoded inside an EDNS0 option.
+That is the sole compatibility interface between them. Change the format on
+either side alone and the other neither fails to compile nor errors at runtime;
+the declared zone simply becomes unreadable and queries fall quietly back to the
+non-zone-aware path.
 
-## 建置
+## Building
 
-兩個 plugin 都是 external CoreDNS plugin —— CoreDNS 的 plugin 是**編譯期連結**
-的，沒有執行期載入機制，所以兩者都必須重新建置宿主 binary。
+Both plugins are external CoreDNS plugins, and CoreDNS plugins are **linked at
+compile time** with no runtime loading mechanism, so both require rebuilding the
+host binary.
 
-- **中心端**編進普通 CoreDNS：在 `plugin.cfg` 加一行（**必須在 `cache` 之前**）
-  再 `go generate && go build`
-- **節點端**編進 `sigs.k8s.io/node-local-dns`：加 blank import、把
-  `"zonedns_agent"` 插進 `dnsserver.Directives`（**同樣在 `cache` 之前**），
-  並注意該專案 vendor 相依、且必須以 `GOOS=linux` 建置
+- **The central side** compiles into ordinary CoreDNS: add a line to
+  `plugin.cfg` (**it must come before `cache`**), then
+  `go generate && go build`
+- **The node side** compiles into `sigs.k8s.io/node-local-dns`: add a blank
+  import and insert `"zonedns_agent"` into `dnsserver.Directives` (**again
+  before `cache`**), bearing in mind that the project vendors its dependencies
+  and that the build must use `GOOS=linux`
 
-兩端的順序要求不是偏好：內建的 `cache` plugin 以 `(qname, qtype)` 為 key，不含
-發問者的 zone。若它排在前面，一個 zone 的 pod 會拿到另一個 zone 快取的答案，而
-執行期沒有任何徵兆。兩端都會在啟動時檢查並拒絕錯誤的順序。
+The ordering requirement on both ends is not a preference: the built-in `cache`
+plugin keys on `(qname, qtype)` and does not include the asking workload's zone.
+If it sorts first, a pod in one zone receives an answer cached for another, with
+no sign of it at runtime. Both ends check the order at startup and refuse a wrong
+one.
 
 ```bash
-make images          # 兩個 image
-make image-central   # 只建中心端
-make image-agent     # 只建節點端
-make help            # 全部目標
+make images          # both images
+make image-central   # the central side only
+make image-agent     # the node side only
+make help            # every target
 ```
 
-兩份 Dockerfile 各自內建自檢：中心端確認 `-plugins` 列得出 `zonedns`，節點端
-餵一份含 `zonedns_agent` 的 Corefile 確認 directive 被認得。建置失敗會停在建置，
-而不是變成一個看起來正常、卻沒有 plugin 的 image。
+Both Dockerfiles carry their own self-check: the central one confirms `-plugins`
+lists `zonedns`, and the node one feeds in a Corefile containing `zonedns_agent`
+to confirm the directive is recognised. A failure stops at build time rather than
+becoming an image that looks fine and has no plugin in it.
 
-完整步驟與版本 pinning 的理由見 `docs/deployment.md`。
+For the full steps and the reasoning behind the version pins, see
+`docs/deployment.md`.
 
-## 測試
+## Tests
 
 ```bash
 go test ./... -race
 ```
 
-`internal/identity` 的測試涵蓋各種繞過嘗試 —— 整套 zone 隔離是否成立只取決於
-該套件，修改前請先讀它的測試。兩端各有一組端到端測試，驗證同一個名字在不同
-source zone 下得到不同答案：中心端在 `plugin/zonedns/e2e_test.go`，節點端在
-`plugin/zonedns_agent/e2e_test.go`（經真正的 DoH wire 編碼／解碼）。
+`internal/identity`'s tests cover a range of bypass attempts — whether zone
+isolation holds at all depends on nothing but that package, so read its tests
+before changing it. Each end has an end-to-end test proving one name yields
+different answers under different source zones: the central side in
+`plugin/zonedns/e2e_test.go`, the node side in
+`plugin/zonedns_agent/e2e_test.go`, the latter through real DoH wire encoding and
+decoding.
 
-### 兩端對接測試
+### The two-ends integration test
 
-`internal/integration` 讓真正的 `Agent.ServeDNS` 經過**真實的 mTLS 握手**打到
-真正的 `ZoneDNS.ServeDNS`，中間不替換任何一端的邏輯。它涵蓋單邊測試構造不出來
-的情境：兩端設定不同的 `edns0_code`、未授權憑證在真實握手下被拒、以及 client
-偽造的宣告在線上被剝除。
+`internal/integration` runs the real `Agent.ServeDNS` through a **real mTLS
+handshake** into the real `ZoneDNS.ServeDNS`, substituting neither end's logic.
+It covers situations a one-sided test cannot construct: the two ends configured
+with different `edns0_code`s, an unauthorized certificate refused in a real
+handshake, and a client's forged declaration stripped on the wire.
 
-那裡的假 central **刻意跟真的一樣嚴格** —— 它套用與 CoreDNS DoH server 完全
-相同的路徑檢查。`upstream` URL 重複附加 `/dns-query` 那個 bug 之所以躲過 16 個
-任務與兩輪最終審查，正是因為當時的測試替身接受任何路徑。寬鬆的替身會複製它
-本來要防的盲點。
+The fake central there is **deliberately as strict as the real one** — it applies
+exactly the path check CoreDNS's DoH server applies. The bug where the `upstream`
+URL had `/dns-query` appended twice escaped 16 tasks and two final reviews for
+precisely one reason: the test doubles of the time accepted any path. A
+permissive double reproduces the very blind spot it exists to prevent.
 
-### 需要真實 cluster 的測試
+### Tests that need a real cluster
 
-`internal/podzone/cluster_test.go` 以 `cluster` build tag 隔開，一般的
-`go test ./...` 不會跑到。CI 用兩節點 kind cluster 執行；本機重現：
+`internal/podzone/cluster_test.go` sits behind the `cluster` build tag and an
+ordinary `go test ./...` does not reach it. CI runs it on a two-node kind
+cluster; to reproduce locally:
 
 ```bash
 kind create cluster --config deploy/kind/two-node.yaml
@@ -159,16 +184,18 @@ kubectl apply -f deploy/k8s/01-rbac.yaml
 go test -tags=cluster ./internal/podzone/ -run TestCluster -v
 ```
 
-它驗的是 `fake.NewSimpleClientset` 結構上做不到的事：它的 object tracker
-**忽略 field selector**，所以「informer 只看本機節點的 pod」這個行為在其他
-測試裡從來沒有真正發生過。測試以該 ServiceAccount 的 token 連線、用的是
-`deploy/k8s/01-rbac.yaml` 那份真正的 RBAC，所以權限不足時 informer 會同步不了
-而失敗。
+It verifies what `fake.NewSimpleClientset` structurally cannot: its object
+tracker **ignores field selectors**, so "the informer sees only this node's pods"
+has never actually happened in any other test. The test connects with that
+ServiceAccount's token and uses the real RBAC from
+`deploy/k8s/01-rbac.yaml`, so insufficient permissions leave the informer unable
+to sync and the test fails.
 
-必須是兩個節點：單節點的 cluster 無法證明範圍真的被限縮。
+Two nodes are required: a single-node cluster cannot prove the scoping really
+took effect.
 
-`internal/drift/cluster_test.go` 同樣以 `cluster` tag 隔開，需要一個裝了 Istio
-CRD 的 cluster：
+`internal/drift/cluster_test.go` sits behind the same `cluster` tag and needs a
+cluster with the Istio CRDs installed:
 
 ```bash
 kind create cluster
@@ -176,81 +203,96 @@ make istio-crds
 make test-drift
 ```
 
-它驗的是 fake dynamic client 結構上做不到的事：那個假物件**對 GVR 不做任何驗證**
-—— 群組名、資源複數形、版本全部打錯，它一樣照列不誤。也就是說「這支工具真的
-讀得到 VirtualService」這件事，在單元測試裡從來沒有被證明過，而它是整個檢查的
-前提：讀不到就等於沒有漂移，一份漂亮的乾淨報告。
+It verifies what the fake dynamic client structurally cannot: that fake
+**validates nothing about the GVR** — a wrong group, a wrong resource plural, a
+wrong version, and it lists happily all the same. Which means "this tool can
+actually read VirtualServices" has never been proven by any unit test, and it is
+the premise of the whole check: not being able to read them looks exactly like
+having no drift, a nice clean report.
 
-## 漂移檢查
+## The drift check
 
-一個 workload 的對外名稱在這套設計裡被寫了兩份 —— pod 的 `zonedns.io/host`
-label 決定 SPIRE entry 的 dns_name（也就是 central registry 的 key），Istio
-VirtualService 的 `hosts:` 決定 client 實際查什麼名字。**兩份宣告漂移時沒有任何
-東西會報錯**：central 查不到那個名字，就把它當成不歸自己管而交給下游，於是那個
-服務靜靜地失去 zone 路由，而 DNS 查詢照常有答案。
+This design writes a workload's external name twice — the pod's
+`zonedns.io/host` label determines the dns_name of its SPIRE entry, and therefore
+the key of central's registry, while the Istio VirtualService's `hosts:`
+determines the name clients actually query. **When the two declarations drift,
+nothing raises an error**: central cannot find the name, treats it as not its
+own, hands it downstream, and that service silently loses zone routing while DNS
+queries keep returning answers.
 
 ```bash
-make drift              # 用目前的 kubeconfig
+make drift              # using the current kubeconfig
 go run ./cmd/zonedns-drift --show-skipped
 ```
 
-| 離開碼 | 意義 |
+| Exit code | Meaning |
 |---|---|
-| 0 | 沒有漂移 |
-| 1 | 發現漂移 |
-| 2 | 檢查本身失敗（連不上、權限不足、沒裝 Istio CRD） |
+| 0 | No drift |
+| 1 | Drift found |
+| 2 | The check itself failed (cannot connect, insufficient permission, no Istio CRD) |
 
-離開碼 2 是刻意與 0 分開的：叢集裡沒有 Istio CRD 和叢集裡沒有漂移，如果都印成
-「乾淨」，這支工具就會在最該說話的時候保持沉默。
+Exit code 2 is deliberately kept apart from 0: if a cluster with no Istio CRD and
+a cluster with no drift both printed "clean", this tool would fall silent at
+exactly the moment it most needs to speak.
 
-比對前會排除三類名稱（`--show-skipped` 會列出來並附上理由）：萬用 host、cluster
-內部名稱（短名與 `*.svc.cluster.local`）、以及綁在 gateway 而非 mesh 的
-VirtualService。這些不可能有對應的 workload label，比對它們只會製造假警報。
+Three kinds of name are excluded before the comparison, and `--show-skipped`
+lists them with the reason: wildcard hosts, cluster-internal names (short names
+and `*.svc.cluster.local`), and VirtualServices bound to a gateway rather than
+the mesh. None of them can have a corresponding workload label, and comparing
+them would only manufacture false alarms.
 
-**這個檢查只比對名稱。** 兩邊都對得上的名稱仍然可能指向錯誤的 workload —— 要驗
-那件事得追蹤 VirtualService → destination Service → pod 的路由，也就是設計時評估
-後否決的 Istio traversal 方案。工具的輸出會把這個界線印出來。
+**This check compares names only.** Names matching on both sides can still point
+at the wrong workload — verifying that would mean tracing the route from
+VirtualService to destination Service to pod, the Istio traversal approach
+considered and rejected during design. The tool prints that boundary in its own
+output.
 
-在叢集內執行（CronJob）時需要的權限：對 `pods` 與 `networking.istio.io` 的
-`virtualservices` 有 cluster 範圍的 `list`。
+Permissions needed to run inside the cluster, as a CronJob: cluster-wide `list`
+on `pods` and on `networking.istio.io`'s `virtualservices`.
 
-`--namespace` 可以把檢查限縮到單一 namespace，但**那會縮小正確性**：Istio 允許
-A namespace 的 VirtualService 指向 B namespace 的服務，限縮後那種情形會被誤報成
-「沒有 pod 認領」。它的用途是測試與範圍受限的檢查，正式用途請維持預設的全 cluster。
+`--namespace` narrows the check to a single namespace, but **it narrows
+correctness with it**: Istio lets a VirtualService in namespace A point at a
+service in namespace B, and scoping reports that arrangement as "no pod claims
+it". Its purpose is testing and deliberately scoped checks; for real use keep the
+default of the whole cluster.
 
 ## CI
 
-`.github/workflows/ci.yaml` 有五個 job。每一個都對應一種「單元測試結構上證明不了」
-的東西：
+`.github/workflows/ci.yaml` has five jobs. Each corresponds to something a unit
+test structurally cannot prove:
 
-| Job | 它證明什麼 |
+| Job | What it proves |
 |---|---|
-| `test` | 格式、`go vet`、`go build`、`go mod tidy` 是 no-op、`go test -race` |
-| `plugin-link` | 兩個 plugin 真的連結得進宿主 binary 並完成註冊；另外建一個**順序錯誤**的 binary，確認它啟動時真的被拒絕 |
-| `manifests` | `deploy/k8s/*.yaml` 對真實 API server 通過 server-side dry-run，且裝了真的 `ClusterSPIFFEID` CRD —— 少了 CRD，打錯的欄位名會被當成合法 YAML 放行 |
-| `informer` | 兩節點 kind cluster 上，`spec.nodeName` field selector 真的把範圍限縮到本機，且 `deploy/k8s/01-rbac.yaml` 的權限真的夠 |
-| `drift` | 漂移檢查對真實 Istio CRD 跑得動，三個離開碼都正確，而且報告會**指名道姓** |
+| `test` | Formatting, `go vet`, `go build`, `go mod tidy` being a no-op, `go test -race` |
+| `plugin-link` | Both plugins really link into the host binary and register; and separately, that a binary built in the **wrong order** really is refused at startup |
+| `manifests` | `deploy/k8s/*.yaml` pass a server-side dry-run against a real API server, with the real `ClusterSPIFFEID` CRD installed — without the CRD a mistyped field name sails through as valid YAML |
+| `informer` | On a two-node kind cluster, the `spec.nodeName` field selector really scopes to this machine, and the permissions in `deploy/k8s/01-rbac.yaml` really suffice |
+| `drift` | The drift check runs against a real Istio CRD, all three exit codes are correct, and the report **names names** |
 
-`tidy-check` 不是潔癖：CoreDNS 版本必須與上游 node-local-dns 一致、k8s 函式庫
-必須落在同一條線上，否則 agent plugin 連結不進去。那些 pin 全靠這個 job 守住。
+`tidy-check` is not fastidiousness: the CoreDNS version must match upstream
+node-local-dns and the Kubernetes libraries must sit on the same line, or the
+agent plugin will not link. Those pins are held by this job alone.
 
-`plugin-link` 與 `drift` 都刻意包含**反向驗證** —— 建一個應該失敗的東西，確認它
-真的失敗。只驗成功路徑的話，一個永遠通過的檢查看起來跟一個正確的檢查一模一樣。
+`plugin-link` and `drift` both deliberately include a **reverse check** — build
+something that should fail, and confirm it really does. Verify only the success
+path and a check that always passes looks exactly like a correct one.
 
-## 目前狀態
+## Current state
 
-**可用的**：兩端 plugin 與其對接、節點端的 Kubernetes manifest、兩份 Dockerfile
-與 Makefile、漂移檢查工具、上述五個 CI job。
+**Working**: both plugins and the interface between them, the node side's
+Kubernetes manifests, both Dockerfiles and the Makefile, the drift check tool,
+and the five CI jobs above.
 
-**還沒做的**：
+**Not done yet**:
 
-| 項目 | 影響 |
+| Item | Consequence |
 |---|---|
-| central 的 VM 端部署 artifact | central 跑在 VM 上，但 repo 裡只有 `docs/deployment.md` 的文字敘述，沒有 systemd unit 或任何可直接套用的檔案 |
-| `PrometheusRule` | 必要告警列在 `docs/deployment.md`，但沒有可直接套用的 rule 檔 —— 目前得手動照著建 |
-| spec §11 項 2 的尾巴 | 是否有 `Sidecar` 資源逐 namespace 覆寫成 `REGISTRY_ONLY`。若有，該範圍的跨 zone 流量會中斷而他處正常 |
-| spec §11 項 4 | CoreDNS 對多個 `bind` server block 的支援 —— 僅在日後改回 per-zone 位址時才需要 |
+| VM-side deployment artifacts for central | Central runs on a VM, but the repo holds only the prose in `docs/deployment.md` — no systemd unit, no directly applyable file of any kind |
+| `PrometheusRule` | The required alerts are listed in `docs/deployment.md`, but there is no applyable rule file — for now they have to be built by hand from the list |
+| The tail of spec §11, item 2 | Whether any `Sidecar` resource overrides a namespace to `REGISTRY_ONLY`. If one does, cross-zone traffic breaks within that scope while working everywhere else |
+| Spec §11, item 4 | CoreDNS's support for multiple `bind` server blocks — needed only if per-zone addresses are ever brought back |
 
-另外有數項已記錄但未處理的次要問題，例如 `podzone.Run` 不可重入（重複呼叫會建出
-第二個 informer），以及 `zonecache` 會快取「非成功但帶有答案」的回應。兩者在目前
-的使用方式下不會觸發。
+There are also a handful of recorded but unaddressed minor issues, such as
+`podzone.Run` not being re-entrant (calling it twice builds a second informer)
+and `zonecache` caching responses that are unsuccessful but carry answers.
+Neither is reachable given how they are currently used.
