@@ -214,6 +214,10 @@ VirtualService。這些不可能有對應的 workload label，比對它們只會
 在叢集內執行（CronJob）時需要的權限：對 `pods` 與 `networking.istio.io` 的
 `virtualservices` 有 cluster 範圍的 `list`。
 
+`--namespace` 可以把檢查限縮到單一 namespace，但**那會縮小正確性**：Istio 允許
+A namespace 的 VirtualService 指向 B namespace 的服務，限縮後那種情形會被誤報成
+「沒有 pod 認領」。它的用途是測試與範圍受限的檢查，正式用途請維持預設的全 cluster。
+
 ## CI
 
 `.github/workflows/ci.yaml` 有五個 job。每一個都對應一種「單元測試結構上證明不了」

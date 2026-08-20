@@ -57,9 +57,16 @@ func makeNamespace(t *testing.T, typed *kubernetes.Clientset, name string) {
 		t.Fatalf("建立 namespace %s: %v", name, err)
 	}
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
-		_ = typed.CoreV1().Namespaces().Delete(ctx, name, metav1.DeleteOptions{})
+		if err := typed.CoreV1().Namespaces().Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
+			t.Errorf("刪除 namespace %s: %v", name, err)
+			return
+		}
+		// 一定要等到真的消失。namespace 的刪除是非同步的，裡面的 pod 會停在
+		// Terminating 而依然被 list 得到 —— 同一個 CI job 裡後續的步驟會讀到
+		// 它們，於是一個「無人認領」的 host 突然變成有人認領。
+		waitNamespaceGone(ctx, t, typed, name)
 	})
 }
 
@@ -132,7 +139,7 @@ func TestClusterReadsRealVirtualServices(t *testing.T) {
 	applyVirtualService(t, dyn, ns, "payments", nil,
 		[]string{"payments.example.com", "payments", "payments." + ns + ".svc.cluster.local"})
 
-	hosts, skipped, err := CollectVirtualServiceHosts(context.Background(), dyn, DefaultClusterDomain)
+	hosts, skipped, err := CollectVirtualServiceHosts(context.Background(), dyn, DefaultClusterDomain, ns)
 	if err != nil {
 		t.Fatalf("CollectVirtualServiceHosts: %v", err)
 	}
@@ -160,7 +167,7 @@ func TestClusterDetectsDrift(t *testing.T) {
 	applyVirtualService(t, dyn, ns, "payments", nil, []string{"payments.example.com"})
 	applyPod(t, typed, ns, "payments-matching", "payments.example.com")
 
-	report := compareCluster(t, typed, dyn)
+	report := compareCluster(t, typed, dyn, ns)
 	if !report.OK() {
 		t.Fatalf("名稱一致時仍報出漂移：%+v", report)
 	}
@@ -168,7 +175,7 @@ func TestClusterDetectsDrift(t *testing.T) {
 	// 改掉 label —— 這正是真實世界的漂移：有人改了名字，只改了一邊。
 	applyPod(t, typed, ns, "payments-drifted", "paymnets.example.com")
 
-	report = compareCluster(t, typed, dyn)
+	report = compareCluster(t, typed, dyn, ns)
 	if report.OK() {
 		t.Fatal("label 打錯字後仍報告沒有漂移")
 	}
@@ -177,14 +184,14 @@ func TestClusterDetectsDrift(t *testing.T) {
 	}
 }
 
-func compareCluster(t *testing.T, typed *kubernetes.Clientset, dyn dynamic.Interface) Report {
+func compareCluster(t *testing.T, typed *kubernetes.Clientset, dyn dynamic.Interface, ns string) Report {
 	t.Helper()
 	ctx := context.Background()
-	vsHosts, _, err := CollectVirtualServiceHosts(ctx, dyn, DefaultClusterDomain)
+	vsHosts, _, err := CollectVirtualServiceHosts(ctx, dyn, DefaultClusterDomain, ns)
 	if err != nil {
 		t.Fatalf("CollectVirtualServiceHosts: %v", err)
 	}
-	podHosts, err := CollectPodHosts(ctx, typed, HostLabel)
+	podHosts, err := CollectPodHosts(ctx, typed, HostLabel, ns)
 	if err != nil {
 		t.Fatalf("CollectPodHosts: %v", err)
 	}
@@ -215,5 +222,22 @@ func TestClusterUnservedVersionIsNotFound(t *testing.T) {
 		List(context.Background(), metav1.ListOptions{})
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("列出未被服務的版本得到 %v，預期是 NotFound", err)
+	}
+}
+
+// waitNamespaceGone 等到 namespace 真的從 API server 消失。
+func waitNamespaceGone(ctx context.Context, t *testing.T, typed *kubernetes.Clientset, name string) {
+	t.Helper()
+	for {
+		_, err := typed.CoreV1().Namespaces().Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Errorf("等待 namespace %s 消失逾時", name)
+			return
+		case <-time.After(time.Second):
+		}
 	}
 }

@@ -245,9 +245,15 @@ jobs:
             containers: [{name: pause, image: registry.k8s.io/pause:3.10}]
           EOF
 
+          # 一定要限定 namespace：這一步斷言的是「修好之後整份報告乾淨」，那是
+          # 全域性質，任何殘留物都會改變答案。前一個步驟的 cluster 測試才剛刪掉
+          # 自己的 namespace，而 namespace 的刪除是非同步的 —— 裡面的 pod 會停在
+          # Terminating 卻依然 list 得到。第一次上 runner 時就是這樣掛的。
+          DRIFT="/tmp/zonedns-drift --namespace drift-ci"
+
           echo "── 有漂移時應離開 1，而且要指名道姓"
           set +e
-          out=$(/tmp/zonedns-drift --show-skipped); code=$?
+          out=$($DRIFT --show-skipped); code=$?
           set -e
           echo "$out"
           [ "$code" = "1" ] || { echo "預期離開碼 1，實得 $code"; exit 1; }
@@ -261,12 +267,12 @@ jobs:
           echo "── 修好 label 後應離開 0"
           kubectl label pod -n drift-ci payments-1 \
             zonedns.io/host=payments.example.com --overwrite
-          /tmp/zonedns-drift
+          $DRIFT
 
           echo "── 沒有 Istio CRD 時應離開 2，而不是回報乾淨"
           kubectl delete crd virtualservices.networking.istio.io
           set +e
-          /tmp/zonedns-drift; code=$?
+          $DRIFT; code=$?
           set -e
           [ "$code" = "2" ] || { echo "預期離開碼 2，實得 $code"; exit 1; }
 
