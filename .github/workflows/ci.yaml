@@ -158,3 +158,42 @@ jobs:
             echo "── $f"
             kubectl apply --dry-run=server -f "$f"
           done
+
+  informer:
+    name: informer 對真實 cluster
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # 必須是兩個節點：單節點無法證明 field selector 真的把範圍限縮到本機。
+      - name: 建立兩節點 kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: zonedns-informer
+          config: deploy/k8s/kind-2node.yaml
+
+      # 用 repo 裡真正的 RBAC，不是另外寫一份寬鬆的 —— 這個 job 要驗的其中
+      # 一件事就是那份 manifest 給的權限夠不夠。
+      - name: 套用 RBAC
+        run: |
+          kubectl apply -f deploy/k8s/01-rbac.yaml
+          kubectl wait --for=condition=Ready node --all --timeout=180s
+
+      # 這些測試以 build tag 隔開，一般的 go test ./... 不會跑到。它們驗的是
+      # fake.NewSimpleClientset 結構上做不到的事：field selector 對真實 API
+      # server 生效、RBAC 足夠、以及真實 informer 的 update 事件會立即讓失去
+      # 索引資格的 pod 失效。
+      - name: 執行 cluster 測試
+        run: go test -tags=cluster ./internal/podzone/ -run TestCluster -v -count=1 -timeout 10m
+
+      - name: 失敗時傾印 cluster 狀態
+        if: failure()
+        run: |
+          kubectl get nodes -o wide || true
+          kubectl get pods -A -o wide || true
+          kubectl auth can-i list pods \
+            --as=system:serviceaccount:kube-system:node-local-dns || true
