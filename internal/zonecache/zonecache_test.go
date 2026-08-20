@@ -10,7 +10,7 @@ import (
 
 var base = time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 
-// reply 建立一筆帶單一 A 記錄的回應，TTL 為 ttl 秒。
+// reply builds a response carrying a single A record with a TTL of ttl seconds.
 func reply(name string, ttl uint32, ip string) *dns.Msg {
 	m := new(dns.Msg)
 	m.SetQuestion(name, dns.TypeA)
@@ -21,7 +21,8 @@ func reply(name string, ttl uint32, ip string) *dns.Msg {
 	return m
 }
 
-// TestZoneIsPartOfTheKey 是這個套件存在的理由：同名同型別、不同 zone 必須互不干擾。
+// TestZoneIsPartOfTheKey is this package's reason to exist: same name, same
+// type, different zone must not interfere.
 func TestZoneIsPartOfTheKey(t *testing.T) {
 	c, err := New(16)
 	if err != nil {
@@ -67,7 +68,7 @@ func TestNameIsCaseInsensitive(t *testing.T) {
 	}
 }
 
-// 過期的項目必須是 miss，不可回一個 TTL 為 0 或負數的答案。
+// An expired entry must be a miss, never an answer with a zero or negative TTL.
 func TestExpiredEntryIsAMiss(t *testing.T) {
 	c, _ := New(16)
 	c.Put("payments.example.com.", dns.TypeA, "zone-a", reply("payments.example.com.", 30, "10.96.0.7"), base)
@@ -80,7 +81,8 @@ func TestExpiredEntryIsAMiss(t *testing.T) {
 	}
 }
 
-// 回傳的 TTL 必須扣掉已經過的時間，否則下游會把答案留得比我們預期更久。
+// The returned TTL must have the elapsed time subtracted, or downstream keeps
+// the answer longer than intended.
 func TestTTLIsDecrementedByElapsedTime(t *testing.T) {
 	c, _ := New(16)
 	c.Put("payments.example.com.", dns.TypeA, "zone-a", reply("payments.example.com.", 30, "10.96.0.7"), base)
@@ -94,7 +96,8 @@ func TestTTLIsDecrementedByElapsedTime(t *testing.T) {
 	}
 }
 
-// 呼叫端拿到的必須是副本 —— 改動回傳值不可污染快取。
+// The caller must receive a copy — changing the returned value must not
+// contaminate the cache.
 func TestGetReturnsACopy(t *testing.T) {
 	c, _ := New(16)
 	c.Put("payments.example.com.", dns.TypeA, "zone-a", reply("payments.example.com.", 30, "10.96.0.7"), base)
@@ -112,7 +115,7 @@ func TestGetReturnsACopy(t *testing.T) {
 	}
 }
 
-// 沒有 answer 的回應（NODATA）也要能快取，但沒有 TTL 可循，因此不快取。
+// A response with no answers (NODATA) has no TTL to follow, so it is not cached.
 func TestReplyWithoutAnswersIsNotCached(t *testing.T) {
 	c, _ := New(16)
 	m := new(dns.Msg)
@@ -127,7 +130,7 @@ func TestReplyWithoutAnswersIsNotCached(t *testing.T) {
 	}
 }
 
-// TTL 取 answer 中最小的一個。
+// The TTL is the smallest one among the answers.
 func TestExpiryUsesMinimumTTL(t *testing.T) {
 	c, _ := New(16)
 	m := reply("payments.example.com.", 30, "10.96.0.7")
@@ -158,18 +161,19 @@ func TestNewRejectsNonPositiveSize(t *testing.T) {
 	}
 }
 
-// 在過期的精確邊界（remaining == 0）時，Get 必須失敗。實作不能用 < 0，必須用 <= 0。
+// At the exact expiry boundary (remaining == 0) Get must fail. The
+// implementation must use <= 0, not < 0.
 func TestExactBoundaryExpiry(t *testing.T) {
 	c, _ := New(16)
 	c.Put("payments.example.com.", dns.TypeA, "zone-a", reply("payments.example.com.", 30, "10.96.0.7"), base)
 
-	// 在精確的過期時刻，必須失敗
+	// At the exact moment of expiry it must fail
 	if _, ok := c.Get("payments.example.com.", dns.TypeA, "zone-a", base.Add(30*time.Second)); ok {
 		t.Fatal("entry served at exact expiry boundary — must check remaining <= 0, not < 0")
 	}
 }
 
-// Put 拒絕快取 TTL 為 0 的回應。
+// Put refuses to cache a response with a zero TTL.
 func TestPutRefusesZeroTTL(t *testing.T) {
 	c, _ := New(16)
 	m := reply("payments.example.com.", 0, "10.96.0.7")
@@ -183,18 +187,19 @@ func TestPutRefusesZeroTTL(t *testing.T) {
 	}
 }
 
-// Ns 和 Extra 記錄的 TTL 也要扣掉，但 OPT 虛擬紀錄的 TTL 欄位是 EDNS0 旗標，不可改。
+// TTLs on Ns and Extra records are decremented too, but the TTL field of the
+// OPT pseudo-record holds EDNS0 flags and must not be touched.
 func TestNsAndExtraRecordsTTLRewritten(t *testing.T) {
 	c, _ := New(16)
 	m := reply("payments.example.com.", 30, "10.96.0.7")
 
-	// 加入 Ns 記錄
+	// Add an Ns record
 	m.Ns = []dns.RR{&dns.NS{
 		Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 30},
 		Ns:  "ns1.example.com.",
 	}}
 
-	// 加入 OPT 虛擬紀錄（TTL 欄位存放 EDNS0 擴展版本和旗標）
+	// Add an OPT pseudo-record (its TTL field holds the EDNS0 version and flags)
 	m.Extra = []dns.RR{&dns.OPT{
 		Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT, Class: 512, Ttl: 0x00008000},
 	}}
@@ -206,7 +211,7 @@ func TestNsAndExtraRecordsTTLRewritten(t *testing.T) {
 		t.Fatal("entry missing")
 	}
 
-	// Ns 記錄的 TTL 要扣掉時間
+	// The Ns record's TTL must be decremented
 	if len(got.Ns) == 0 {
 		t.Fatal("Ns record missing from copy")
 	}
@@ -214,7 +219,8 @@ func TestNsAndExtraRecordsTTLRewritten(t *testing.T) {
 		t.Fatalf("Ns TTL = %d, want 20 (should be decremented)", ttl)
 	}
 
-	// OPT 虛擬紀錄的 TTL 欄位不能改（包含 EDNS0 擴展版本和旗標）
+	// The OPT pseudo-record's TTL field must not change (it holds the EDNS0
+	// version and flags)
 	if len(got.Extra) == 0 {
 		t.Fatal("OPT record missing from copy")
 	}
@@ -224,15 +230,17 @@ func TestNsAndExtraRecordsTTLRewritten(t *testing.T) {
 	}
 }
 
-// 即使上游答案自帶的 TTL 遠超過 maxTTL（例如同 zone 分支直接轉發上游答案，
-// TTL 可能長達數小時），實際存活時間也不可超過 maxTTL —— 否則一個名字被登記
-// 進 registry 或改了 zone 之後，節點會繼續回覆舊答案直到那個很長的 TTL 走完。
+// Even when the upstream answer's own TTL far exceeds maxTTL (the same-zone
+// branch forwards upstream answers untouched, and those TTLs can run to hours),
+// the entry must not outlive maxTTL — otherwise, once a name is registered in
+// the registry or changes zone, the node keeps returning the old answer until
+// that long TTL runs out.
 func TestPutCapsTTLAtMax(t *testing.T) {
 	c, _ := New(16)
 	c.Put("payments.example.com.", dns.TypeA, "zone-a", reply("payments.example.com.", 3600, "10.96.0.7"), base)
 
-	// 剛存進去、還沒到 maxTTL 之前必須是 hit，且回傳的 TTL 以 maxTTL（不是
-	// 原始的 3600 秒）為準。
+	// Freshly stored and still short of maxTTL, it must be a hit, and the returned
+	// TTL must follow maxTTL rather than the original 3600 seconds.
 	got, ok := c.Get("payments.example.com.", dns.TypeA, "zone-a", base.Add(1*time.Second))
 	if !ok {
 		t.Fatal("entry missing before the cap")
@@ -242,18 +250,20 @@ func TestPutCapsTTLAtMax(t *testing.T) {
 		t.Fatalf("ttl = %d, want %d (capped at maxTTL, not the upstream's 3600s)", ttl, wantTTL)
 	}
 
-	// 過了 maxTTL 之後必須是 miss，即使上游原本給的 TTL 遠遠沒到期。
+	// Past maxTTL it must be a miss, even though upstream's own TTL is nowhere
+	// near expiry.
 	if _, ok := c.Get("payments.example.com.", dns.TypeA, "zone-a", base.Add(maxTTL+time.Second)); ok {
 		t.Fatal("entry outlived maxTTL despite an upstream TTL far beyond it")
 	}
 }
 
-// Zone 匹配是大小寫敏感的 —— zone 標籤從 pod label 一路傳到 SPIFFE ID，大小寫必須一致。
+// Zone matching is case-sensitive — a zone label travels from the pod label all
+// the way into the SPIFFE ID, and the case must agree throughout.
 func TestZoneCaseSensitive(t *testing.T) {
 	c, _ := New(16)
 	c.Put("payments.example.com.", dns.TypeA, "zone-a", reply("payments.example.com.", 30, "10.96.0.7"), base)
 
-	// 不同大小寫的 zone 必須是不同的 key —— 不應該命中
+	// Zones differing only in case must be different keys — this must not hit
 	if _, ok := c.Get("payments.example.com.", dns.TypeA, "Zone-A", base); ok {
 		t.Fatal("zone case folding occurred — zone must be case-sensitive")
 	}

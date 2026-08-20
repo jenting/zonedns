@@ -19,7 +19,8 @@ func query() *dns.Msg {
 	return m
 }
 
-// echoServer 回一筆固定答案，並把收到的查詢交給 inspect。
+// echoServer returns one fixed answer and hands the query it received to
+// inspect.
 func echoServer(t *testing.T, inspect func(*dns.Msg)) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -61,7 +62,8 @@ func TestExchange(t *testing.T) {
 	}
 }
 
-// 上游看到的查詢必須保留原本的問題與 EDNS0 內容。
+// The query upstream sees must preserve the original question and EDNS0
+// contents.
 func TestExchangePreservesTheQuery(t *testing.T) {
 	var seen *dns.Msg
 	srv := echoServer(t, func(m *dns.Msg) { seen = m })
@@ -84,7 +86,8 @@ func TestExchangePreservesTheQuery(t *testing.T) {
 	}
 }
 
-// 回應的 ID 必須對得回原查詢 —— RFC 8484 要求送出時 ID 為 0，還原是我們的責任。
+// The response ID must match the original query — RFC 8484 requires an ID of 0
+// on the wire, and restoring it is our responsibility.
 func TestExchangeRestoresMessageID(t *testing.T) {
 	srv := echoServer(t, nil)
 	defer srv.Close()
@@ -101,10 +104,11 @@ func TestExchangeRestoresMessageID(t *testing.T) {
 	}
 }
 
-// Exchange 不得改動呼叫端傳入的 *dns.Msg —— CoreDNS plugin 在請求生命週期中
-// 會重複使用同一個訊息物件，若少了內部的 .Copy()，日後的「簡化」會讓
-// Exchange 直接改動呼叫端的訊息（ID 被清成 0、EDNS0 選項被動到），而且不會有
-// 任何測試失敗提醒。
+// Exchange must not modify the *dns.Msg the caller passed in. CoreDNS plugins
+// reuse one message object across a request's lifetime, and without the internal
+// .Copy() a later "simplification" would have Exchange mutate the caller's
+// message directly — the ID cleared to 0, the EDNS0 options disturbed — with no
+// failing test to say so.
 func TestExchangeDoesNotMutateCallerMessage(t *testing.T) {
 	srv := echoServer(t, nil)
 	defer srv.Close()
@@ -157,9 +161,11 @@ func TestExchangeHonoursContextCancellation(t *testing.T) {
 	}
 }
 
-// 一個掛住不回應的上游（網路分斷、防火牆丟包、central 掛死但連線沒斷）不可
-// 讓 Exchange 無限期卡住 —— 那會讓呼叫它的 goroutine 與底層 socket 永遠佔用。
-// buildHTTPClient 接上的 http.Client.Timeout 必須讓它在有限時間內回錯。
+// An upstream that hangs without answering — a network partition, a firewall
+// dropping packets, a central that hung without dropping the connection — must
+// not stall Exchange indefinitely, which would hold the calling goroutine and
+// its underlying socket forever. The http.Client.Timeout wired in by
+// buildHTTPClient must make it fail within a bounded time.
 func TestExchangeTimesOutOnHangingUpstream(t *testing.T) {
 	block := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -183,17 +189,18 @@ func TestExchangeTimesOutOnHangingUpstream(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error from a hanging upstream")
 	}
-	// 給排程餘裕留一點空間，但必須遠低於「無限期卡住」的意思 —— 這裡用
-	// client 逾時的 10 倍當上限，遠低於這個套件過去任何一次會拿來模擬掛住的
-	// 秒數量級。
+	// Leave room for scheduling jitter, but stay far below anything that would
+	// count as "stalled indefinitely" — the bound here is ten times the client
+	// timeout, well under the order of seconds this package has ever used to
+	// simulate a hang.
 	if elapsed > time.Second {
 		t.Fatalf("Exchange took %s to return an error, want well under 1s (client timeout was 100ms) — "+
 			"it appears to have blocked rather than honouring the client's Timeout", elapsed)
 	}
 }
 
-// buildHTTPClient 是 NewMTLS 的逾時邏輯拆出來的部分，讓它可以在不需要一個真的
-// 在跑的 SPIRE Workload API 的情況下單獨測試。
+// buildHTTPClient is the timeout logic split out of NewMTLS so it can be tested
+// on its own, without a running SPIRE Workload API.
 func TestBuildHTTPClientDefaultsTimeout(t *testing.T) {
 	hc := buildHTTPClient(&tls.Config{}, 0)
 	if hc.Timeout != defaultQueryTimeout {
@@ -209,7 +216,8 @@ func TestBuildHTTPClientHonoursConfiguredTimeout(t *testing.T) {
 	}
 }
 
-// 缺少 central SPIFFE ID 必須在建立時就失敗，不可退回成只驗憑證鏈。
+// A missing central SPIFFE ID must fail at construction, never fall back to
+// verifying the chain alone.
 func TestNewMTLSRequiresCentralSPIFFEID(t *testing.T) {
 	_, _, err := NewMTLS(context.Background(), Config{
 		URL:             "https://central/dns-query",
@@ -223,12 +231,14 @@ func TestNewMTLSRequiresCentralSPIFFEID(t *testing.T) {
 	}
 }
 
-// Exchange 送出的請求路徑必須恰好是 "/dns-query"。
+// The request path Exchange sends must be exactly "/dns-query".
 //
-// CoreDNS 的 doh.NewRequestWithContext 自己會接上那段路徑，所以呼叫端給的 URL
-// 不可再帶路徑。這個假設一直沒有被測到：其他測試都用 httptest 的 srv.URL（剛好
-// 不帶路徑），而 echoServer 又接受任何路徑，兩邊互補地遮蔽了它 —— 實際部署時
-// 帶路徑的 URL 會被 central 以 HTTP 404 拒絕。
+// CoreDNS's doh.NewRequestWithContext appends that path itself, so the URL the
+// caller supplies must not carry one. This assumption went untested for a long
+// time: the other tests all use httptest's srv.URL, which happens to carry no
+// path, and echoServer accepts any path anyway — the two gaps covered for each
+// other. In a real deployment a URL with a path is refused by central with an
+// HTTP 404.
 func TestExchangeRequestsTheDoHPathExactlyOnce(t *testing.T) {
 	var seenPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -254,8 +264,8 @@ func TestExchangeRequestsTheDoHPathExactlyOnce(t *testing.T) {
 	}
 }
 
-// 給了帶路徑的 URL，路徑會被重複附加 —— 記錄這個上游行為，因為呼叫端的設定
-// 驗證正是為了擋下它而存在。
+// Given a URL with a path, the path is appended twice. Recorded here because the
+// caller's configuration validation exists precisely to prevent it.
 func TestExchangeDoublesAPathAlreadyInTheURL(t *testing.T) {
 	var seenPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

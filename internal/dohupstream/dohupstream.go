@@ -1,9 +1,11 @@
-// Package dohupstream 是 agent 對 central 的 DoH client。
+// Package dohupstream is the agent's DoH client for talking to central.
 //
-// 傳輸為 DoH over mTLS：agent 以自己的 SVID 出示身分，並且**必須**以 SPIFFE ID
-// 釘住 central。只驗證憑證鏈是不夠的 —— 信任域內任何一張 SVID 都能冒充 central，
-// 而偽造的 central 可以回傳任意答案（例如宣稱某個同 zone 服務是跨 zone 的，並給出
-// 攻擊者控制的位址），agent 對答案沒有獨立查核手段。見 spec §7.5。
+// The transport is DoH over mTLS: the agent presents its own SVID and MUST pin
+// central by SPIFFE ID. Verifying the certificate chain alone is not enough —
+// any SVID in the trust domain could impersonate central, and a forged central
+// can return whatever it likes (claiming a same-zone service is cross-zone and
+// handing back an attacker-controlled address, say), with no independent way for
+// the agent to check the answer. See spec §7.5.
 package dohupstream
 
 import (
@@ -21,60 +23,68 @@ import (
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
 )
 
-// defaultDialTimeout 限制取得第一份 SVID 的等待時間。
+// defaultDialTimeout bounds the wait for the first SVID.
 //
-// workloadapi.NewX509Source 會一直阻塞到 Workload API 首次回應為止，所以沒有這個
-// 上限時，SPIRE agent 尚未就緒會讓 CoreDNS 的設定解析整個卡住，沒有逾時也沒有日誌。
+// workloadapi.NewX509Source blocks until the Workload API first responds, so
+// without this bound a SPIRE agent that is not yet ready would stall CoreDNS's
+// whole configuration parse, with neither a timeout nor a log line.
 const defaultDialTimeout = 10 * time.Second
 
-// defaultQueryTimeout 限制單一 DoH 查詢從送出到拿到回應的總時間，涵蓋 dial、
-// TLS 握手、寫入請求、讀取回應的全部階段。
+// defaultQueryTimeout bounds the total time of one DoH query from send to
+// response, covering the dial, the TLS handshake, writing the request and
+// reading the reply.
 //
-// http.Client 預設沒有 Timeout：一個開始跟 central 三路握手就不回話的連線
-// （網路分斷、防火牆丟包、central 掛死但連線沒斷）會讓等在 Exchange 裡的那個
-// goroutine 與底層的那個 socket 永遠卡住，且卡住的數量隨查詢量線性累加，沒有
-// 任何日誌或 metric 會提示這件事在發生。5 秒鐘的選擇取自傳統 DNS resolver 的
-// 慣例（glibc /etc/resolv.conf 的 timeout 預設也是 5 秒）：長到足以吸收一次
-// TLS 握手加一次正常的網路延遲，短到讓呼叫端（node-local DNS 面對的 client）
-// 在它自己的等待耐性耗盡前就先拿到一個看起來正常的逾時，而不是一直掛著。
+// http.Client has no Timeout by default. A connection that begins its three-way
+// handshake with central and then goes quiet — a network partition, a firewall
+// dropping packets, a central that has hung without dropping the connection —
+// would strand the goroutine waiting inside Exchange and its underlying socket
+// forever, and the number stranded grows linearly with query volume, with no log
+// line or metric to hint that it is happening. Five seconds comes from
+// traditional DNS resolver convention (glibc's /etc/resolv.conf timeout defaults
+// to 5 seconds too): long enough to absorb a TLS handshake plus ordinary network
+// latency, short enough that the caller — the client facing node-local DNS —
+// gets a timeout that looks normal before its own patience runs out, rather than
+// hanging indefinitely.
 const defaultQueryTimeout = 5 * time.Second
 
-// Config 是建立 mTLS client 所需的設定。
+// Config is what building an mTLS client requires.
 type Config struct {
-	// URL 是 central 的位址，**不含路徑**。
+	// URL is central's address, WITHOUT a path.
 	//
-	// CoreDNS 的 doh.NewRequestWithContext 會自己接上 "/dns-query"（它的註解
-	// 明講 "The URL should not have a path"），所以這裡若給了
-	// "https://central/dns-query"，實際請求會是 "/dns-query/dns-query"，central
-	// 的 DoH server 回 404，而 agent 只看得到「上游回 HTTP 404」。
+	// CoreDNS's doh.NewRequestWithContext appends "/dns-query" itself (its own
+	// comment says so: "The URL should not have a path"), so passing
+	// "https://central/dns-query" here makes the actual request
+	// "/dns-query/dns-query", central's DoH server answers 404, and all the agent
+	// sees is "upstream returned HTTP 404".
 	//
-	// 這個契約一度沒有被寫下來也沒有被測試：所有單元測試都用 httptest 的
-	// srv.URL（剛好不帶路徑），而測試用的假伺服器又接受任何路徑，兩邊互補地
-	// 遮蔽了它。呼叫端的設定驗證負責在啟動時擋下帶路徑的值。
+	// This contract was once neither written down nor tested: every unit test used
+	// httptest's srv.URL, which happens to carry no path, and the fake server
+	// accepted any path anyway — the two gaps covered for each other. The caller's
+	// configuration validation is what rejects a value with a path at startup.
 	URL             string
 	WorkloadAPIAddr string
 	CentralSPIFFEID string
 	DialTimeout     time.Duration
-	// Timeout 限制每一次 DoH 查詢的總時間，見 defaultQueryTimeout。零值採用
-	// 該預設值。
+	// Timeout bounds the total time of each DoH query; see defaultQueryTimeout. A
+	// zero value takes that default.
 	Timeout time.Duration
 }
 
-// Client 對 central 發送 DoH 查詢。
+// Client sends DoH queries to central.
 type Client struct {
 	url string
 	hc  *http.Client
 }
 
-// NewWithHTTPClient 以既有的 http.Client 建立 Client。測試用，也讓傳輸層的設定
-// 與 DNS 邏輯分離。
+// NewWithHTTPClient builds a Client over an existing http.Client. For tests, and
+// to keep transport configuration separate from DNS logic.
 func NewWithHTTPClient(url string, hc *http.Client) *Client {
 	return &Client{url: url, hc: hc}
 }
 
-// NewMTLS 建立以 SPIFFE 身分互相驗證的 Client。
+// NewMTLS builds a Client that authenticates both ways by SPIFFE identity.
 //
-// 回傳的 cleanup 必須在關閉時呼叫，以釋放 X509Source。
+// The returned cleanup must be called on shutdown to release the X509Source.
 func NewMTLS(ctx context.Context, cfg Config) (*Client, func(), error) {
 	if cfg.CentralSPIFFEID == "" {
 		return nil, nil, errors.New("dohupstream: central_spiffe_id is required; " +
@@ -99,16 +109,17 @@ func NewMTLS(ctx context.Context, cfg Config) (*Client, func(), error) {
 			cfg.WorkloadAPIAddr, timeout, err)
 	}
 
-	// 憑證取自 X509Source 而非靜態檔案，SVID 輪替才不需要重新載入設定。
+	// Certificates come from the X509Source rather than static files, so SVID
+	// rotation needs no configuration reload.
 	tlsCfg := tlsconfig.MTLSClientConfig(source, source, tlsconfig.AuthorizeID(id))
 	hc := buildHTTPClient(tlsCfg, cfg.Timeout)
 
 	return &Client{url: cfg.URL, hc: hc}, func() { source.Close() }, nil
 }
 
-// buildHTTPClient 組出送查詢用的 http.Client，把 mTLS 設定與逾時接上去。從
-// NewMTLS 拆出來，好讓逾時預設值的邏輯可以在不需要一個真的在跑的 SPIRE
-// Workload API 的情況下單獨測試。
+// buildHTTPClient assembles the http.Client used for queries, wiring in the mTLS
+// configuration and the timeout. Split out of NewMTLS so the timeout-defaulting
+// logic can be tested on its own, without a running SPIRE Workload API.
 func buildHTTPClient(tlsCfg *tls.Config, timeout time.Duration) *http.Client {
 	if timeout == 0 {
 		timeout = defaultQueryTimeout
@@ -119,10 +130,10 @@ func buildHTTPClient(tlsCfg *tls.Config, timeout time.Duration) *http.Client {
 	}
 }
 
-// Exchange 送出查詢並回傳答案。
+// Exchange sends a query and returns the answer.
 func (c *Client) Exchange(ctx context.Context, m *dns.Msg) (*dns.Msg, error) {
-	// RFC 8484 要求 DoH 查詢的 DNS ID 為 0；回應的 ID 由我們還原，否則呼叫端無法
-	// 把答案對回原查詢。
+	// RFC 8484 requires the DNS ID of a DoH query to be 0. We restore the ID on the
+	// response, or the caller cannot match the answer back to its query.
 	originalID := m.Id
 	outbound := m.Copy()
 	outbound.Id = 0
@@ -141,7 +152,7 @@ func (c *Client) Exchange(ctx context.Context, m *dns.Msg) (*dns.Msg, error) {
 		return nil, fmt.Errorf("dohupstream: upstream returned HTTP %d", resp.StatusCode)
 	}
 
-	// ResponseToMsg 會關閉 body。
+	// ResponseToMsg closes the body.
 	answer, err := doh.ResponseToMsg(resp)
 	if err != nil {
 		return nil, fmt.Errorf("dohupstream: decode response: %w", err)
