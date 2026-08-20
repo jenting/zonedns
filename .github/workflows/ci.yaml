@@ -10,13 +10,13 @@ permissions:
   contents: read
 
 env:
-  # 與 go.mod 的 go 指令一致。這個版本不是隨意選的：它必須跟上游
-  # sigs.k8s.io/node-local-dns 對得上，否則 agent plugin 連結不進去。
+  # In step with go.mod's go directive. This version is not arbitrary: it must
+  # match upstream sigs.k8s.io/node-local-dns, or the agent plugin will not link.
   GO_VERSION: "1.25"
 
 jobs:
   test:
-    name: 測試與靜態檢查
+    name: Tests and static checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,7 +29,7 @@ jobs:
         run: |
           unformatted=$(gofmt -l .)
           if [ -n "$unformatted" ]; then
-            echo "以下檔案未格式化："
+            echo "the following files are not formatted:"
             echo "$unformatted"
             exit 1
           fi
@@ -40,13 +40,13 @@ jobs:
       - name: go build
         run: go build ./...
 
-      - name: go mod tidy 應為 no-op
+      - name: go mod tidy should be a no-op
         run: |
           cp go.mod /tmp/go.mod.orig
           cp go.sum /tmp/go.sum.orig
           go mod tidy
           if ! diff -q go.mod /tmp/go.mod.orig >/dev/null || ! diff -q go.sum /tmp/go.sum.orig >/dev/null; then
-            echo "go mod tidy 產生了差異，請在本機執行後提交："
+            echo "go mod tidy produced a diff; run it locally and commit the result:"
             diff go.mod /tmp/go.mod.orig || true
             exit 1
           fi
@@ -55,7 +55,7 @@ jobs:
         run: go test ./... -race -cover
 
   plugin-link:
-    name: 連結進 CoreDNS
+    name: Links into CoreDNS
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -66,44 +66,47 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: false
 
-      # 這個 job 驗證的東西 go test ./... 完全碰不到：module 單獨編得過，
-      # 不代表它能被 CoreDNS 的 plugin.cfg 連結進去。一個新的 import、一個
-      # 版本衝突、或 plugin 註冊方式的改動，都只會在這裡失敗。
-      - name: 取得 CoreDNS（版本與 go.mod 一致）
+      # What this job verifies is entirely out of go test ./...'s reach: a module
+      # that compiles on its own does not mean CoreDNS's plugin.cfg can link it in.
+      # A new import, a version conflict, or a change in how the plugin registers
+      # itself will fail here and nowhere else.
+      - name: Fetch CoreDNS (version in step with go.mod)
         run: |
           version=$(grep -oE 'github.com/coredns/coredns v[0-9.]+' zonedns/go.mod | head -1 | awk '{print $2}')
           echo "CoreDNS $version"
           git clone -q --depth 1 --branch "$version" https://github.com/coredns/coredns.git coredns
 
-      - name: 把兩個 plugin 都加進 plugin.cfg 並建置
+      - name: Add both plugins to plugin.cfg and build
         working-directory: coredns
         run: |
           set -euo pipefail
           go mod edit -replace github.com/jenting/zonedns="$GITHUB_WORKSPACE/zonedns"
           go mod edit -require github.com/jenting/zonedns@v0.0.0
 
-          # 兩者都必須排在 cache 之前，否則 plugin 自己會在啟動時拒絕啟動。
+          # Both must sort before cache, or the plugins themselves refuse to start.
           sed -i 's|^cache:cache$|zonedns:github.com/jenting/zonedns/plugin/zonedns\nzonedns_agent:github.com/jenting/zonedns/plugin/zonedns_agent\ncache:cache|' plugin.cfg
           grep -n -B2 '^cache:cache$' plugin.cfg
 
-          # 順序很重要：go generate 先寫出 import，go mod tidy 才不會把 require 清掉。
+          # The order matters: go generate writes the import first, so that go mod
+          # tidy does not drop the require.
           go generate
           go mod tidy
           go build -o coredns-zonedns .
 
-      - name: 確認兩個 plugin 都註冊了
+      - name: Confirm both plugins registered
         working-directory: coredns
         run: |
           set -euo pipefail
           plugins=$(./coredns-zonedns -plugins)
           for p in zonedns zonedns_agent; do
-            echo "$plugins" | grep -qx "$p" || { echo "$p 未註冊"; echo "$plugins"; exit 1; }
+            echo "$plugins" | grep -qx "$p" || { echo "$p did not register"; echo "$plugins"; exit 1; }
             echo "✓ $p"
           done
 
-      # 順序保護是本專案唯二的啟動期硬性檢查之一，而它只有在真實 binary 上
-      # 才驗得到 —— 單元測試給的是合成的 Directives 切片。
-      - name: 順序錯誤時必須拒絕啟動
+      # The ordering guard is one of this project's only two hard startup checks,
+      # and it can be verified only on a real binary — the unit tests hand it a
+      # synthetic Directives slice.
+      - name: A wrong order must refuse to start
         working-directory: coredns
         run: |
           set -euo pipefail
@@ -122,12 +125,12 @@ jobs:
           }
           EOF
           if ./coredns-wrongorder -conf /tmp/Corefile -dns.port 1053 2>/tmp/err.log; then
-            echo "順序錯誤竟然啟動成功了 —— 保護失效"
+            echo "a wrong order started successfully — the guard is not working"
             exit 1
           fi
           grep -q "must be ordered before cache" /tmp/err.log || {
-            echo "拒絕了，但訊息不是預期的："; cat /tmp/err.log; exit 1; }
-          echo "✓ 順序錯誤被正確拒絕"
+            echo "it refused, but not with the expected message:"; cat /tmp/err.log; exit 1; }
+          echo "✓ the wrong order was correctly refused"
           cat /tmp/err.log
 
   manifests:
@@ -136,14 +139,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 建立 kind cluster
+      - name: Create the kind cluster
         uses: helm/kind-action@v1
         with:
           cluster_name: zonedns-ci
 
-      # ClusterSPIFFEID 需要 spire-controller-manager 的 CRD 才驗得到欄位是否
-      # 真的存在 —— 少了它，一個打錯的欄位名會被當成合法 YAML 放過去。
-      - name: 安裝 ClusterSPIFFEID CRD
+      # Validating whether a ClusterSPIFFEID's fields really exist requires
+      # spire-controller-manager's CRD — without it a mistyped field name sails
+      # through as valid YAML.
+      - name: Install the ClusterSPIFFEID CRD
         run: |
           curl -sSfL -o /tmp/csid-crd.yaml \
             https://raw.githubusercontent.com/spiffe/spire-controller-manager/main/config/crd/bases/spire.spiffe.io_clusterspiffeids.yaml
@@ -160,7 +164,7 @@ jobs:
           done
 
   informer:
-    name: informer 對真實 cluster
+    name: Informer against a real cluster
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -169,28 +173,31 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      # 必須是兩個節點：單節點無法證明 field selector 真的把範圍限縮到本機。
-      - name: 建立兩節點 kind cluster
+      # Two nodes are required: a single node cannot prove the field selector
+      # really scopes the informer to this machine.
+      - name: Create a two-node kind cluster
         uses: helm/kind-action@v1
         with:
           cluster_name: zonedns-informer
           config: deploy/kind/two-node.yaml
 
-      # 用 repo 裡真正的 RBAC，不是另外寫一份寬鬆的 —— 這個 job 要驗的其中
-      # 一件事就是那份 manifest 給的權限夠不夠。
-      - name: 套用 RBAC
+      # Use the repo's real RBAC rather than a more permissive copy — one of the
+      # things this job checks is whether the permissions that manifest grants are
+      # sufficient.
+      - name: Apply the RBAC
         run: |
           kubectl apply -f deploy/k8s/01-rbac.yaml
           kubectl wait --for=condition=Ready node --all --timeout=180s
 
-      # 這些測試以 build tag 隔開，一般的 go test ./... 不會跑到。它們驗的是
-      # fake.NewSimpleClientset 結構上做不到的事：field selector 對真實 API
-      # server 生效、RBAC 足夠、以及真實 informer 的 update 事件會立即讓失去
-      # 索引資格的 pod 失效。
-      - name: 執行 cluster 測試
+      # These tests sit behind a build tag and an ordinary go test ./... does not
+      # reach them. They verify what fake.NewSimpleClientset structurally cannot:
+      # that the field selector takes effect against a real API server, that the
+      # RBAC suffices, and that a real informer's update events invalidate a pod
+      # the moment it loses its eligibility to be indexed.
+      - name: Run the cluster tests
         run: go test -tags=cluster ./internal/podzone/ -run TestCluster -v -count=1 -timeout 10m
 
-      - name: 失敗時傾印 cluster 狀態
+      - name: Dump cluster state on failure
         if: failure()
         run: |
           kubectl get nodes -o wide || true
@@ -199,7 +206,7 @@ jobs:
             --as=system:serviceaccount:kube-system:node-local-dns || true
 
   drift:
-    name: 漂移檢查對真實 cluster
+    name: Drift check against a real cluster
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -208,22 +215,24 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: 建立 kind cluster
+      - name: Create the kind cluster
         uses: helm/kind-action@v1
         with:
           cluster_name: zonedns-drift
 
-      # 一定要用真的 Istio CRD：單元測試的 fake dynamic client 對 GVR 不做任何
-      # 驗證 —— 群組名、資源複數形、版本全部打錯，它一樣照列不誤。
-      - name: 安裝 Istio CRD
+      # A real Istio CRD is essential: the unit tests' fake dynamic client validates
+      # nothing about the GVR — a wrong group, a wrong resource plural, a wrong
+      # version, and it lists happily all the same.
+      - name: Install the Istio CRDs
         run: make istio-crds
 
-      - name: 執行 cluster 測試
+      - name: Run the cluster tests
         run: make test-drift
 
-      # 這一段驗的是離開碼。工具的價值全在「有漂移時擋下 CI」，而一支永遠回 0
-      # 的檢查跟沒有檢查完全一樣 —— 所以兩個方向都要證明。
-      - name: 端對端驗證離開碼
+      # This step checks the exit codes. The tool's whole value is blocking CI when
+      # there is drift, and a check that always returns 0 is the same as no check at
+      # all — so both directions have to be proven.
+      - name: Verify the exit codes end to end
         run: |
           set -euo pipefail
           go build -o /tmp/zonedns-drift ./cmd/zonedns-drift
@@ -245,38 +254,41 @@ jobs:
             containers: [{name: pause, image: registry.k8s.io/pause:3.10}]
           EOF
 
-          # 一定要限定 namespace：這一步斷言的是「修好之後整份報告乾淨」，那是
-          # 全域性質，任何殘留物都會改變答案。前一個步驟的 cluster 測試才剛刪掉
-          # 自己的 namespace，而 namespace 的刪除是非同步的 —— 裡面的 pod 會停在
-          # Terminating 卻依然 list 得到。第一次上 runner 時就是這樣掛的。
+          # The namespace must be scoped: this step asserts that the whole report is
+          # clean once fixed, which is a global property that any leftover changes.
+          # The previous step's cluster tests have just deleted their namespaces, and
+          # namespace deletion is asynchronous — the pods inside linger in Terminating
+          # and are still returned by a list. That is how this failed the first time
+          # it ran on a runner.
           DRIFT="/tmp/zonedns-drift --namespace drift-ci"
 
-          echo "── 有漂移時應離開 1，而且要指名道姓"
+          echo "── with drift present it should exit 1, and name names"
           set +e
           out=$($DRIFT --show-skipped); code=$?
           set -e
           echo "$out"
-          [ "$code" = "1" ] || { echo "預期離開碼 1，實得 $code"; exit 1; }
-          # 只驗離開碼不夠：一支永遠回 1 的工具也會通過。漂移的兩個方向都必須
-          # 被點名，否則報告等於一個沒有內容的警報。
+          [ "$code" = "1" ] || { echo "expected exit code 1, got $code"; exit 1; }
+          # The exit code alone is not enough: a tool that always returns 1 would
+          # pass too. Both directions of the drift must be named, or the report is an
+          # alarm with nothing in it.
           grep -q "payments.example.com" <<<"$out" \
-            || { echo "沒有點名無人認領的 VirtualService host"; exit 1; }
+            || { echo "the unclaimed VirtualService host was not named"; exit 1; }
           grep -q "paymnets.example.com" <<<"$out" \
-            || { echo "沒有點名沒有路由的 pod label"; exit 1; }
+            || { echo "the unrouted pod label was not named"; exit 1; }
 
-          echo "── 修好 label 後應離開 0"
+          echo "── once the label is fixed it should exit 0"
           kubectl label pod -n drift-ci payments-1 \
             zonedns.io/host=payments.example.com --overwrite
           $DRIFT
 
-          echo "── 沒有 Istio CRD 時應離開 2，而不是回報乾淨"
+          echo "── with no Istio CRD it should exit 2, not report clean"
           kubectl delete crd virtualservices.networking.istio.io
           set +e
           $DRIFT; code=$?
           set -e
-          [ "$code" = "2" ] || { echo "預期離開碼 2，實得 $code"; exit 1; }
+          [ "$code" = "2" ] || { echo "expected exit code 2, got $code"; exit 1; }
 
-      - name: 失敗時傾印 cluster 狀態
+      - name: Dump cluster state on failure
         if: failure()
         run: |
           kubectl get crd | grep -i istio || true

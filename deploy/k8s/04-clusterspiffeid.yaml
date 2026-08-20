@@ -1,32 +1,37 @@
-# 兩份 ClusterSPIFFEID，用途完全不同。
+# Two ClusterSPIFFEIDs, serving entirely different purposes.
 #
-# 第一份決定 central 的 registry 內容：它產生的 registration entry 裡，
-# dns_names 提供「client 會查的名字」，spiffe_id 的 path 提供 zone。central
-# 輪詢 SPIRE Entry API 拿到的就是這些。
+# The first determines the contents of central's registry: in the registration
+# entries it produces, dns_names supply the names clients will query and the
+# spiffe_id path supplies the zone. This is what central retrieves when it polls
+# the SPIRE Entry API.
 #
-# 第二份讓 node-local-dns 自己拿得到 SVID，才能跟 central 建立 mTLS。
+# The second lets node-local-dns obtain an SVID of its own, so it can establish
+# mTLS with central.
 ---
 apiVersion: spire.spiffe.io/v1alpha1
 kind: ClusterSPIFFEID
 metadata:
   name: zonedns-workloads
 spec:
-  # 這道守衛是必要條件，不是最佳化。
+  # This guard is a requirement, not an optimisation.
   #
-  # spire-controller-manager 渲染模板時沒有設 missingkey=error，label 不存在會
-  # 渲染成空字串；而 SPIRE Server 的 x509util.ValidateLabel 會以 ErrEmptyDomain
-  # 拒絕空的 DNS name，導致整筆 registration entry 建立失敗 —— 那個 pod 會拿不到
-  # SVID，失效範圍遠大於 DNS。
+  # spire-controller-manager renders templates without missingkey=error, so a
+  # missing label renders as the empty string; and SPIRE Server's
+  # x509util.ValidateLabel refuses an empty DNS name with ErrEmptyDomain, which
+  # fails creation of the whole registration entry — that pod would get no SVID at
+  # all, and the damage would reach far beyond DNS.
   podSelector:
     matchExpressions:
       - {key: zonedns.io/host, operator: Exists}
-  # zone 從 pod 的 zone label 來。這是整個系統唯一宣告 zone 的地方：同一個值
-  # 同時決定這個 workload 當 client 時的 source zone，與它當 server 時 registry
-  # 查到的 dest zone，兩者由建構方式保證一致。
+  # The zone comes from the pod's zone label. This is the only place in the whole
+  # system where a zone is declared: one value settles both this workload's source
+  # zone when it acts as a client and the dest zone the registry reports when it
+  # acts as a server, and the two agree by construction.
   spiffeIDTemplate: 'spiffe://example.org/zone/{{ .PodMeta.Labels.zone }}/ns/{{ .PodMeta.Namespace }}/sa/{{ .PodSpec.ServiceAccountName }}'
-  # 一個 workload 只能有一個對外 FQDN（spec §9 已知限制 1）。加第二個選配 label
-  # 會在未填時渲染出空字串導致 entry 被拒；開第二個 ClusterSPIFFEID 會因 SPIFFE ID
-  # 與 selector 相同而被 entriesMasked 遮蔽。
+  # A workload may have exactly one external FQDN (spec §9, known limitation 1).
+  # Adding a second optional label renders the empty string when it is unset and
+  # the entry is refused; a second ClusterSPIFFEID is masked by entriesMasked
+  # because its SPIFFE ID and selector are identical.
   dnsNameTemplates:
     - '{{ index .PodMeta.Labels "zonedns.io/host" }}'
 ---
@@ -41,7 +46,9 @@ spec:
   namespaceSelector:
     matchLabels:
       kubernetes.io/metadata.name: kube-system
-  # 這個 SPIFFE ID 必須逐字出現在 central Corefile 的 authorized_agent 清單裡，
-  # 否則 central 會忽略這個節點宣告的 zone，並靜默退回非 zone-aware 路徑 ——
-  # 查詢照常有答案，只是不再分 zone。兩端的設定必須成對維護。
+  # This SPIFFE ID must appear verbatim in the authorized_agent list of central's
+  # Corefile, or central ignores the zone this node declares and falls back
+  # silently to the non-zone-aware path — queries still return answers, they just
+  # stop distinguishing zones. The two ends' configurations must be maintained as
+  # a pair.
   spiffeIDTemplate: 'spiffe://example.org/zone/infra/node/{{ .NodeMeta.Name }}'

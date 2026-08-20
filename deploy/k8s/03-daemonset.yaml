@@ -1,17 +1,20 @@
-# node-local-dns DaemonSet，內含 zonedns_agent。
+# The node-local-dns DaemonSet, with zonedns_agent inside it.
 #
-# 結構完全沿用上游 kubernetes/kubernetes 的 cluster/addons/dns/nodelocaldns，
-# 只有三處差異（部署文件「DaemonSet 的變更」一節）：
-#   1. image 指向自建版本（上游 image 沒有 zonedns_agent，plugin 是編譯期連結的）
-#   2. serviceAccountName 綁到有 pods 讀取權的 SA（見 01-rbac.yaml）
-#   3. 多兩個掛載與兩個環境變數：SPIRE 的 Workload API socket，以及節點自身的
-#      名稱與位址
+# The structure follows upstream kubernetes/kubernetes's
+# cluster/addons/dns/nodelocaldns exactly, with three differences (see "Changes to
+# the DaemonSet" in the deployment doc):
+#   1. the image points at the self-built version (upstream's image has no
+#      zonedns_agent, since plugins are linked at compile time)
+#   2. serviceAccountName is bound to an SA with read access to pods (see
+#      01-rbac.yaml)
+#   3. two extra mounts and two extra environment variables: SPIRE's Workload API
+#      socket, and the node's own name and address
 #
-# 上游原本就有、且一項都不能省的：hostNetwork、dnsPolicy: Default、
-# priorityClassName、-localip 的兩個位址、xtables-lock 掛載、NET_ADMIN、
-# 以及涵蓋所有 taint 的 tolerations。少任何一項，node-local-dns 本身就不會
-# 正常運作 —— 那跟 zone 路由無關，是它管理 dummy interface 與 iptables 規則
-# 所需要的。
+# Present upstream already, and none of it optional: hostNetwork,
+# dnsPolicy: Default, priorityClassName, both -localip addresses, the xtables-lock
+# mount, NET_ADMIN, and tolerations covering every taint. Drop any one of them and
+# node-local-dns itself stops working — none of that concerns zone routing, it is
+# what managing the dummy interface and the iptables rules requires.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -49,13 +52,15 @@ spec:
         operator: "Exists"
       containers:
       - name: node-cache
-        # 必改：自建 image。上游的 k8s-dns-node-cache 不含 zonedns_agent。
+        # Must be changed: the self-built image. Upstream's k8s-dns-node-cache
+        # does not contain zonedns_agent.
         image: REGISTRY/k8s-dns-node-cache-zonedns:TAG
         resources:
           requests:
             cpu: 25m
-            # 上游是 5Mi。client-go 的 informer 需要更多空間放本機 pod 的快取，
-            # 25Mi 是保守值；請依實際節點 pod 數量調整。
+            # Upstream uses 5Mi. client-go's informer needs more room for its cache
+            # of local pods; 25Mi is conservative — adjust it to the pod count your
+            # nodes actually carry.
             memory: 25Mi
         args: [ "-localip", "__PILLAR__LOCAL__DNS__,__PILLAR__DNS__SERVER__", "-conf", "/etc/Corefile", "-upstreamsvc", "kube-dns-upstream" ]
         securityContext:
@@ -63,14 +68,16 @@ spec:
             add:
             - NET_ADMIN
         env:
-        # zonedns_agent 用 node_name 過濾 informer，只看本機的 pod。
+        # zonedns_agent filters the informer by node_name so it sees only this
+        # node's pods.
         - name: NODE_NAME
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
-        # 節點自身位址，用於偵測 masquerade：查詢的 source IP 若等於節點 IP，
-        # 就無法判斷是哪個 workload 在問。這個值格式錯誤時 plugin 會啟動失敗，
-        # 不會被靜默忽略 —— 因為它是那個訊號唯一的依據。
+        # The node's own address, used to detect masquerading: a query whose source
+        # IP equals the node IP leaves no way to tell which workload is asking. A
+        # malformed value fails plugin startup rather than being ignored silently —
+        # it is the sole basis for that signal.
         - name: NODE_IP
           valueFrom:
             fieldRef:
@@ -100,7 +107,8 @@ spec:
           mountPath: /etc/coredns
         - name: kube-dns-config
           mountPath: /etc/kube-dns
-        # SPIRE 的 Workload API：agent 用它取得自己的 SVID 去跟 central 建 mTLS。
+        # SPIRE's Workload API: the agent obtains its own SVID through it to
+        # establish mTLS with central.
         - name: spire-agent-socket
           mountPath: /run/spire/sockets
           readOnly: true
@@ -119,15 +127,17 @@ spec:
           items:
             - key: Corefile
               path: Corefile.base
-      # 必確認：SPIRE agent 在你們節點上實際暴露 socket 的路徑。這裡用的是
-      # SPIFFE 慣例值；helm chart 安裝的 SPIRE 可能不同。路徑錯了的話 plugin
-      # 會在啟動時逾時失敗並指名 workload_api，不會靜默降級。
+      # Must be confirmed: the path at which the SPIRE agent actually exposes its
+      # socket on your nodes. The value here is SPIFFE's conventional one; a SPIRE
+      # installed by Helm chart may differ. A wrong path makes the plugin fail at
+      # startup on a timeout that names workload_api, rather than degrading
+      # silently.
       - name: spire-agent-socket
         hostPath:
           path: /run/spire/sockets
           type: Directory
 ---
-# Headless service，讓 Prometheus 抓得到每個節點的 metrics。照上游。
+# A headless service so Prometheus can scrape each node's metrics. As upstream.
 apiVersion: v1
 kind: Service
 metadata:

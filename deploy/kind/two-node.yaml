@@ -1,12 +1,12 @@
-# 測試用的 kind cluster：兩個節點。
+# A kind cluster for testing: two nodes.
 #
-# 放在 deploy/kind/ 而不是 deploy/k8s/，因為後者只放可以直接 kubectl apply 的
-# manifest —— CI 會對那個目錄下每個檔案做 server-side dry-run，而 kind 的
-# Cluster 不是 Kubernetes 資源。
+# It lives in deploy/kind/ rather than deploy/k8s/, because the latter holds only
+# manifests that can be applied with kubectl — CI runs a server-side dry-run over
+# every file in that directory, and a kind Cluster is not a Kubernetes resource.
 #
-# 為什麼一定要兩個節點：internal/podzone 的 informer 以 spec.nodeName 過濾，
-# 只看本機節點的 pod。單節點的 cluster 無法證明那個範圍限縮真的生效 —— 所有
-# pod 本來就都在同一個節點上。
+# Why two nodes are required: internal/podzone's informer filters by
+# spec.nodeName and sees only this node's pods. A single-node cluster cannot
+# prove that scoping takes effect — every pod is on the one node regardless.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
