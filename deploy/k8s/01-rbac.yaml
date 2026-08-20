@@ -1,10 +1,13 @@
-# node-local-dns 需要讀取「自己這個節點上的 pod」，才能把查詢的 source IP 對應到
-# 發問 workload 的 zone label。上游的 node-local-dns ServiceAccount 沒有任何權限，
-# 因此這份 RBAC 是本方案新增的。
+# node-local-dns needs to read the pods on its own node in order to map a query's
+# source IP to the asking workload's zone label. Upstream's node-local-dns
+# ServiceAccount holds no permissions at all, so this RBAC is added by this
+# solution.
 #
-# 權限刻意只到 pods 的唯讀。informer 以 spec.nodeName 過濾，實際只會看本機的數十
-# 個 pod —— 但 Kubernetes 的 RBAC 無法把 list/watch 限縮在單一節點，所以授予的是
-# 全 cluster 的 pod 讀取權。這一點值得在導入前讓安全審查知道。
+# The permissions deliberately stop at read-only access to pods. The informer
+# filters by spec.nodeName and in practice sees only the few dozen pods on this
+# node — but Kubernetes RBAC cannot scope list/watch to a single node, so what is
+# granted is cluster-wide read access to pods. That is worth putting in front of a
+# security review before adoption.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

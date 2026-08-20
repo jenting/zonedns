@@ -1,15 +1,18 @@
-// zonedns-drift 檢查 Istio VirtualService 的 hosts 與 pod 的 zonedns.io/host
-// label 有沒有分歧。
+// zonedns-drift checks whether the hosts of Istio VirtualServices and the
+// zonedns.io/host labels on pods have diverged.
 //
-// 一個 workload 的對外名稱在這套設計裡被寫了兩份：pod label 決定 SPIRE entry 的
-// dns_name（也就是 central registry 的 key），VirtualService 決定 client 實際查
-// 什麼名字。兩份宣告漂移時沒有任何東西會報錯 —— central 查不到那個名字，就把它
-// 當成不歸自己管而交給下游，於是那個服務靜靜地失去 zone 路由，DNS 查詢照常有答案。
+// This design writes a workload's external name twice: the pod label determines
+// the dns_name of the SPIRE entry (and therefore the key of the central
+// registry), while the VirtualService determines the name clients actually
+// query. When the two declarations drift, nothing raises an error — central
+// cannot find the name, treats it as not its own, hands it downstream, and the
+// service silently loses zone routing while DNS queries keep returning answers.
 //
-// 這支工具是設計文件 §9 限制 2 所要求的那個比對檢查。適合放進 CI，或以 CronJob
-// 定期執行。
+// This tool is the comparison the design doc calls for in §9, limitation 2. It
+// suits CI, or a CronJob running on a schedule.
 //
-// 離開碼：0 沒有漂移；1 發現漂移；2 檢查本身失敗（連不上、權限不足、沒有 CRD）。
+// Exit codes: 0 no drift; 1 drift found; 2 the check itself failed (cannot
+// connect, insufficient permission, no CRD).
 package main
 
 import (
@@ -76,7 +79,7 @@ func run(ctx context.Context, kubeconfig, clusterDomain, hostLabel, namespace st
 	return printReport(os.Stdout, drift.Compare(vsHosts, podHosts), skipped, hostLabel, showSkipped), nil
 }
 
-// printReport 印出結果並回傳離開碼。
+// printReport prints the result and returns the exit code.
 func printReport(w io.Writer, report drift.Report, skipped []drift.Skipped, hostLabel string, showSkipped bool) int {
 	if showSkipped && len(skipped) > 0 {
 		fmt.Fprintf(w, "Excluded from the comparison (%d):\n", len(skipped))
@@ -115,8 +118,8 @@ func printReport(w io.Writer, report drift.Report, skipped []drift.Skipped, host
 	return exitDrift
 }
 
-// loadConfig 依序嘗試 in-cluster 設定與 kubeconfig，讓同一支程式在 CronJob 裡
-// 和在工程師的筆電上都能跑。
+// loadConfig tries the in-cluster config and then a kubeconfig, so one binary
+// runs both inside a CronJob and on an engineer's laptop.
 func loadConfig(kubeconfig string) (*rest.Config, error) {
 	if kubeconfig == "" {
 		if config, err := rest.InClusterConfig(); err == nil {

@@ -1,8 +1,9 @@
-// Package zonedns_agent 是 zone-based DNS 的節點端 CoreDNS plugin。
+// Package zonedns_agent is the node-side CoreDNS plugin for zone-based DNS.
 //
-// 它判定發問 workload 的 zone，以該 zone 為快取 key 的一部分，並在向 central 查詢
-// 時把 zone 宣告在 EDNS0 option 裡。它只負責參與 zone 路由的網域（由 Corefile 的
-// server block 界定），其餘查詢完全不經過它。
+// It determines the asking workload's zone, makes that zone part of the cache
+// key, and declares it in an EDNS0 option when querying central. It handles only
+// the domains that take part in zone routing, as delimited by the Corefile's
+// server block; every other query bypasses it entirely.
 package zonedns_agent
 
 import (
@@ -20,30 +21,30 @@ import (
 
 var log = clog.NewWithPlugin("zonedns_agent")
 
-// timeNow 讓快取的過期判斷可在測試中控制。
+// timeNow lets tests control how cache expiry is judged.
 var timeNow = time.Now
 
-// Upstream 對 central 發送查詢。
+// Upstream sends queries to central.
 type Upstream interface {
 	Exchange(ctx context.Context, m *dns.Msg) (*dns.Msg, error)
 }
 
-// Agent 是 plugin 的處理器。
+// Agent is the plugin's handler.
 type Agent struct {
 	Resolver  ZoneResolver
 	Cache     *zonecache.Cache
 	Upstream  Upstream
 	EDNS0Code uint16
 
-	// NodeIP 是本機節點的位址，只用於偵測 masquerade。查詢的 source IP 等於它，
-	// 代表 pod IP 在途中被改寫了。
+	// NodeIP is this node's own address, used only to detect masquerading. A query
+	// whose source IP equals it had its pod IP rewritten along the way.
 	NodeIP netip.Addr
 }
 
-// Name 實作 plugin.Handler。
+// Name implements plugin.Handler.
 func (a Agent) Name() string { return "zonedns_agent" }
 
-// ServeDNS 實作 plugin.Handler。
+// ServeDNS implements plugin.Handler.
 func (a Agent) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
 	state := request.Request{W: w, Req: r}
 
@@ -127,10 +128,11 @@ func stripZoneOption(m *dns.Msg, code uint16) {
 	opt.Option = kept
 }
 
-// answersQuestion 回報 answer 的 Question section 是否恰好對應到 outbound 送出的
-// 那個查詢 —— 同一個 qname（大小寫不敏感，DNS 名稱本來就不分大小寫）、同一個
-// qtype、同一個 qclass。central 的身分已經由 mTLS 釘住（見 dohupstream），但那
-// 只保證「是誰回的」，不保證「回的是不是這一題」。
+// answersQuestion reports whether an answer's Question section corresponds
+// exactly to the query that went out: the same qname (case-insensitively, as DNS
+// names are), the same qtype, the same qclass. Central's identity is already
+// pinned by mTLS (see dohupstream), but that guarantees only who answered, not
+// that what came back answers this question.
 func answersQuestion(outbound, answer *dns.Msg) bool {
 	if len(answer.Question) != len(outbound.Question) {
 		return false
@@ -144,11 +146,14 @@ func answersQuestion(outbound, answer *dns.Msg) bool {
 	return true
 }
 
-// resolveZone 判定來源的 zone 並記錄結果。
+// resolveZone determines the source's zone and records the outcome.
 //
-// 認不出來源時回 ok=false，呼叫端會照常轉發但不宣告 zone。這是刻意的：central 對
-// 沒有宣告的查詢會走非 zone-aware 路徑並回一般答案，而在 zone 之間網路隔離的前提
-// 下，那個答案要嘛可用、要嘛連不上 —— 都比猜錯 zone 把流量導向錯誤的 gateway 好。
+// An unrecognised source returns ok=false, and the caller forwards as usual
+// without declaring a zone. This is deliberate: central takes the non-zone-aware
+// path for an undeclared query and returns the ordinary answer, and given that
+// zones are network-isolated, that answer is either usable or unreachable —
+// either of which beats guessing the wrong zone and sending traffic to the wrong
+// gateway.
 func (a Agent) resolveZone(srcIP string) (string, bool) {
 	src, err := netip.ParseAddr(srcIP)
 	if err != nil {
@@ -156,8 +161,9 @@ func (a Agent) resolveZone(srcIP string) (string, bool) {
 		return "", false
 	}
 	if a.NodeIP.IsValid() && src == a.NodeIP {
-		// 節點上有東西在改寫 source IP，或這是一個 hostNetwork 的 workload。
-		// 兩種情況都無法分辨是哪個 workload 在問。
+		// Either something on the node is rewriting the source IP, or this is a
+		// hostNetwork workload. In neither case can we tell which workload is
+		// asking.
 		zoneResolutionTotal.WithLabelValues("node_ip").Inc()
 		return "", false
 	}

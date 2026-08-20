@@ -100,8 +100,9 @@ func TestSPIFFEIDFromCertRejectsNonSPIFFE(t *testing.T) {
 	}
 }
 
-// 多個 URI SAN 的順序由憑證持有者（可能是攻擊者）決定，所以「挑第一個 spiffe
-// scheme 的當身分」不安全 — 必須整張憑證直接拒絕，不管 SAN 順序為何。
+// The order of multiple URI SANs is chosen by the certificate holder, possibly
+// an attacker, so taking the first one with a spiffe scheme as the identity is
+// unsafe — the whole certificate must be refused, whatever the SAN order.
 func TestSPIFFEIDFromCertRejectsMultipleURISANs(t *testing.T) {
 	cases := []struct {
 		name string
@@ -134,7 +135,8 @@ func TestSPIFFEIDFromCertRejectsMultipleURISANs(t *testing.T) {
 	}
 }
 
-// 恰好一個 URI SAN、且是 spiffe scheme 時才接受 — 這是唯一應該通過的形狀。
+// Accepted only with exactly one URI SAN carrying a spiffe scheme — the one
+// shape that should pass.
 func TestSPIFFEIDFromCertAcceptsExactlyOneSPIFFESAN(t *testing.T) {
 	cert := testcerts.New(t, agentID)
 	got, ok := SPIFFEIDFromCert(cert)

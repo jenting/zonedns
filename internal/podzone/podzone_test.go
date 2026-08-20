@@ -30,7 +30,8 @@ func pod(name, ip, zone string, hostNetwork bool) *corev1.Pod {
 	}
 }
 
-// waitUntil 輪詢 cond 直到為真或逾時，逾時就讓測試失敗。
+// waitUntil polls cond until it holds or the deadline passes, failing the test
+// on timeout.
 func waitUntil(t *testing.T, cond func() bool, msg string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -42,7 +43,7 @@ func waitUntil(t *testing.T, cond func() bool, msg string) {
 	}
 }
 
-// start 啟動 watcher 並等到就緒，回傳停止函式。
+// start runs the watcher, waits until it is ready, and returns a stop function.
 func start(t *testing.T, pods ...*corev1.Pod) (*Watcher, func()) {
 	t.Helper()
 
@@ -90,8 +91,9 @@ func TestUnknownIP(t *testing.T) {
 	}
 }
 
-// hostNetwork pod 共用節點 IP，無法分辨彼此，因此絕不可進表 —— 否則節點 IP 會
-// 對應到某一個 hostNetwork pod 的 zone，而那個對應是任意的。
+// hostNetwork pods share the node IP and cannot be told apart, so they must
+// never enter the table — otherwise the node IP would map to one hostNetwork
+// pod's zone, and which one is arbitrary.
 func TestHostNetworkPodIsNotIndexed(t *testing.T) {
 	w, stop := start(t,
 		pod("payments-abc", "10.1.0.5", "zone-a", false),
@@ -107,10 +109,12 @@ func TestHostNetworkPodIsNotIndexed(t *testing.T) {
 	}
 }
 
-// zone.a 是合法的 k8s label value，但帶點的字元不合 ednszone.Valid（見該套件
-// 的測試與註解），central 一定會把它的宣告當成不存在丟棄。這種 pod 必須跟沒有
-// zone label 的 pod 一樣不進表 —— 否則本機會回報 result="ok"、看起來一切正常，
-// 但 central 那一側其實從未採信過這個宣告，兩端的判定完全對不上。
+// zone.a is a legal Kubernetes label value, but the dot breaks ednszone.Valid
+// (see that package's tests and docs) and central is certain to discard the
+// declaration as absent. Such a pod must stay out of the table exactly like one
+// with no zone label — otherwise the node reports result="ok" and everything
+// looks fine, while central never once believed the declaration and the two
+// sides' verdicts disagree completely.
 func TestPodWithInvalidZoneLabelIsNotIndexed(t *testing.T) {
 	w, stop := start(t, pod("payments-abc", "10.1.0.5", "zone.a", false))
 	defer stop()
@@ -144,11 +148,13 @@ func TestPodWithoutIPIsNotIndexed(t *testing.T) {
 	}
 }
 
-// 刪除必須立刻讓映射失效。IP 會被回收給新的 pod，沿用舊值會回答錯誤的 zone。
+// Deletion must invalidate the mapping at once. IPs are recycled to new pods,
+// and keeping the old value answers with the wrong zone.
 //
-// 這裡刻意放兩個 pod：只清單一個被刪除 pod 的映射還不夠，必須確認刪除事件
-// 沒有波及其他還活著的 pod —— 一個「刪除時清空整張表」的錯誤實作，如果只有
-// 一個 pod 在場，測試也會通過。
+// Two pods are used deliberately: clearing the deleted pod's mapping is not
+// enough on its own, the delete must also be shown not to disturb the pods still
+// alive. An implementation that wrongly wipes the whole table on delete would
+// pass this test with only one pod present.
 func TestDeleteRemovesTheMapping(t *testing.T) {
 	p := pod("payments-abc", "10.1.0.5", "zone-a", false)
 	sibling := pod("checkout-def", "10.1.0.7", "zone-b", false)
@@ -175,9 +181,10 @@ func TestDeleteRemovesTheMapping(t *testing.T) {
 	}
 }
 
-// pod IP 會改變（例如重建但沿用同一個 Deployment/Name，或 CNI 重新配發）。
-// upsert 若只新增不回收，舊 IP 會永遠停留在表裡 —— 和刪除沒有清乾淨是同一種錯誤，
-// 只是從「更新」這個方向進來。
+// A pod's IP can change — recreated under the same Deployment/Name, or
+// reassigned by the CNI. If upsert only adds and never reclaims, the old IP stays
+// in the table forever: the same fault as a deletion that did not clean up,
+// arriving from the update direction instead.
 func TestPodIPChangeRemovesOldMapping(t *testing.T) {
 	p := pod("payments-abc", "10.1.0.5", "zone-a", false)
 	client := fake.NewSimpleClientset(p)
@@ -208,8 +215,9 @@ func TestPodIPChangeRemovesOldMapping(t *testing.T) {
 	}
 }
 
-// 拿掉 zone label（IP 不變）必須讓映射跟著失效，理由和 pod 被刪除時一樣：
-// 沿用舊值會回答一個不再成立的 zone，而那個答案看起來完全正常。
+// Removing the zone label while the IP stays the same must invalidate the
+// mapping too, for the same reason as a deletion: keeping the old value answers
+// with a zone that no longer holds, and the answer looks entirely normal.
 func TestZoneLabelRemovedStopsResolving(t *testing.T) {
 	p := pod("payments-abc", "10.1.0.5", "zone-a", false)
 	client := fake.NewSimpleClientset(p)
@@ -233,8 +241,9 @@ func TestZoneLabelRemovedStopsResolving(t *testing.T) {
 	}, "STALE: IP still resolves after its pod's zone label was removed")
 }
 
-// 把 zone label 的值改成空字串，效果必須和拿掉 label 一樣：不可索引，
-// 因為空字串一樣會被下游當成一個真的 zone。
+// Emptying the zone label's value must behave exactly like removing the label:
+// not indexed, because downstream would treat the empty string as a real zone
+// all the same.
 func TestZoneLabelEmptiedStopsResolving(t *testing.T) {
 	p := pod("payments-abc", "10.1.0.5", "zone-a", false)
 	client := fake.NewSimpleClientset(p)
@@ -258,8 +267,9 @@ func TestZoneLabelEmptiedStopsResolving(t *testing.T) {
 	}, "STALE: IP still resolves after its pod's zone label was emptied")
 }
 
-// 改標成另一個非空 zone 是合格的轉換：同一個 IP 鍵被覆寫即可，這條路徑本來就
-// 是對的。把它釘住，避免之後的重構（例如改成先刪後寫）不小心破壞它。
+// Relabelling to another non-empty zone is a valid transition: the same IP key is
+// overwritten, and this path was always correct. Pinned here so a later refactor
+// — switching to delete-then-write, say — cannot break it by accident.
 func TestRelabelToDifferentZoneResolvesNewZone(t *testing.T) {
 	p := pod("payments-abc", "10.1.0.5", "zone-a", false)
 	client := fake.NewSimpleClientset(p)
@@ -283,7 +293,8 @@ func TestRelabelToDifferentZoneResolvesNewZone(t *testing.T) {
 	}, "IP never resolved to the pod's new zone after relabel")
 }
 
-// 尚未就緒時一律回 false —— 「還不知道」與「查得到但不在表裡」是不同的答案。
+// Before it is ready it always returns false — "not known yet" and "resolvable
+// but absent from the table" are different answers.
 func TestNotReadyResolvesNothing(t *testing.T) {
 	w := New(fake.NewSimpleClientset(), nodeName, zoneLabel)
 	if w.Ready() {
@@ -294,11 +305,13 @@ func TestNotReadyResolvesNothing(t *testing.T) {
 	}
 }
 
-// resyncPeriod 過後，informer 必須重新對現有的 pod 送出 Update，並藉此修好
-// upsert/remove 上方描述的 IP 回收競態遺留下來的損壞狀態 —— 不是重新計數，是
-// 原地覆寫回目前真正的值。這裡直接破壞 byIP（模擬另一個 pod 的 Delete 事件
-// 在錯的時機把它清掉），確認 resync 能把它修回來，且 Len() 全程維持 1，證明
-// 是覆寫而不是疊加。
+// After resyncPeriod the informer must re-deliver Updates for the pods it
+// already knows, and thereby repair the damage left by the IP reuse race
+// described above upsert/remove — not by recounting, but by overwriting in place
+// with the value as it now stands. This test damages byIP directly, simulating
+// another pod's Delete wiping it at the wrong moment, and confirms the resync
+// repairs it while Len() stays at 1 throughout, proving an overwrite rather than
+// an accumulation.
 func TestResyncRebuildsMapping(t *testing.T) {
 	origResync := resyncPeriod
 	// client-go clamps anything below 1s to 1s (with a warning); use a value
@@ -314,8 +327,9 @@ func TestResyncRebuildsMapping(t *testing.T) {
 		t.Fatalf("initial sync: got (%q,%v), want (zone-a,true)", zone, ok)
 	}
 
-	// 模擬競態遺留下來的損壞狀態：byPod 仍指向這個 IP（下面沒有動它），但
-	// byIP 這一側被清掉了 —— 見 upsert/remove 上方對這個競態的完整說明。
+	// Simulate the damage the race leaves behind: byPod still points at this IP
+	// (nothing below touches it) while the byIP side has been wiped — see the full
+	// account of the race above upsert/remove.
 	w.mu.Lock()
 	delete(w.byIP, netip.MustParseAddr("10.1.0.5"))
 	w.mu.Unlock()
@@ -334,9 +348,10 @@ func TestResyncRebuildsMapping(t *testing.T) {
 	}
 }
 
-// OnReady 必須在 informer 首次完成同步後、Ready() 開始回報 true 之後，
-// 恰好被呼叫一次 —— Task 5 靠這個時機點把 resolver_ready 這個 gauge 設成 1；
-// 沒有輪詢 Ready() 的人，這是唯一能觀察到「就緒那一刻」的機會。
+// OnReady must fire exactly once, after the informer completes its first sync
+// and after Ready() begins reporting true. Task 5 uses that moment to set the
+// resolver_ready gauge to 1; for anyone not polling Ready(), it is the only
+// chance to observe the instant readiness arrives.
 func TestOnReadyFiresOnceAfterSync(t *testing.T) {
 	client := fake.NewSimpleClientset(pod("payments-abc", "10.1.0.5", "zone-a", false))
 
@@ -358,7 +373,8 @@ func TestOnReadyFiresOnceAfterSync(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	// 給 OnReady 一點時間執行；它在標記就緒之後、非持鎖狀態下才被呼叫。
+	// Give OnReady a moment to run; it is called after readiness is marked, and
+	// without the lock held.
 	deadline = time.Now().Add(2 * time.Second)
 	for atomic.LoadInt32(&calls) == 0 {
 		if time.Now().After(deadline) {

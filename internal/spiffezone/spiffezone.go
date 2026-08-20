@@ -1,8 +1,10 @@
-// Package spiffezone 從 SPIFFE ID 取出 zone。
+// Package spiffezone extracts the zone from a SPIFFE ID.
 //
-// 約定：zone 是 SPIFFE ID path 的第一組 key/value，形如 /zone/<zone>/...
-// 這個約定同時被 central plugin（取 dest zone）與 agent plugin（取 source zone）
-// 使用，因此放在共用套件裡，避免兩邊各寫一份而發生解析差異。
+// The convention: the zone is the first key/value pair in the SPIFFE ID path,
+// of the form /zone/<zone>/... Both the central plugin (for the dest zone) and
+// the agent plugin (for the source zone) rely on this convention, so it lives
+// in a shared package — two independent copies could drift apart in how they
+// parse it.
 package spiffezone
 
 import (
@@ -12,10 +14,10 @@ import (
 	"strings"
 )
 
-// ErrNoZone 表示 path 裡沒有合法的 zone 段。
+// ErrNoZone reports that the path contains no valid zone segment.
 var ErrNoZone = errors.New("spiffezone: no zone segment in path")
 
-// FromPath 從 SPIFFE ID 的 path 取出 zone。
+// FromPath extracts the zone from the path of a SPIFFE ID.
 func FromPath(path string) (string, error) {
 	segs := strings.Split(strings.TrimPrefix(path, "/"), "/")
 	if len(segs) < 2 || segs[0] != "zone" || segs[1] == "" {
@@ -24,7 +26,7 @@ func FromPath(path string) (string, error) {
 	return segs[1], nil
 }
 
-// FromID 從完整的 SPIFFE ID 取出 zone。
+// FromID extracts the zone from a complete SPIFFE ID.
 func FromID(id string) (string, error) {
 	u, err := url.Parse(id)
 	if err != nil {

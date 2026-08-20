@@ -1,20 +1,22 @@
-// Package decision 實作 zonedns 的核心決策邏輯（spec §6.4）。
+// Package decision implements zonedns's core decision logic (spec §6.4).
 //
-// 刻意做成無 I/O 的純函式：所有外部狀態都由呼叫端先查好再傳進來。這讓決策表可以
-// 被窮舉測試，也讓「什麼情況該做什麼」這件事集中在一個地方，不散落在 ServeDNS 裡。
+// Deliberately a pure function with no I/O: the caller looks up all external
+// state and passes it in. That lets the decision table be tested exhaustively,
+// and keeps "what to do in which situation" in one place rather than scattered
+// through ServeDNS.
 package decision
 
 import "net/netip"
 
-// Action 是決策結果要採取的動作。
+// Action is the action a decision calls for.
 type Action int
 
 const (
-	// ActionPassThrough 把查詢交給 plugin chain 的下一個 plugin。
+	// ActionPassThrough hands the query to the next plugin in the chain.
 	ActionPassThrough Action = iota
-	// ActionAnswerGateway 直接以 zone gateway VIP 回答。
+	// ActionAnswerGateway answers directly with the zone gateway VIP.
 	ActionAnswerGateway
-	// ActionServFail 回 SERVFAIL。
+	// ActionServFail returns SERVFAIL.
 	ActionServFail
 )
 
@@ -31,42 +33,48 @@ func (a Action) String() string {
 	}
 }
 
-// Input 是做決策所需的全部資訊。
+// Input is everything needed to make a decision.
 type Input struct {
 	SourceZone string
-	SourceOK   bool // 是否成功取得可信的 source zone
+	SourceOK   bool // whether a trustworthy source zone was obtained
 	DestZone   string
-	DestOK     bool // 該 FQDN 是否在 registry 中
+	DestOK     bool // whether the FQDN is present in the registry
 }
 
-// Decision 是決策結果。Gateway 只在 Action 為 ActionAnswerGateway 時有意義。
+// Decision is the result. Gateway is meaningful only when Action is
+// ActionAnswerGateway.
 type Decision struct {
 	Action  Action
 	Gateway netip.Addr
 }
 
-// Decide 實作 spec §6.4 的決策表。
+// Decide implements the decision table in spec §6.4.
 //
-// gateway 是 zone 到 gateway VIP 的查詢函式（通常是 zonetable.Table.Gateway）。
+// gateway looks up the gateway VIP for a zone (normally
+// zonetable.Table.Gateway).
 func Decide(in Input, gateway func(string) (netip.Addr, bool)) Decision {
-	// source zone 未知 — 這是非 zone-aware 的正常路徑，不是錯誤。
+	// Source zone unknown — this is the ordinary non-zone-aware path, not an error.
 	if !in.SourceOK {
 		return Decision{Action: ActionPassThrough}
 	}
-	// 這個名字不歸我們管（例如外部網域）。
+	// This name is not ours to handle (an external domain, say).
 	if !in.DestOK {
 		return Decision{Action: ActionPassThrough}
 	}
-	// 同 zone — 交給下游回一般答案。刻意不查 gateway 表：同 zone 根本不需要
-	// gateway，若查了，未設定 gateway 的 zone 會在自己人互打時誤觸 SERVFAIL。
+	// Same zone — let downstream return the ordinary answer. The gateway table
+	// is deliberately not consulted: a same-zone lookup needs no gateway at all,
+	// and consulting it would make a zone with no configured gateway SERVFAIL
+	// when its own workloads talk to each other.
 	if in.DestZone == in.SourceZone {
 		return Decision{Action: ActionPassThrough}
 	}
-	// 跨 zone — 必須有 gateway 設定。
+	// Cross-zone — a gateway must be configured.
 	gw, ok := gateway(in.DestZone)
 	if !ok {
-		// registry 說這個 zone 存在，但設定檔沒有它的 gateway。這是設定漏掉，
-		// 靜默回一般答案等於無聲破壞 zone 隔離，因此刻意不 fail-open。
+		// The registry says this zone exists but the config file has no gateway
+		// for it. That is a missing configuration, and silently returning the
+		// ordinary answer would break zone isolation without a sound — so this
+		// path deliberately does not fail open.
 		return Decision{Action: ActionServFail}
 	}
 	return Decision{Action: ActionAnswerGateway, Gateway: gw}

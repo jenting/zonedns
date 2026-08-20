@@ -20,8 +20,8 @@ func TestCheckDirectiveOrder(t *testing.T) {
 	}
 }
 
-// 順序錯了必須是啟動失敗：cache 排在前面時，zone-盲的快取會把某個 zone 的答案
-// 回給另一個 zone 的 pod，而執行期看不出任何異狀。
+// A wrong order must fail startup: with cache first, a zone-blind cache hands one
+// zone's answer to a pod in another, and nothing looks amiss at runtime.
 func TestCheckDirectiveOrderRejectsCacheFirst(t *testing.T) {
 	err := CheckDirectiveOrder([]string{"cache", "zonedns_agent", "forward"})
 	if err == nil {
@@ -38,8 +38,8 @@ func TestCheckDirectiveOrderMissingPlugin(t *testing.T) {
 	}
 }
 
-// cache 完全沒出現在 plugin.cfg 裡也必須成功 —— 沒有 cache 就沒有 zone-盲快取
-// 這個風險，不該被當成錯誤擋下來。
+// It must also succeed when cache does not appear in plugin.cfg at all — with no
+// cache there is no zone-blind caching to risk, and this should not be refused.
 func TestCheckDirectiveOrderNoCache(t *testing.T) {
 	if err := CheckDirectiveOrder([]string{"zonedns_agent", "forward"}); err != nil {
 		t.Fatalf("valid order without cache rejected: %v", err)
@@ -96,8 +96,8 @@ func TestParseK8sMode(t *testing.T) {
 	}
 }
 
-// central_spiffe_id 沒有安全的預設值：少了它就只剩憑證鏈驗證，信任域內任何一張
-// SVID 都能冒充 central。
+// central_spiffe_id has no safe default: without it only chain verification
+// remains, and any SVID in the trust domain could impersonate central.
 func TestParseRequiresCentralSPIFFEID(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode vm
@@ -188,9 +188,11 @@ func TestParseRejectsMalformedCacheSize(t *testing.T) {
 	}
 }
 
-// 一個 http:// 的 upstream 會讓 DoH 查詢走純文字傳輸，NewMTLS 的 TLSClientConfig
-// （因此也包含 SPIFFE AuthorizeID 的 central 身分釘住）根本不會被用上 —— 必須在
-// 設定解析時就擋下來，而不是留給執行期悄悄退化成不驗證身分的連線。
+// An http:// upstream sends DoH queries in plaintext, and NewMTLS's
+// TLSClientConfig — and with it the SPIFFE AuthorizeID pin on central's identity —
+// is never consulted. It has to be stopped at config parse time rather than left
+// to degrade quietly at runtime into a connection that verifies no identity at
+// all.
 func TestParseRejectsHTTPUpstream(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode vm
@@ -216,9 +218,10 @@ func TestParseRejectsMalformedUpstreamURL(t *testing.T) {
 	parseConfigErr(t, c)
 }
 
-// upstream 帶路徑必須在啟動時被擋下。CoreDNS 的 doh 套件會自己接上 "/dns-query"，
-// 所以帶路徑的值會變成 "/dns-query/dns-query" 並得到 HTTP 404 —— 一個在執行期
-// 完全指不到原因的錯誤。這個案例是本專案第一次在真實環境跑起來時發現的。
+// An upstream carrying a path must be stopped at startup. CoreDNS's doh package
+// appends "/dns-query" itself, so such a value becomes "/dns-query/dns-query" and
+// earns an HTTP 404 — an error that points at nothing whatsoever at runtime. This
+// case was found the first time the project ran in a real environment.
 func TestParseRejectsUpstreamWithPath(t *testing.T) {
 	for _, u := range []string{
 		"https://central.example.org/dns-query",
@@ -242,7 +245,8 @@ func TestParseRejectsUpstreamWithPath(t *testing.T) {
 	}
 }
 
-// 只有一個斜線不算路徑 —— 那是 URL 的正常寫法，不該擋。
+// A lone slash is not a path — that is how URLs are ordinarily written, and it
+// must not be refused.
 func TestParseAcceptsUpstreamWithTrailingSlash(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode vm
@@ -269,8 +273,8 @@ func TestParseAcceptsHTTPSUpstream(t *testing.T) {
 	}
 }
 
-// parseConfigErr 是共用的小工具：呼叫 parseConfig 並要求它回錯誤，回錯誤本身
-// 讓呼叫端可以再檢查訊息內容。
+// parseConfigErr is a shared helper: it calls parseConfig, requires an error, and
+// returns that error so the caller can inspect the message.
 func parseConfigErr(t *testing.T, c *caddy.Controller) error {
 	t.Helper()
 	_, err := parseConfig(c)
@@ -280,9 +284,10 @@ func parseConfigErr(t *testing.T, c *caddy.Controller) error {
 	return err
 }
 
-// 一個設了但解不開的 NODE_IP 必須讓 parseConfig 失敗，而不是悄悄當成沒設 ——
-// 否則 masquerade 偵測（節省告警操作者「這個節點已經退化成單一 zone」的唯一
-// 訊號）會因為 DaemonSet manifest 裡的一個錯字悄悄停用，且沒有任何記錄。
+// A NODE_IP that is set but unparseable must make parseConfig fail rather than be
+// quietly treated as unset — otherwise masquerade detection, the only signal that
+// tells an operator this node has collapsed into a single zone, is disabled by one
+// typo in the DaemonSet manifest, with nothing recorded.
 func TestParseNodeIPEnvRejectsMalformed(t *testing.T) {
 	t.Setenv("NODE_IP", "not-an-ip")
 	c := caddy.NewTestController("dns", `zonedns_agent {
@@ -297,8 +302,8 @@ func TestParseNodeIPEnvRejectsMalformed(t *testing.T) {
 	}
 }
 
-// 沒設 NODE_IP 時必須維持原樣 —— cfg.nodeIP 留在零值，不能因為前一個檢查改動
-// 而變成「設了但錯」的那條路徑。
+// With NODE_IP unset everything must stay as it was: cfg.nodeIP keeps its zero
+// value, and the previous check must not push it onto the "set but wrong" path.
 func TestParseNodeIPEnvAbsentLeavesNodeIPUnset(t *testing.T) {
 	t.Setenv("NODE_IP", "")
 	c := caddy.NewTestController("dns", `zonedns_agent {
@@ -342,10 +347,10 @@ func TestParseMissingZoneArgument(t *testing.T) {
 	}
 }
 
-// edns0_code 必須能在 agent 端設定，且驗證規則跟 central 端的
-// plugin/zonedns/setup.go 完全一致 —— 兩端的值必須相同（spec §6.6），一個能
-// 在其中一端過關、卻在另一端被拒絕的值，會讓操作者以為自己已經把兩端同步，
-// 實際上其中一端永遠不會接受它。
+// edns0_code must be settable on the agent side, with validation identical to
+// central's in plugin/zonedns/setup.go — the two ends must carry the same value
+// (spec §6.6), and a value accepted at one end while refused at the other would
+// have an operator believe both ends are in sync when one will never accept it.
 func TestParseEdns0Code(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode vm
@@ -411,9 +416,10 @@ func TestParseRejectsMalformedEdns0Code(t *testing.T) {
 	}
 }
 
-// vm 模式下 node_name 完全不起作用 —— 這台機器的 zone 由 zone 選項一次性決定，
-// 不是逐查詢從 pod label 讀出來的。悄悄接受並丟棄它，會讓 Corefile 表達的意圖
-// 跟實際行為對不上。
+// Under vm mode node_name does nothing at all — this machine's zone is settled
+// once by the zone option, not read per query from a pod label. Accepting and
+// discarding it quietly would leave the Corefile's stated intent and the actual
+// behaviour disagreeing.
 func TestParseVMModeRejectsNodeName(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode vm
@@ -429,8 +435,9 @@ func TestParseVMModeRejectsNodeName(t *testing.T) {
 	}
 }
 
-// 對稱地，k8s 模式下 zone 完全不起作用 —— 這個節點的 zone 逐查詢由 pod label
-// 決定，寫死一個 zone 選項會讓操作者誤以為這個節點只服務那一個 zone。
+// Symmetrically, under k8s mode zone does nothing at all — this node's zone is
+// settled per query by the pod label, and hard-coding a zone option would have an
+// operator believe the node serves that one zone alone.
 func TestParseK8sModeRejectsZone(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode k8s
@@ -460,11 +467,12 @@ func TestParseRejectsUnknownProperty(t *testing.T) {
 	}
 }
 
-// reload 期間新舊兩個 k8s watcher 的生命週期會重疊：coredns/caddy 先完整啟動
-// 新 instance（含它的 OnReady）才去關閉舊的。若較新世代已經把 resolverReady
-// 標成就緒，較舊世代因為自己的 ctx 被取消而觸發的歸零就不該把它蓋掉 —— 否則
-// 這個 gauge 會卡在 0，直到下一次 reload 都不會修正，即使新 instance 早已正常
-// 運作。
+// During a reload the lifetimes of the old and new k8s watchers overlap:
+// coredns/caddy brings the new instance fully up, its OnReady included, before
+// shutting the old one down. Once a newer generation has marked resolverReady
+// ready, the zeroing an older generation triggers on its own cancelled ctx must
+// not overwrite it — otherwise the gauge sticks at 0 and stays wrong until the
+// next reload, however long the new instance has been working normally.
 func TestResolverReadyGuardIgnoresStaleShutdown(t *testing.T) {
 	resolverGeneration.Store(0)
 	resetResolverReadyGeneration(t)
@@ -502,9 +510,10 @@ func TestResolverReadyGuardIgnoresStaleShutdown(t *testing.T) {
 	}
 }
 
-// resetResolverReadyGeneration 把 resolverReadyGeneration 歸零，用 white-box
-// 測試的方式直接拿 resolverReadyMu，而不是透過 markResolverReady/
-// markResolverStopped —— 這裡只是測試前後的清理，不是要重現任何交錯時機。
+// resetResolverReadyGeneration zeroes resolverReadyGeneration, taking
+// resolverReadyMu directly in white-box fashion rather than going through
+// markResolverReady/markResolverStopped — this is only cleanup around a test, not
+// an attempt to reproduce any interleaving.
 func resetResolverReadyGeneration(t *testing.T) {
 	t.Helper()
 	resolverReadyMu.Lock()
@@ -512,28 +521,31 @@ func resetResolverReadyGeneration(t *testing.T) {
 	resolverReadyMu.Unlock()
 }
 
-// TestResolverReadyGuardTOCTOU 重現一個 check-then-act 的競態：gen1 讀到「我
-// 還是最新世代」之後、還沒來得及依這個結論寫入 gauge 之前，gen2 搶先透過
-// markResolverReady 取代它成為最新世代；接著 gen1 才執行它已經決定好（但此刻
-// 已經過時）的動作。
+// TestResolverReadyGuardTOCTOU reproduces a check-then-act race: gen1 reads "I am
+// still the latest generation" and then, before it can act on that conclusion by
+// writing the gauge, gen2 gets in first through markResolverReady and replaces it
+// as the latest — after which gen1 carries out the action it had already decided
+// on, now out of date.
 //
-// 這是 TestResolverReadyGuardIgnoresStaleShutdown 沒有覆蓋到的情境：那個測試
-// 依序呼叫 markResolverReady(gen1)、markResolverReady(gen2)、
-// markResolverStopped(gen1)，三次呼叫互不重疊，只驗證「讀」與「寫」各自的
-// 結果、不驗證兩者之間有沒有窗口。這裡改用 resolverStoppedTestHook，強制在
-// markResolverStopped(gen1) 讀出「還是最新」之後、真正寫入 gauge 之前，插入
-// 一次完整的 markResolverReady(gen2) 呼叫 —— 若「讀、比較、寫」不是同一個不
-// 可分割的臨界區，gen1 接下來就會把 gen2 剛寫好的「就緒」蓋掉，而且蓋掉之後
-// 不會再有任何事件修正它，直到下一次 reload：跟這整套機制原本要避免的
-// 「卡在 0」錯誤一樣，只是窗口從整個 reload 縮小成這一個 check-then-act 的
-// 瞬間。
+// This is the situation TestResolverReadyGuardIgnoresStaleShutdown does not cover.
+// That test calls markResolverReady(gen1), markResolverReady(gen2) and
+// markResolverStopped(gen1) in sequence, with no overlap between the three, so it
+// verifies the outcome of each read and each write without verifying whether a
+// window exists between them. This one uses resolverStoppedTestHook to force a
+// complete markResolverReady(gen2) call in after markResolverStopped(gen1) has
+// read "still the latest" and before it actually writes the gauge — and if read,
+// compare and write are not one indivisible critical section, gen1 then overwrites
+// the readiness gen2 just wrote, with no later event to put it right until the
+// next reload. The same "stuck at 0" fault this whole mechanism exists to prevent,
+// with the window narrowed from a whole reload to this one check-then-act instant.
 //
-// hook 裡用獨立的 goroutine 去呼叫 markResolverReady(gen2)，而不是在這裡同步
-// 呼叫：修好之後 markResolverReady 需要拿 markResolverStopped(gen1) 正持有的
-// 同一把 resolverReadyMu，同步呼叫會讓呼叫端自己卡死在一個不可重入的鎖上。
-// 開一個 goroutine 讓它去搶鎖，用 channel 確認它至少已經開始執行，再用一小段
-// 排程餘裕，讓它有機會在還沒修好的版本上真的搶先寫完 —— 這段時間對修好的版本
-// 沒有影響：它會卡在 Lock() 直到 gen1 放手為止。
+// The hook calls markResolverReady(gen2) from its own goroutine rather than
+// synchronously: once fixed, markResolverReady needs the same resolverReadyMu that
+// markResolverStopped(gen1) is holding, and a synchronous call would deadlock the
+// caller on a non-reentrant lock. A goroutine goes after the lock instead, a
+// channel confirms it has at least started, and a little scheduling slack gives it
+// a real chance to get its write in first on the unfixed version — time that costs
+// the fixed version nothing: it simply blocks in Lock() until gen1 lets go.
 func TestResolverReadyGuardTOCTOU(t *testing.T) {
 	resolverReady.Set(0)
 	resetResolverReadyGeneration(t)
@@ -579,14 +591,16 @@ func TestResolverReadyGuardTOCTOU(t *testing.T) {
 	}
 }
 
-// wireResolverReadyLifecycle 是 vm 模式在 setup() 裡實際呼叫的函式：立刻標成
-// 就緒，並在 ctx 結束時清掉。這條路徑過去（Task 8 之前）只在 k8s 模式走，vm
-// 模式是直接 resolverReady.Set(1) 且從不清空 —— 節點關閉之後 gauge 會繼續卡在
-// 1，即使查詢早就沒人在回應。這裡直接測這個函式本身，而不是繞經完整的
-// setup()：它是 vm 與 k8s 兩個模式共用的世代保護機制，機制本身的正確性已經由
-// TestResolverReadyGuardIgnoresStaleShutdown 與 TestResolverReadyGuardTOCTOU
-// 覆蓋，這裡只需要確認 vm 模式實際呼叫的這個函式確實接上了「就緒」與「清空」
-// 兩端。
+// wireResolverReadyLifecycle is the function vm mode actually calls inside
+// setup(): mark ready at once, clear when ctx ends. Before Task 8 this path ran
+// only under k8s mode, while vm mode called resolverReady.Set(1) directly and
+// never cleared it — leaving the gauge stuck at 1 after the node shut down, long
+// after anything was answering queries. This tests the function itself rather than
+// going the long way round through a full setup(): it is the generation guard
+// shared by vm and k8s modes, the guard's own correctness is already covered by
+// TestResolverReadyGuardIgnoresStaleShutdown and TestResolverReadyGuardTOCTOU, and
+// all that is needed here is confirmation that the function vm mode really calls
+// is wired to both ends, ready and cleared.
 func TestWireResolverReadyLifecycleClearsOnCancel(t *testing.T) {
 	resolverGeneration.Store(0)
 	resetResolverReadyGeneration(t)
@@ -615,10 +629,10 @@ func TestWireResolverReadyLifecycleClearsOnCancel(t *testing.T) {
 	}
 }
 
-// fakeUpstreamConstructor 建立一個 newUpstream 替身：不接觸真正的 SPIRE
-// Workload API，回傳一個零值 *dohupstream.Client（這幾個測試都不會真的用它
-// 送查詢）與一個會記錄呼叫次數、也讓測試觀察到 setup() 傳進來的 ctx 的
-// cleanup。
+// fakeUpstreamConstructor builds a newUpstream stand-in: it never touches a real
+// SPIRE Workload API, and returns a zero-value *dohupstream.Client (none of these
+// tests actually send a query through it) together with a cleanup that counts its
+// calls and lets the test observe the ctx setup() passed in.
 func fakeUpstreamConstructor(cleanupCalls *int, capturedCtx *context.Context) func(context.Context, dohupstream.Config) (*dohupstream.Client, func(), error) {
 	return func(ctx context.Context, _ dohupstream.Config) (*dohupstream.Client, func(), error) {
 		*capturedCtx = ctx
@@ -626,7 +640,8 @@ func fakeUpstreamConstructor(cleanupCalls *int, capturedCtx *context.Context) fu
 	}
 }
 
-// vmModeConfig 是可以直接餵給 setup() 的最小合法 vm 模式設定。
+// vmModeConfig is the smallest valid vm-mode configuration that can be fed
+// straight to setup().
 const vmModeConfig = `zonedns_agent {
 	mode vm
 	zone zone-c
@@ -635,9 +650,9 @@ const vmModeConfig = `zonedns_agent {
 	workload_api unix:///run/spire/sockets/agent.sock
 }`
 
-// TestSetupRejectsBadDirectiveOrder 是 setup() 本身唯一一段先於 parseConfig
-// 執行的邏輯：dnsserver.Directives 錯誤時必須直接拒絕啟動，而不是先解析完
-// 設定才發現順序不對。
+// TestSetupRejectsBadDirectiveOrder covers setup()'s only logic that runs ahead of
+// parseConfig: a wrong dnsserver.Directives must refuse startup outright, rather
+// than the order being discovered only after the config has been parsed.
 func TestSetupRejectsBadDirectiveOrder(t *testing.T) {
 	origDirectives := dnsserver.Directives
 	dnsserver.Directives = []string{"cache", "zonedns_agent"}
@@ -653,8 +668,9 @@ func TestSetupRejectsBadDirectiveOrder(t *testing.T) {
 	}
 }
 
-// TestSetupVMModeSuccess 驗證 vm 模式端到端跑過 setup()：resolver_ready gauge
-// 必須到 1（見 wireResolverReadyLifecycle），且 newUpstream 只被呼叫一次。
+// TestSetupVMModeSuccess runs vm mode end to end through setup(): the
+// resolver_ready gauge must reach 1 (see wireResolverReadyLifecycle) and
+// newUpstream must be called exactly once.
 func TestSetupVMModeSuccess(t *testing.T) {
 	origDirectives := dnsserver.Directives
 	dnsserver.Directives = []string{"zonedns_agent", "cache"}
@@ -694,11 +710,14 @@ func TestSetupVMModeSuccess(t *testing.T) {
 	}
 }
 
-// TestSetupK8sModeFailurePathRunsCleanup 驗證每一條錯誤路徑都要把已經建立的
-// 資源收乾淨。newUpstream 成功之後、rest.InClusterConfig() 保證失敗（測試環境
-// 外沒有 KUBERNETES_SERVICE_HOST/PORT），setup() 必須在回錯誤之前呼叫
-// cancel() 與 cleanup() —— 否則已經建立的 X509Source 與它持有的檔案描述器、
-// 背景 goroutine 就外洩了，而且只在特定失敗組合下才會發生，難以事後察覺。
+// TestSetupK8sModeFailurePathRunsCleanup checks that every error path tidies up
+// the resources already created. After newUpstream succeeds,
+// rest.InClusterConfig() is guaranteed to fail (outside a cluster there is no
+// KUBERNETES_SERVICE_HOST/PORT), and setup() must call cancel() and cleanup()
+// before returning the error — otherwise the X509Source it built, along with the
+// file descriptors and background goroutines it holds, leaks. And it leaks only
+// under a particular combination of failures, which makes it hard to notice after
+// the fact.
 func TestSetupK8sModeFailurePathRunsCleanup(t *testing.T) {
 	origDirectives := dnsserver.Directives
 	dnsserver.Directives = []string{"zonedns_agent", "cache"}

@@ -1,96 +1,107 @@
-# zonedns 節點端 Kubernetes 部署
+# zonedns node-side Kubernetes deployment
 
-這裡是 node-local-dns 加上 `zonedns_agent` 的完整 manifest。中心端（`zonedns`）
-不在這裡 —— 它部署在 VM 上，見 `docs/deployment.md`。
+These are the complete manifests for node-local-dns with `zonedns_agent`. The
+central side (`zonedns`) is not here — it is deployed on a VM; see
+`docs/deployment.md`.
 
-## 套用順序
+## Apply order
 
 ```bash
 kubectl apply -f 01-rbac.yaml
 kubectl apply -f 02-configmap.yaml
 kubectl apply -f 03-daemonset.yaml
-kubectl apply -f 04-clusterspiffeid.yaml   # 需要 spire-controller-manager 的 CRD
+kubectl apply -f 04-clusterspiffeid.yaml   # needs spire-controller-manager's CRD
 ```
 
-## 必須替換的值
+## Values you must replace
 
-manifest 裡刻意留下需要按環境替換的地方，全部集中在這張表。
+The manifests deliberately leave places to fill in per environment, all
+collected in this table.
 
-| 檔案 | 位置 | 換成什麼 |
+| File | Where | Replace with |
 |---|---|---|
-| `02-configmap.yaml` | `example.com:53 {` | 你們 VirtualService `hosts:` 實際使用的網域。只有落在這個 block 的查詢會走 zone 路由 |
-| `02-configmap.yaml` | `upstream` | central 的位址，**不含路徑** |
-| `02-configmap.yaml` | `central_spiffe_id` | central 自己的 SPIFFE ID |
-| `02-configmap.yaml` | `workload_api` | SPIRE agent 在節點上暴露 socket 的路徑 |
-| `02-configmap.yaml` | `zone_label` | 若不是 `zone` |
-| `03-daemonset.yaml` | `image` | 自建 image（見下） |
-| `03-daemonset.yaml` | `spire-agent-socket` 的 `hostPath` | 同 `workload_api`，兩處必須一致 |
-| `04-clusterspiffeid.yaml` | 兩個 `spiffeIDTemplate` 的 trust domain | 你們的 trust domain |
+| `02-configmap.yaml` | `example.com:53 {` | The domain your VirtualService `hosts:` actually use. Only queries landing in this block take the zone-routed path |
+| `02-configmap.yaml` | `upstream` | Central's address, **without a path** |
+| `02-configmap.yaml` | `central_spiffe_id` | Central's own SPIFFE ID |
+| `02-configmap.yaml` | `workload_api` | The path at which the SPIRE agent exposes its socket on the node |
+| `02-configmap.yaml` | `zone_label` | If it is not `zone` |
+| `03-daemonset.yaml` | `image` | Your self-built image (see below) |
+| `03-daemonset.yaml` | `hostPath` of `spire-agent-socket` | The same as `workload_api`; the two must agree |
+| `04-clusterspiffeid.yaml` | The trust domain in both `spiffeIDTemplate`s | Your trust domain |
 
-`__PILLAR__*` 佔位符照上游慣例保留，由你們既有的 node-local-dns 安裝流程替換。
-若你們是直接 apply 已替換好的版本，把它們換成實際值即可。
+The `__PILLAR__*` placeholders are kept per upstream convention and are
+substituted by your existing node-local-dns installation flow. If you apply an
+already-substituted version directly, replace them with the real values.
 
-## 自建 image
+## Building the image
 
-上游的 `k8s-dns-node-cache` 不含 `zonedns_agent` —— CoreDNS 的 plugin 是編譯期
-連結的，沒有執行期載入機制。建置步驟見 `docs/deployment.md`「節點端（agent）部署 →
-建置」。
+Upstream's `k8s-dns-node-cache` does not contain `zonedns_agent` — CoreDNS
+plugins are linked at compile time and there is no runtime loading mechanism.
+For the build steps see "Node side (agent) deployment → Building" in
+`docs/deployment.md`.
 
-要點：把 `zonedns_agent` 插進 `plugin.cfg` 時**必須排在 `cache` 之前**，否則
-plugin 啟動時會直接拒絕啟動並說明原因。
+The key point: when inserting `zonedns_agent` into `plugin.cfg` it **must sort
+before `cache`**, or the plugin refuses to start and says why.
 
-## 這份 manifest 相對上游改了什麼
+## What this manifest changes relative to upstream
 
-只有三處，其餘完全照 `kubernetes/kubernetes` 的
-`cluster/addons/dns/nodelocaldns/nodelocaldns.yaml`：
+Three things only; everything else follows `kubernetes/kubernetes`'s
+`cluster/addons/dns/nodelocaldns/nodelocaldns.yaml` exactly:
 
-1. **image** 指向自建版本
-2. **RBAC**：上游的 ServiceAccount 沒有任何權限；這裡加上 pods 的
-   `get`/`list`/`watch`，供 informer 把查詢的 source IP 對應到 pod 的 zone label
-3. **DaemonSet 多兩個掛載與兩個環境變數**：SPIRE 的 Workload API socket，以及
-   `NODE_NAME`、`NODE_IP`
+1. **image** points at the self-built version
+2. **RBAC**: upstream's ServiceAccount holds no permissions; this adds
+   `get`/`list`/`watch` on pods, so the informer can map a query's source IP to
+   the pod's zone label
+3. **Two extra mounts and two extra environment variables on the DaemonSet**:
+   SPIRE's Workload API socket, plus `NODE_NAME` and `NODE_IP`
 
-上游原本就有、一項都不能省的：`hostNetwork`、`dnsPolicy: Default`、
-`priorityClassName`、`-localip` 的兩個位址、`xtables-lock` 掛載、`NET_ADMIN`
-capability、涵蓋所有 taint 的 tolerations。這些跟 zone 路由無關，是 node-local-dns
-管理 dummy interface 與 iptables 規則所需要的。
+Present upstream already and none of it optional: `hostNetwork`,
+`dnsPolicy: Default`, `priorityClassName`, both `-localip` addresses, the
+`xtables-lock` mount, the `NET_ADMIN` capability, and tolerations covering every
+taint. None of that concerns zone routing; it is what node-local-dns requires to
+manage its dummy interface and iptables rules.
 
-## 兩端必須成對維護的設定
+## Settings that must be maintained as a pair
 
-任一邊漏掉，zone 路由都會**靜默停止運作** —— 查詢照常有答案，只是不再分 zone。
+Miss either side and zone routing **stops working silently** — queries still
+return answers, they just stop distinguishing zones.
 
-- `04-clusterspiffeid.yaml` 產生的節點 SPIFFE ID，必須逐字出現在 central Corefile
-  的 `authorized_agent` 清單
-- central 的 SPIFFE ID，必須是本地 Corefile 的 `central_spiffe_id`
-- 兩端的 `edns0_code` 必須相同
-- 本地的 `zone_label` 必須跟 `04-clusterspiffeid.yaml` 的 `spiffeIDTemplate`
-  讀的是同一個 label
+- The node SPIFFE ID produced by `04-clusterspiffeid.yaml` must appear verbatim
+  in the `authorized_agent` list of central's Corefile
+- Central's SPIFFE ID must be the local Corefile's `central_spiffe_id`
+- Both ends' `edns0_code` must be identical
+- The local `zone_label` must be the same label that
+  `04-clusterspiffeid.yaml`'s `spiffeIDTemplate` reads
 
-## 驗證
+## Verification
 
-RBAC 是否生效：
+Whether the RBAC took effect:
 
 ```bash
 kubectl auth can-i list pods \
   --as=system:serviceaccount:kube-system:node-local-dns
 ```
 
-zone 判定是否正常（在任一節點上）：
+Whether zone resolution is working (on any node):
 
 ```bash
 kubectl -n kube-system exec ds/node-local-dns -- \
   wget -qO- http://127.0.0.1:9253/metrics | grep zonedns_agent
 ```
 
-`zone_resolution_total{result="node_ip"}` 有非零增長，代表節點上有東西在改寫
-查詢的 source IP，整個節點會靜默退化成不宣告 zone。完整的告警清單見
-`docs/deployment.md`。
+Any non-zero growth in `zone_resolution_total{result="node_ip"}` means something
+on the node is rewriting queries' source IPs, and the whole node silently
+degrades to declaring no zone at all. For the full list of alerts see
+`docs/deployment.md`.
 
-## 已知限制
+## Known limitations
 
-- **RBAC 無法限縮到單一節點。** informer 以 `spec.nodeName` 過濾，實際只讀本機
-  的數十個 pod，但授予的權限是全 cluster 的 pod 讀取權。導入前值得讓安全審查
-  知道這一點。
-- **hostNetwork 的 pod 無法被辨識。** 它們的 source IP 就是節點 IP，同節點上所有
-  hostNetwork pod 共用，因此一律退到非 zone-aware 路徑（spec §9 已知限制 4）。
-- **一個 workload 只能有一個對外 FQDN**（spec §9 已知限制 1）。
+- **RBAC cannot be scoped to a single node.** The informer filters by
+  `spec.nodeName` and in practice reads only the few dozen pods on this machine,
+  but the permission granted is cluster-wide read access to pods. That is worth
+  putting in front of a security review before adoption.
+- **hostNetwork pods cannot be identified.** Their source IP is the node IP,
+  shared by every hostNetwork pod on the node, so they always fall back to the
+  non-zone-aware path (spec §9, known limitation 4).
+- **A workload may have exactly one external FQDN** (spec §9, known
+  limitation 1).

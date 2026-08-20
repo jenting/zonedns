@@ -12,14 +12,16 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-// HostLabel 是 workload 用來宣告自己對外名稱的 label —— 同一個值會被
-// ClusterSPIFFEID 的 dnsNameTemplates 渲染成 SPIRE entry 的 dns_name。
+// HostLabel is the label a workload uses to declare its own external name. The
+// same value is rendered by the ClusterSPIFFEID's dnsNameTemplates into the
+// dns_name of the SPIRE entry.
 const HostLabel = "zonedns.io/host"
 
-// VirtualServiceGVRs 是要嘗試的 VirtualService 資源版本，依序嘗試。
+// VirtualServiceGVRs are the VirtualService resource versions to try, in order.
 //
-// Istio 1.22 起主推 v1，先前是 v1beta1，兩者服務同一批物件。這裡不做 discovery：
-// 依序試、第一個列得出來的就用它，少一次 API 往返也少一份權限需求。
+// Istio has led with v1 since 1.22 and with v1beta1 before that; both serve the
+// same objects. This does no discovery: try them in order and use the first one
+// that lists, which saves an API round trip and a permission requirement.
 func VirtualServiceGVRs() []schema.GroupVersionResource {
 	return []schema.GroupVersionResource{
 		{Group: "networking.istio.io", Version: "v1", Resource: "virtualservices"},
@@ -27,21 +29,24 @@ func VirtualServiceGVRs() []schema.GroupVersionResource {
 	}
 }
 
-// Skipped 記錄一筆被排除在比對之外的名稱，以及排除的理由。
+// Skipped records one name excluded from the comparison, and why.
 //
-// 這些不是漂移，但要能印出來：一個「乾淨」的報告如果其實是把所有東西都跳過了，
-// 那跟真的沒有漂移看起來一模一樣 —— 正是這個專案反覆在抓的那種失敗形狀。
+// These are not drift, but they must be printable: a "clean" report that is
+// really the result of skipping everything looks exactly like a report with no
+// drift in it — the failure shape this project keeps catching.
 type Skipped struct {
-	Source string // VirtualService 的 namespace/name
+	Source string // namespace/name of the VirtualService
 	Host   string
 	Reason SkipReason
 }
 
-// CollectVirtualServiceHosts 走訪 VirtualService，取出要參與比對的 host。
+// CollectVirtualServiceHosts walks the VirtualServices and returns the hosts
+// that should take part in the comparison.
 //
-// namespace 為空字串代表整個 cluster —— 那是正式用途的預設值。指定 namespace 只
-// 適合測試與範圍受限的檢查：Istio 允許 A namespace 的 VirtualService 指向 B
-// namespace 的服務，所以縮小範圍會把那種情形誤報成「沒有 pod 認領」。
+// An empty namespace means the whole cluster, which is the default for real
+// use. Naming a namespace suits testing and deliberately scoped checks only:
+// Istio lets a VirtualService in namespace A point at a service in namespace B,
+// so narrowing the scope reports that arrangement as "no pod claims it".
 func CollectVirtualServiceHosts(ctx context.Context, client dynamic.Interface, clusterDomain, namespace string) (hosts []string, skipped []Skipped, err error) {
 	list, err := listVirtualServices(ctx, client, namespace)
 	if err != nil {
@@ -78,11 +83,13 @@ func CollectVirtualServiceHosts(ctx context.Context, client dynamic.Interface, c
 	return hosts, skipped, nil
 }
 
-// listVirtualServices 依序嘗試各個 API 版本，回傳第一個列得出來的結果。
+// listVirtualServices tries each API version in order and returns the first
+// listing that succeeds.
 //
-// 全部版本都不存在時回傳錯誤而不是空清單：叢集裡沒有 Istio CRD，和叢集裡沒有
-// VirtualService，對這支工具而言是天差地別的兩件事 —— 後者代表沒有漂移，
-// 前者代表這次檢查根本沒檢查到東西。
+// When no version exists it returns an error rather than an empty list: a
+// cluster with no Istio CRD and a cluster with no VirtualServices are entirely
+// different things to this tool. The latter means there is no drift; the former
+// means the check examined nothing at all.
 func listVirtualServices(ctx context.Context, client dynamic.Interface, namespace string) (*unstructured.UnstructuredList, error) {
 	var lastErr error
 	for _, gvr := range VirtualServiceGVRs() {
@@ -98,8 +105,8 @@ func listVirtualServices(ctx context.Context, client dynamic.Interface, namespac
 	return nil, fmt.Errorf("no VirtualService CRD served at any known version (%v): %w", VirtualServiceGVRs(), lastErr)
 }
 
-// CollectPodHosts 取出帶 hostLabel 的 pod 所宣告的名稱。namespace 為空字串代表
-// 整個 cluster，語意與 CollectVirtualServiceHosts 相同。
+// CollectPodHosts returns the names declared by pods carrying hostLabel. An
+// empty namespace means the whole cluster, as in CollectVirtualServiceHosts.
 func CollectPodHosts(ctx context.Context, client kubernetes.Interface, hostLabel, namespace string) ([]string, error) {
 	pods, err := client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: hostLabel,
@@ -114,8 +121,10 @@ func CollectPodHosts(ctx context.Context, client kubernetes.Interface, hostLabel
 	return hosts, nil
 }
 
-// stringSlice 讀出一個字串陣列欄位。欄位不存在視為空陣列；存在但型別不對則報錯 ——
-// 這種 VirtualService 的意圖無從得知，靜靜當成沒有 host 會讓它逃過比對。
+// stringSlice reads a field holding an array of strings. A missing field counts
+// as an empty array; a present one of the wrong type is an error — the intent of
+// such a VirtualService is unknowable, and quietly treating it as having no
+// hosts would let it escape the comparison entirely.
 func stringSlice(obj *unstructured.Unstructured, fields ...string) ([]string, error) {
 	out, found, err := unstructured.NestedStringSlice(obj.Object, fields...)
 	if err != nil {

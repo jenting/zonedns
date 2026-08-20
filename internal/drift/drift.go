@@ -1,37 +1,44 @@
-// Package drift 比對兩份各自獨立宣告的服務名稱，找出它們的分歧。
+// Package drift compares two independently written declarations of a service
+// name and reports where they disagree.
 //
-// 設計上，一個 workload 的對外名稱被寫在兩個地方：pod 的 zonedns.io/host label
-// （它會變成 SPIRE registration entry 的 dns_name，也就是 central registry 的
-// key），以及 Istio VirtualService 的 spec.hosts（client 實際查詢的名字）。
-// 兩者是同一個事實的兩份宣告，沒有任何機制保證它們一致。
+// By design a workload's external name is written in two places: the pod's
+// zonedns.io/host label (which becomes the dns_name of its SPIRE registration
+// entry, and therefore the key of the central registry), and the Istio
+// VirtualService's spec.hosts (the name clients actually query). They are two
+// declarations of the same fact, and nothing keeps them in agreement.
 //
-// 漂移的後果不會報錯：client 查的名字不在 registry 裡，central 就把它當成
-// 「不歸我管」而交給下游，於是那個服務永遠拿不到 zone 路由 —— 查詢照常有答案。
-// 設計文件（§9 已知限制 2）把「需要比對檢查防漂移」列為前提，這個套件就是它。
+// Drift raises no error. The name a client queries is absent from the registry,
+// so central treats it as "not mine", hands it downstream, and that service
+// silently loses zone routing — the query still returns an answer. The design
+// doc (§9, known limitation 2) lists this comparison as a precondition; this
+// package is it.
 package drift
 
 import "sort"
 
-// Report 是一次比對的結果。
+// Report is the result of one comparison.
 type Report struct {
-	// UnclaimedHosts 是 VirtualService 宣告、但沒有任何 pod 以 zonedns.io/host
-	// 認領的名稱。這是危險的一邊：client 會查它，registry 沒有它。
+	// UnclaimedHosts are names a VirtualService declares that no pod claims via
+	// zonedns.io/host. This is the dangerous direction: clients resolve them,
+	// and the registry does not have them.
 	UnclaimedHosts []string
 
-	// UnroutedLabels 是 pod 標了、但沒有任何 VirtualService 宣告的名稱。
-	// 多半是打錯字或殘留設定 —— registry 裡有一筆沒人會查的資料。
+	// UnroutedLabels are names labelled on pods that no VirtualService declares.
+	// Usually a typo or a leftover — a registry entry nothing ever queries.
 	UnroutedLabels []string
 }
 
-// OK 回報有沒有漂移。
+// OK reports whether there is any drift.
 func (r Report) OK() bool {
 	return len(r.UnclaimedHosts) == 0 && len(r.UnroutedLabels) == 0
 }
 
-// Compare 比對兩組名稱。
+// Compare compares the two sets of names.
 //
-// 呼叫端負責先篩掉不該參與比對的 VirtualService（綁在 gateway 而非 mesh 的、
-// 萬用 host），因為那些判斷需要 Istio 的語意，而這裡只做集合運算。
+// The caller is responsible for filtering out whatever should not take part
+// (VirtualServices bound to a gateway rather than the mesh, wildcard hosts),
+// because those judgements need Istio semantics; this function only does set
+// arithmetic.
 func Compare(virtualServiceHosts, podLabelHosts []string) Report {
 	inVS := toSet(virtualServiceHosts)
 	inLabel := toSet(podLabelHosts)

@@ -4,7 +4,7 @@
 *.out
 vendor/
 
-# 編輯器與作業系統
+# Editors and operating systems
 .DS_Store
 .idea/
 .vscode/

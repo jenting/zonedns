@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// fakeLister 依序回傳預先安排好的分頁，可注入錯誤。
+// fakeLister returns prearranged pages in order and can inject errors.
 type fakeLister struct {
 	pages [][]Entry
 	err   error
@@ -23,7 +23,7 @@ func (f *fakeLister) ListEntries(_ context.Context, token string) ([]Entry, stri
 	}
 	idx := 0
 	if token != "" {
-		// token 格式為 "page-<n>"
+		// tokens have the form "page-<n>"
 		idx = int(token[len(token)-1] - '0')
 	}
 	if idx >= len(f.pages) {
@@ -60,7 +60,8 @@ func TestPollOnceFollowsPagination(t *testing.T) {
 	}
 }
 
-// 輪詢失敗時必須保留上一份快照 —— SPIRE 短暫不可用不應讓全域 DNS 失去 zone 路由。
+// A failed poll must keep the previous snapshot — a brief SPIRE outage must not
+// cost DNS its zone routing everywhere.
 func TestPollOnceKeepsPreviousSnapshotOnError(t *testing.T) {
 	lister := &fakeLister{pages: [][]Entry{
 		{{SPIFFEIDPath: "/zone/zone-a/ns/prod/sa/payments", DNSNames: []string{"payments.example.com"}}},
@@ -83,8 +84,10 @@ func TestPollOnceKeepsPreviousSnapshotOnError(t *testing.T) {
 	}
 }
 
-// 首次輪詢就失敗時 Store 必須維持未就緒，不可變成空快照。
-// 空快照會讓所有查詢「查得到但都不在 registry」，與「還不知道」意義不同。
+// When the very first poll fails the Store must stay not-ready rather than
+// become an empty snapshot. An empty snapshot makes every query "resolvable but
+// absent from the registry", which means something different from "not known
+// yet".
 func TestPollOnceLeavesStoreUnreadyOnFirstFailure(t *testing.T) {
 	lister := &fakeLister{err: errors.New("spire unavailable")}
 	store := NewStore()
@@ -120,9 +123,10 @@ func (l *everGrowingTokenLister) callCount() int {
 	return l.calls
 }
 
-// TestPollOnceBoundsRunawayPagination 驗證一個永遠回傳非空、且每次都不同的
-// NextPageToken 的 SPIRE server 不會讓 PollOnce 無限迴圈：它必須在 maxPollPages
-// 次呼叫內回傳錯誤，並且不能動到既有快照。
+// TestPollOnceBoundsRunawayPagination checks that a SPIRE server always
+// returning a non-empty and always different NextPageToken cannot spin PollOnce
+// forever: it must return an error within maxPollPages calls, and must not touch
+// the existing snapshot.
 func TestPollOnceBoundsRunawayPagination(t *testing.T) {
 	good := &fakeLister{pages: [][]Entry{
 		{{SPIFFEIDPath: "/zone/zone-a/ns/prod/sa/payments", DNSNames: []string{"payments.example.com"}}},
@@ -169,8 +173,9 @@ func (l *repeatedTokenLister) callCount() int {
 	return l.calls
 }
 
-// TestPollOnceDetectsRepeatedPageToken 驗證一個回傳同一個 page token 兩次的
-// SPIRE server 會被立刻視為錯誤，而不是把 maxPollPages 的預算耗完才失敗。
+// TestPollOnceDetectsRepeatedPageToken checks that a SPIRE server returning the
+// same page token twice is treated as an error at once, rather than failing only
+// after the maxPollPages budget is exhausted.
 func TestPollOnceDetectsRepeatedPageToken(t *testing.T) {
 	good := &fakeLister{pages: [][]Entry{
 		{{SPIFFEIDPath: "/zone/zone-a/ns/prod/sa/payments", DNSNames: []string{"payments.example.com"}}},
@@ -219,9 +224,10 @@ func (l *flakyLister) ListEntries(_ context.Context, _ string) ([]Entry, string,
 	return []Entry{{SPIFFEIDPath: "/zone/zone-a/ns/prod/sa/svc", DNSNames: []string{"svc.example.com"}}}, "", nil
 }
 
-// TestRunTracksConsecutivePollErrors 驗證 Run 會在輪詢失敗時把 pollErrors 往上加，
-// 並在下一次成功時歸零 —— ConsecutivePollErrors 是 plugin 層要發布成 metric 的
-// 唯一來源，這條路徑之前完全沒有測試覆蓋。
+// TestRunTracksConsecutivePollErrors checks that Run raises pollErrors on a
+// failed poll and resets it on the next success. ConsecutivePollErrors is the
+// plugin layer's only source for that metric, and this path previously had no
+// test coverage at all.
 func TestRunTracksConsecutivePollErrors(t *testing.T) {
 	lister := &flakyLister{failUntil: 3}
 	p := NewPoller(lister, NewStore(), 2*time.Millisecond)
@@ -257,10 +263,11 @@ func TestRunTracksConsecutivePollErrors(t *testing.T) {
 	}
 }
 
-// pollErrors 是 Poller 各自的欄位，不是套件層級的單一計數器 —— 兩個 Poller
-// 各自失敗，彼此的連續失敗次數互不影響。這是把 pollErrors 從套件變數改成
-// Poller 欄位之後，唯一能證明「確實互相獨立」的測試；改回套件層級變數會讓
-// 這個測試失敗。
+// pollErrors is a field on each Poller, not one package-level counter — two
+// Pollers failing separately must not affect each other's consecutive failure
+// counts. This is the only test that proves they really are independent after
+// pollErrors moved from a package variable to a field; moving it back would make
+// this test fail.
 func TestPollErrorsAreIndependentPerPoller(t *testing.T) {
 	// pollErrors is only ever mutated inside Run's loop (PollOnce itself is
 	// I/O-free and side-effect-free with respect to the counter), so this
@@ -302,9 +309,10 @@ func TestPollErrorsAreIndependentPerPoller(t *testing.T) {
 	}
 }
 
-// OnPollErrors 是 registry_poll_errors gauge 的唯一資料來源：它必須在成功與
-// 失敗時都被呼叫（成功時歸零、失敗時往上發布），只在其中一種情況呼叫都會讓
-// gauge 卡在舊值。
+// OnPollErrors is the only data source for the registry_poll_errors gauge: it
+// must fire on success as well as failure — resetting to zero on success, raising
+// the count on failure — and firing in only one of those cases would leave the
+// gauge stuck at an old value.
 func TestRunCallsOnPollErrorsOnBothOutcomes(t *testing.T) {
 	lister := &flakyLister{failUntil: 2}
 	p := NewPoller(lister, NewStore(), 2*time.Millisecond)

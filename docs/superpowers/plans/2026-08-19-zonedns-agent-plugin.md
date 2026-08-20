@@ -2,58 +2,60 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 實作 zonedns 的節點端 CoreDNS plugin — 從查詢的 source IP 判定發問 workload 的 zone，以 zone 為 key 快取，並以 DoH over mTLS 帶著 zone 宣告向 central 查詢。
+**Goal:** Implement zonedns's node-side CoreDNS plugin — determine the asking workload's zone from a query's source IP, key the cache by that zone, and query central over DoH with mTLS carrying the zone declaration.
 
-**Architecture:** 一個 CoreDNS plugin（`zonedns_agent`），編譯進自建的 node-local DNS image。三個獨立可測的單元：`podzone`（watch 本機 pod，維護 pod IP → zone）、`zonecache`（以 `(qname, qtype, zone)` 為 key 的答案快取）、`dohupstream`（釘住 central SPIFFE ID 的 mTLS DoH client）。zone 解析抽象成介面，k8s 模式用 `podzone`，VM 模式用設定檔中的固定值。
+**Architecture:** One CoreDNS plugin, `zonedns_agent`, compiled into a self-built node-local DNS image. Three independently testable units: `podzone` (watches local pods and maintains pod IP → zone), `zonecache` (an answer cache keyed by `(qname, qtype, zone)`) and `dohupstream` (an mTLS DoH client pinning central's SPIFFE ID). Zone resolution is abstracted behind an interface: k8s mode uses `podzone`, VM mode a fixed value from configuration.
 
-**Tech Stack:** Go、CoreDNS plugin API、miekg/dns、CoreDNS 的 `plugin/pkg/doh`、go-spiffe/v2（SVID 來源與 SPIFFE ID 釘選）、k8s.io/client-go（本機 pod informer）、hashicorp/golang-lru/v2。
+**Tech Stack:** Go, the CoreDNS plugin API, miekg/dns, CoreDNS's `plugin/pkg/doh`, go-spiffe/v2 (the SVID source and SPIFFE ID pinning), k8s.io/client-go (the local pod informer), hashicorp/golang-lru/v2.
 
-**Spec:** `docs/superpowers/specs/2026-08-18-zonedns-design.md`（§7 為本計畫的範圍，§6.6 為與子專案 1 的契約）
+**Spec:** `docs/superpowers/specs/2026-08-18-zonedns-design.md` — §7 is this plan's scope, §6.6 is the contract with subproject 1
 
 ## Global Constraints
 
-- Go module path：`github.com/jenting/zonedns`（子專案 1 已建立，go.mod 已存在且 tidy）
-- CoreDNS 版本：`github.com/coredns/coredns v1.14.6`，不可變更 —— 必須與 `sigs.k8s.io/node-local-dns` 連結的版本一致
-- EDNS0 option code 一律取自 `internal/ednszone.DefaultCode`，不可另行定義常數
-- 共用套件放 `internal/`；plugin 放 `plugin/zonedns_agent/`（**不可**在 `internal/` 下，外部 build 需要匯入）
-- **central 的 SPIFFE ID 必須以 `tlsconfig.AuthorizeID` 釘選，且為必填設定**（spec §7.5）
-- 新增相依：`k8s.io/client-go`、`k8s.io/api`、`k8s.io/apimachinery`、`github.com/hashicorp/golang-lru/v2`。每次 `go get` 後執行 `go mod tidy`
-- 所有 metric 前綴 `zonedns_agent_`，遵循 CoreDNS 的 `plugin.Namespace` 慣例
-- 子專案 1 已完成並合併，以下套件可直接使用：`internal/ednszone`、`internal/spiffezone`、`internal/testcerts`
+- Go module path: `github.com/jenting/zonedns`, created by subproject 1; go.mod already exists and is tidy
+- CoreDNS version: `github.com/coredns/coredns v1.14.6`, not to be changed — it must match the version `sigs.k8s.io/node-local-dns` links against
+- The EDNS0 option code always comes from `internal/ednszone.DefaultCode`; no separate constant may be defined
+- Shared packages go in `internal/`; the plugin goes in `plugin/zonedns_agent/` and **must not** be under `internal/`, because external builds need to import it
+- **Central's SPIFFE ID must be pinned with `tlsconfig.AuthorizeID`, and the setting is required** (spec §7.5)
+- New dependencies: `k8s.io/client-go`, `k8s.io/api`, `k8s.io/apimachinery`, `github.com/hashicorp/golang-lru/v2`. Run `go mod tidy` after every `go get`
+- Every metric carries the `zonedns_agent_` prefix, following CoreDNS's `plugin.Namespace` convention
+- Subproject 1 is complete and merged, so these packages are available directly: `internal/ednszone`, `internal/spiffezone`, `internal/testcerts`
 
 ---
 
-### Task 1: `zonecache` — 以 zone 為 key 的答案快取
+### Task 1: `zonecache` — an answer cache keyed by zone
 
-節點端**必須**有 zone-aware 快取（spec §7.3）：最終答案隨 zone 而異，用既有的 zone-盲
-`cache` plugin 會把 zone-a 的答案回給 zone-b 的 pod。
+The node side **must** have a zone-aware cache (spec §7.3): the final answer
+varies by zone, and the existing zone-blind `cache` plugin would hand zone-a's
+answer to a zone-b pod.
 
 **Files:**
 - Create: `internal/zonecache/zonecache.go`
 - Test: `internal/zonecache/zonecache_test.go`
-- Modify: `go.mod`（加入 `github.com/hashicorp/golang-lru/v2`）
+- Modify: `go.mod` — add `github.com/hashicorp/golang-lru/v2`
 
 **Interfaces:**
-- Consumes: 無
+- Consumes: nothing
 - Produces:
-  - `zonecache.Cache` 型別
+  - the `zonecache.Cache` type
   - `zonecache.New(maxEntries int) (*Cache, error)`
   - `(*Cache).Get(qname string, qtype uint16, zone string, now time.Time) (*dns.Msg, bool)`
   - `(*Cache).Put(qname string, qtype uint16, zone string, m *dns.Msg, now time.Time)`
   - `(*Cache).Len() int`
 
-- [ ] **Step 1: 加入 LRU 相依**
+- [ ] **Step 1: Add the LRU dependency**
 
 ```bash
 go get github.com/hashicorp/golang-lru/v2@latest
 go mod tidy
 ```
 
-`golang-lru/v2` 目前已是 CoreDNS 拉進來的 indirect 相依，這一步只是把它提升為直接相依。
+`golang-lru/v2` is already an indirect dependency pulled in by CoreDNS; this step
+only promotes it to a direct one.
 
-- [ ] **Step 2: 寫失敗的測試**
+- [ ] **Step 2: Write the failing test**
 
-建立 `internal/zonecache/zonecache_test.go`：
+Create `internal/zonecache/zonecache_test.go`:
 
 ```go
 package zonecache
@@ -68,7 +70,7 @@ import (
 
 var base = time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 
-// reply 建立一筆帶單一 A 記錄的回應，TTL 為 ttl 秒。
+// reply builds a response carrying a single A record with a TTL of ttl seconds.
 func reply(name string, ttl uint32, ip string) *dns.Msg {
 	m := new(dns.Msg)
 	m.SetQuestion(name, dns.TypeA)
@@ -79,7 +81,8 @@ func reply(name string, ttl uint32, ip string) *dns.Msg {
 	return m
 }
 
-// TestZoneIsPartOfTheKey 是這個套件存在的理由：同名同型別、不同 zone 必須互不干擾。
+// TestZoneIsPartOfTheKey is this package's reason to exist: same name, same
+// type, different zone must not interfere.
 func TestZoneIsPartOfTheKey(t *testing.T) {
 	c, err := New(16)
 	if err != nil {
@@ -125,7 +128,7 @@ func TestNameIsCaseInsensitive(t *testing.T) {
 	}
 }
 
-// 過期的項目必須是 miss，不可回一個 TTL 為 0 或負數的答案。
+// An expired entry must be a miss, never an answer with a zero or negative TTL.
 func TestExpiredEntryIsAMiss(t *testing.T) {
 	c, _ := New(16)
 	c.Put("payments.example.com.", dns.TypeA, "zone-a", reply("payments.example.com.", 30, "10.96.0.7"), base)
@@ -138,7 +141,8 @@ func TestExpiredEntryIsAMiss(t *testing.T) {
 	}
 }
 
-// 回傳的 TTL 必須扣掉已經過的時間，否則下游會把答案留得比我們預期更久。
+// The returned TTL must have the elapsed time subtracted, or downstream keeps
+// the answer longer than intended.
 func TestTTLIsDecrementedByElapsedTime(t *testing.T) {
 	c, _ := New(16)
 	c.Put("payments.example.com.", dns.TypeA, "zone-a", reply("payments.example.com.", 30, "10.96.0.7"), base)
@@ -152,7 +156,8 @@ func TestTTLIsDecrementedByElapsedTime(t *testing.T) {
 	}
 }
 
-// 呼叫端拿到的必須是副本 —— 改動回傳值不可污染快取。
+// The caller must receive a copy — changing the returned value must not
+// contaminate the cache.
 func TestGetReturnsACopy(t *testing.T) {
 	c, _ := New(16)
 	c.Put("payments.example.com.", dns.TypeA, "zone-a", reply("payments.example.com.", 30, "10.96.0.7"), base)
@@ -170,7 +175,7 @@ func TestGetReturnsACopy(t *testing.T) {
 	}
 }
 
-// 沒有 answer 的回應（NODATA）也要能快取，但沒有 TTL 可循，因此不快取。
+// A response with no answers (NODATA) has no TTL to follow, so it is not cached.
 func TestReplyWithoutAnswersIsNotCached(t *testing.T) {
 	c, _ := New(16)
 	m := new(dns.Msg)
@@ -185,7 +190,7 @@ func TestReplyWithoutAnswersIsNotCached(t *testing.T) {
 	}
 }
 
-// TTL 取 answer 中最小的一個。
+// The TTL is the smallest one among the answers.
 func TestExpiryUsesMinimumTTL(t *testing.T) {
 	c, _ := New(16)
 	m := reply("payments.example.com.", 30, "10.96.0.7")
@@ -217,22 +222,24 @@ func TestNewRejectsNonPositiveSize(t *testing.T) {
 }
 ```
 
-- [ ] **Step 3: 執行測試確認失敗**
+- [ ] **Step 3: Run the test and confirm it fails**
 
 Run: `go test ./internal/zonecache/ -v`
 Expected: FAIL — `undefined: New`
 
-- [ ] **Step 4: 寫最小實作**
+- [ ] **Step 4: Write the minimal implementation**
 
-建立 `internal/zonecache/zonecache.go`：
+Create `internal/zonecache/zonecache.go`:
 
 ```go
-// Package zonecache 是節點端的 DNS 答案快取，以 zone 作為 key 的一部分。
+// Package zonecache is the node-side DNS answer cache, keyed in part by zone.
 //
-// 為什麼不能用 CoreDNS 內建的 cache plugin：它的 key 是 (qname, qtype)，不含發問者
-// 的 zone。同一個名字對不同 zone 的 client 有不同的正確答案（同 zone 回服務位址、
-// 跨 zone 回 gateway VIP），所以 zone-盲的快取會把某個 zone 的答案回給另一個 zone
-// 的 pod —— 而且回得像模像樣，不會有任何錯誤。
+// Why CoreDNS's built-in cache plugin will not do: its key is (qname, qtype) and
+// does not include the asking workload's zone. One name has different correct
+// answers for clients in different zones — the service address within a zone,
+// the gateway VIP across zones — so a zone-blind cache hands one zone's answer
+// to a pod in another. And it hands it over convincingly, with no error at
+// all.
 package zonecache
 
 import (
@@ -245,7 +252,7 @@ import (
 	"github.com/miekg/dns"
 )
 
-// Cache 是有大小上限的 zone-aware 答案快取，可安全併發使用。
+// Cache is a size-bounded, zone-aware answer cache, safe for concurrent use.
 type Cache struct {
 	mu sync.Mutex
 	l  *lru.Cache[key, entry]
@@ -262,7 +269,7 @@ type entry struct {
 	expiry time.Time
 }
 
-// New 建立可容納 maxEntries 筆的快取。
+// New builds a cache holding up to maxEntries entries.
 func New(maxEntries int) (*Cache, error) {
 	if maxEntries <= 0 {
 		return nil, errors.New("zonecache: maxEntries must be positive")
@@ -274,16 +281,19 @@ func New(maxEntries int) (*Cache, error) {
 	return &Cache{l: l}, nil
 }
 
-// makeKey 正規化 qname —— DNS 名稱大小寫不敏感，不正規化會讓同一個名字的不同寫法
-// 各佔一個快取項目，並在下游看來像是快取失效。
+// makeKey normalises qname. DNS names are case-insensitive, and without
+// normalisation each spelling of one name would occupy its own entry, looking
+// downstream like a cache that keeps missing.
 func makeKey(qname string, qtype uint16, zone string) key {
 	return key{qname: strings.ToLower(qname), qtype: qtype, zone: zone}
 }
 
-// Put 收下一筆答案。
+// Put takes in one answer.
 //
-// 沒有 answer 的回應不快取：它沒有可依循的 TTL，而拿 SOA 的 minimum 做否定快取是
-// 另一個決策，不在本套件範圍內。存起來的是副本，呼叫端之後改動原訊息不影響快取。
+// A response with no answers is not cached: there is no TTL to follow, and
+// negative caching off the SOA minimum is a separate decision outside this
+// package's scope. What is stored is a copy, so later changes by the caller to
+// the original message do not reach the cache.
 func (c *Cache) Put(qname string, qtype uint16, zone string, m *dns.Msg, now time.Time) {
 	if m == nil || len(m.Answer) == 0 {
 		return
@@ -307,10 +317,12 @@ func (c *Cache) Put(qname string, qtype uint16, zone string, m *dns.Msg, now tim
 	})
 }
 
-// Get 取出未過期的答案，並把每筆記錄的 TTL 扣掉已經過的時間。
+// Get returns an answer that has not expired, with the elapsed time subtracted
+// from every record's TTL.
 //
-// 扣 TTL 不是修飾：若照原值回傳，下游 resolver 會從收到的那一刻重新計時，答案實際
-// 存活的時間就會比我們設定的長。
+// Subtracting is not cosmetic: returned at their original values, a downstream
+// resolver would restart the clock the moment it received them, and the answer
+// would live longer than intended.
 func (c *Cache) Get(qname string, qtype uint16, zone string, now time.Time) (*dns.Msg, bool) {
 	c.mu.Lock()
 	e, ok := c.l.Get(makeKey(qname, qtype, zone))
@@ -340,7 +352,7 @@ func (c *Cache) Get(qname string, qtype uint16, zone string, now time.Time) (*dn
 	return out, true
 }
 
-// Len 回傳目前的項目數。
+// Len returns the current entry count.
 func (c *Cache) Len() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -348,7 +360,7 @@ func (c *Cache) Len() int {
 }
 ```
 
-- [ ] **Step 5: 執行測試確認通過**
+- [ ] **Step 5: Run the test and confirm it passes**
 
 Run: `go test ./internal/zonecache/ -race -v`
 Expected: PASS
@@ -362,7 +374,7 @@ git commit -m "feat(zonecache): add zone-aware answer cache for the node-local a
 
 ---
 
-### Task 2: `dohupstream` — 釘住 central 身分的 mTLS DoH client
+### Task 2: `dohupstream` — an mTLS DoH client pinning central's identity
 
 **Files:**
 - Create: `internal/dohupstream/dohupstream.go`
@@ -370,26 +382,27 @@ git commit -m "feat(zonecache): add zone-aware answer cache for the node-local a
 - Modify: `go.mod`
 
 **Interfaces:**
-- Consumes: 無
+- Consumes: nothing
 - Produces:
-  - `dohupstream.Client` 型別
+  - the `dohupstream.Client` type
   - `dohupstream.NewWithHTTPClient(url string, hc *http.Client) *Client`
   - `dohupstream.NewMTLS(ctx context.Context, cfg Config) (*Client, func(), error)`
-  - `dohupstream.Config` 結構（欄位 `URL`、`WorkloadAPIAddr`、`CentralSPIFFEID`、`DialTimeout`）
+  - the `dohupstream.Config` struct, with fields `URL`, `WorkloadAPIAddr`, `CentralSPIFFEID` and `DialTimeout`
   - `(*Client).Exchange(ctx context.Context, m *dns.Msg) (*dns.Msg, error)`
 
-- [ ] **Step 1: 加入 go-spiffe 相依**
+- [ ] **Step 1: Add the go-spiffe dependency**
 
 ```bash
 go get github.com/spiffe/go-spiffe/v2@latest
 go mod tidy
 ```
 
-（子專案 1 已加入過，此步驟通常是 no-op；仍執行以確保。）
+(Subproject 1 already added it, so this is normally a no-op; run it anyway to be
+sure.)
 
-- [ ] **Step 2: 寫失敗的測試**
+- [ ] **Step 2: Write the failing test**
 
-建立 `internal/dohupstream/dohupstream_test.go`：
+Create `internal/dohupstream/dohupstream_test.go`:
 
 ```go
 package dohupstream
@@ -411,7 +424,8 @@ func query() *dns.Msg {
 	return m
 }
 
-// echoServer 回一筆固定答案，並把收到的查詢交給 inspect。
+// echoServer returns one fixed answer and hands the query it received to
+// inspect.
 func echoServer(t *testing.T, inspect func(*dns.Msg)) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -453,7 +467,8 @@ func TestExchange(t *testing.T) {
 	}
 }
 
-// 上游看到的查詢必須保留原本的問題與 EDNS0 內容。
+// The query upstream sees must preserve the original question and EDNS0
+// contents.
 func TestExchangePreservesTheQuery(t *testing.T) {
 	var seen *dns.Msg
 	srv := echoServer(t, func(m *dns.Msg) { seen = m })
@@ -476,7 +491,8 @@ func TestExchangePreservesTheQuery(t *testing.T) {
 	}
 }
 
-// 回應的 ID 必須對得回原查詢 —— RFC 8484 要求送出時 ID 為 0，還原是我們的責任。
+// The response ID must match the original query — RFC 8484 requires an ID of 0
+// on the wire, and restoring it is our responsibility.
 func TestExchangeRestoresMessageID(t *testing.T) {
 	srv := echoServer(t, nil)
 	defer srv.Close()
@@ -520,7 +536,8 @@ func TestExchangeHonoursContextCancellation(t *testing.T) {
 	}
 }
 
-// 缺少 central SPIFFE ID 必須在建立時就失敗，不可退回成只驗憑證鏈。
+// A missing central SPIFFE ID must fail at construction, never fall back to
+// verifying the chain alone.
 func TestNewMTLSRequiresCentralSPIFFEID(t *testing.T) {
 	_, _, err := NewMTLS(context.Background(), Config{
 		URL:             "https://central/dns-query",
@@ -535,22 +552,24 @@ func TestNewMTLSRequiresCentralSPIFFEID(t *testing.T) {
 }
 ```
 
-- [ ] **Step 3: 執行測試確認失敗**
+- [ ] **Step 3: Run the test and confirm it fails**
 
 Run: `go test ./internal/dohupstream/ -v`
 Expected: FAIL — `undefined: NewWithHTTPClient`
 
-- [ ] **Step 4: 寫最小實作**
+- [ ] **Step 4: Write the minimal implementation**
 
-建立 `internal/dohupstream/dohupstream.go`：
+Create `internal/dohupstream/dohupstream.go`:
 
 ```go
-// Package dohupstream 是 agent 對 central 的 DoH client。
+// Package dohupstream is the agent's DoH client for talking to central.
 //
-// 傳輸為 DoH over mTLS：agent 以自己的 SVID 出示身分，並且**必須**以 SPIFFE ID
-// 釘住 central。只驗證憑證鏈是不夠的 —— 信任域內任何一張 SVID 都能冒充 central，
-// 而偽造的 central 可以回傳任意答案（例如宣稱某個同 zone 服務是跨 zone 的，並給出
-// 攻擊者控制的位址），agent 對答案沒有獨立查核手段。見 spec §7.5。
+// The transport is DoH over mTLS: the agent presents its own SVID and MUST pin
+// central by SPIFFE ID. Verifying the certificate chain alone is not enough —
+// any SVID in the trust domain could impersonate central, and a forged central
+// can return whatever it likes (claiming a same-zone service is cross-zone and
+// handing back an attacker-controlled address, say), with no independent way for
+// the agent to check the answer. See spec §7.5.
 package dohupstream
 
 import (
@@ -567,13 +586,14 @@ import (
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
 )
 
-// defaultDialTimeout 限制取得第一份 SVID 的等待時間。
+// defaultDialTimeout bounds the wait for the first SVID.
 //
-// workloadapi.NewX509Source 會一直阻塞到 Workload API 首次回應為止，所以沒有這個
-// 上限時，SPIRE agent 尚未就緒會讓 CoreDNS 的設定解析整個卡住，沒有逾時也沒有日誌。
+// workloadapi.NewX509Source blocks until the Workload API first responds, so
+// without this bound a SPIRE agent that is not yet ready would stall CoreDNS's
+// whole configuration parse, with neither a timeout nor a log line.
 const defaultDialTimeout = 10 * time.Second
 
-// Config 是建立 mTLS client 所需的設定。
+// Config is what building an mTLS client requires.
 type Config struct {
 	URL             string
 	WorkloadAPIAddr string
@@ -581,21 +601,21 @@ type Config struct {
 	DialTimeout     time.Duration
 }
 
-// Client 對 central 發送 DoH 查詢。
+// Client sends DoH queries to central.
 type Client struct {
 	url string
 	hc  *http.Client
 }
 
-// NewWithHTTPClient 以既有的 http.Client 建立 Client。測試用，也讓傳輸層的設定
-// 與 DNS 邏輯分離。
+// NewWithHTTPClient builds a Client over an existing http.Client. For tests, and
+// to keep transport configuration separate from DNS logic.
 func NewWithHTTPClient(url string, hc *http.Client) *Client {
 	return &Client{url: url, hc: hc}
 }
 
-// NewMTLS 建立以 SPIFFE 身分互相驗證的 Client。
+// NewMTLS builds a Client that authenticates both ways by SPIFFE identity.
 //
-// 回傳的 cleanup 必須在關閉時呼叫，以釋放 X509Source。
+// The returned cleanup must be called on shutdown to release the X509Source.
 func NewMTLS(ctx context.Context, cfg Config) (*Client, func(), error) {
 	if cfg.CentralSPIFFEID == "" {
 		return nil, nil, errors.New("dohupstream: central_spiffe_id is required; " +
@@ -620,17 +640,18 @@ func NewMTLS(ctx context.Context, cfg Config) (*Client, func(), error) {
 			cfg.WorkloadAPIAddr, timeout, err)
 	}
 
-	// 憑證取自 X509Source 而非靜態檔案，SVID 輪替才不需要重新載入設定。
+	// Certificates come from the X509Source rather than static files, so SVID
+	// rotation needs no configuration reload.
 	tlsCfg := tlsconfig.MTLSClientConfig(source, source, tlsconfig.AuthorizeID(id))
 	hc := &http.Client{Transport: &http.Transport{TLSClientConfig: tlsCfg}}
 
 	return &Client{url: cfg.URL, hc: hc}, func() { source.Close() }, nil
 }
 
-// Exchange 送出查詢並回傳答案。
+// Exchange sends a query and returns the answer.
 func (c *Client) Exchange(ctx context.Context, m *dns.Msg) (*dns.Msg, error) {
-	// RFC 8484 要求 DoH 查詢的 DNS ID 為 0；回應的 ID 由我們還原，否則呼叫端無法
-	// 把答案對回原查詢。
+	// RFC 8484 requires the DNS ID of a DoH query to be 0. We restore the ID on the
+	// response, or the caller cannot match the answer back to its query.
 	originalID := m.Id
 	outbound := m.Copy()
 	outbound.Id = 0
@@ -649,7 +670,7 @@ func (c *Client) Exchange(ctx context.Context, m *dns.Msg) (*dns.Msg, error) {
 		return nil, fmt.Errorf("dohupstream: upstream returned HTTP %d", resp.StatusCode)
 	}
 
-	// ResponseToMsg 會關閉 body。
+	// ResponseToMsg closes the body.
 	answer, err := doh.ResponseToMsg(resp)
 	if err != nil {
 		return nil, fmt.Errorf("dohupstream: decode response: %w", err)
@@ -659,7 +680,7 @@ func (c *Client) Exchange(ctx context.Context, m *dns.Msg) (*dns.Msg, error) {
 }
 ```
 
-- [ ] **Step 5: 執行測試確認通過**
+- [ ] **Step 5: Run the test and confirm it passes**
 
 Run: `go test ./internal/dohupstream/ -race -v`
 Expected: PASS
@@ -673,36 +694,37 @@ git commit -m "feat(dohupstream): add mTLS DoH client pinned to central's SPIFFE
 
 ---
 
-### Task 3: `podzone` — 本機 pod IP 到 zone
+### Task 3: `podzone` — local pod IP to zone
 
 **Files:**
 - Create: `internal/podzone/podzone.go`
 - Test: `internal/podzone/podzone_test.go`
-- Modify: `go.mod`（加入 `k8s.io/client-go`、`k8s.io/api`、`k8s.io/apimachinery`）
+- Modify: `go.mod` — add `k8s.io/client-go`, `k8s.io/api`, `k8s.io/apimachinery`
 
 **Interfaces:**
-- Consumes: 無
+- Consumes: nothing
 - Produces:
-  - `podzone.Watcher` 型別
+  - the `podzone.Watcher` type
   - `podzone.New(client kubernetes.Interface, nodeName, zoneLabel string) *Watcher`
   - `(*Watcher).Run(ctx context.Context) error`
   - `(*Watcher).Zone(ip netip.Addr) (string, bool)`
   - `(*Watcher).Ready() bool`
   - `(*Watcher).Len() int`
 
-- [ ] **Step 1: 加入 k8s 相依**
+- [ ] **Step 1: Add the Kubernetes dependencies**
 
 ```bash
 go get k8s.io/client-go@latest k8s.io/api@latest k8s.io/apimachinery@latest
 go mod tidy
 ```
 
-這是自建 node-local DNS image 上一筆實在的體積成本 —— 上游的 `sigs.k8s.io/node-local-dns`
-只相依 `apimachinery`，不含 `client-go`。這件事要寫進部署文件（Task 6）。
+This is a real size cost on the self-built node-local DNS image — upstream
+`sigs.k8s.io/node-local-dns` depends only on `apimachinery`, not `client-go`.
+It must be written into the deployment doc (Task 6).
 
-- [ ] **Step 2: 寫失敗的測試**
+- [ ] **Step 2: Write the failing test**
 
-建立 `internal/podzone/podzone_test.go`：
+Create `internal/podzone/podzone_test.go`:
 
 ```go
 package podzone
@@ -736,7 +758,7 @@ func pod(name, ip, zone string, hostNetwork bool) *corev1.Pod {
 	}
 }
 
-// start 啟動 watcher 並等到就緒，回傳停止函式。
+// start runs the watcher, waits until it is ready, and returns a stop function.
 func start(t *testing.T, pods ...*corev1.Pod) (*Watcher, func()) {
 	t.Helper()
 
@@ -784,8 +806,9 @@ func TestUnknownIP(t *testing.T) {
 	}
 }
 
-// hostNetwork pod 共用節點 IP，無法分辨彼此，因此絕不可進表 —— 否則節點 IP 會
-// 對應到某一個 hostNetwork pod 的 zone，而那個對應是任意的。
+// hostNetwork pods share the node IP and cannot be told apart, so they must
+// never enter the table — otherwise the node IP would map to one hostNetwork
+// pod's zone, and which one is arbitrary.
 func TestHostNetworkPodIsNotIndexed(t *testing.T) {
 	w, stop := start(t,
 		pod("payments-abc", "10.1.0.5", "zone-a", false),
@@ -822,7 +845,8 @@ func TestPodWithoutIPIsNotIndexed(t *testing.T) {
 	}
 }
 
-// 刪除必須立刻讓映射失效。IP 會被回收給新的 pod，沿用舊值會回答錯誤的 zone。
+// Deletion must invalidate the mapping at once. IPs are recycled to new pods,
+// and keeping the old value answers with the wrong zone.
 func TestDeleteRemovesTheMapping(t *testing.T) {
 	p := pod("payments-abc", "10.1.0.5", "zone-a", false)
 	client := fake.NewSimpleClientset(p)
@@ -856,7 +880,8 @@ func TestDeleteRemovesTheMapping(t *testing.T) {
 	}
 }
 
-// 尚未就緒時一律回 false —— 「還不知道」與「查得到但不在表裡」是不同的答案。
+// Before it is ready it always returns false — "not known yet" and "resolvable
+// but absent from the table" are different answers.
 func TestNotReadyResolvesNothing(t *testing.T) {
 	w := New(fake.NewSimpleClientset(), nodeName, zoneLabel)
 	if w.Ready() {
@@ -868,21 +893,23 @@ func TestNotReadyResolvesNothing(t *testing.T) {
 }
 ```
 
-- [ ] **Step 3: 執行測試確認失敗**
+- [ ] **Step 3: Run the test and confirm it fails**
 
 Run: `go test ./internal/podzone/ -v`
 Expected: FAIL — `undefined: New`
 
-- [ ] **Step 4: 寫最小實作**
+- [ ] **Step 4: Write the minimal implementation**
 
-建立 `internal/podzone/podzone.go`：
+Create `internal/podzone/podzone.go`:
 
 ```go
-// Package podzone 維護本機節點上 pod IP 到 zone 的對照。
+// Package podzone maintains the pod IP to zone mapping for the local node.
 //
-// 資料來自 Kubernetes API，以 spec.nodeName 過濾成只看本節點的 pod —— 數十筆，
-// 不是全 cluster 的 watch。讀到的 zone label 正是產生該 pod SPIFFE ID 所用的同一個
-// 值，因此節點端算出的 zone 與 central 從 registry 查到的 zone 由建構方式保證一致。
+// The data comes from the Kubernetes API, filtered by spec.nodeName to this
+// node's pods alone — a few dozen, not a cluster-wide watch. The zone label it
+// reads is the very value used to produce that pod's SPIFFE ID, so the zone the
+// node computes and the zone central looks up in the registry agree by
+// construction.
 package podzone
 
 import (
@@ -898,7 +925,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
-// Watcher 持有本機 pod 的 IP → zone 對照。
+// Watcher holds the IP to zone mapping for local pods.
 type Watcher struct {
 	client    kubernetes.Interface
 	nodeName  string
@@ -909,7 +936,7 @@ type Watcher struct {
 	ready bool
 }
 
-// New 建立尚未啟動的 Watcher。
+// New builds a Watcher that has not started yet.
 func New(client kubernetes.Interface, nodeName, zoneLabel string) *Watcher {
 	return &Watcher{
 		client:    client,
@@ -919,7 +946,7 @@ func New(client kubernetes.Interface, nodeName, zoneLabel string) *Watcher {
 	}
 }
 
-// Run 啟動 informer 並持續同步，直到 ctx 結束。
+// Run starts the informer and keeps it synced until ctx ends.
 func (w *Watcher) Run(ctx context.Context) error {
 	factory := informers.NewSharedInformerFactoryWithOptions(w.client, 0,
 		informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
@@ -946,21 +973,23 @@ func (w *Watcher) Run(ctx context.Context) error {
 
 	<-ctx.Done()
 
-	// informer 停止後，表上的內容就不再跟得上真實狀態。標回未就緒，讓查詢改走
-	// 不宣告 zone 的路徑，而不是繼續拿一份會愈來愈舊的對照回答。
+	// Once the informer stops, the table no longer tracks reality. Mark it
+	// not-ready so queries take the path that declares no zone, rather than keep
+	// answering from a mapping that only grows staler.
 	w.mu.Lock()
 	w.ready = false
 	w.mu.Unlock()
 	return nil
 }
 
-// upsert 收下一個 pod。
+// upsert takes in a pod.
 //
-// 三種 pod 刻意不進表：
-//   - hostNetwork：它的 IP 就是節點 IP，同節點上所有 hostNetwork pod 共用，
-//     分辨不出是誰，任何對應都是任意的
-//   - 沒有 zone label：不可對應到空字串 zone，那會被下游當成一個真的 zone
-//   - 還沒拿到 IP（Pending）：沒有可索引的鍵
+// Three kinds of pod are deliberately left out of the table:
+//   - hostNetwork: its IP is the node IP, shared by every hostNetwork pod on the
+//     node, so they cannot be told apart and any mapping would be arbitrary
+//   - no zone label: it must not map to the empty-string zone, which downstream
+//     would treat as a real zone
+//   - no IP yet (Pending): there is no key to index by
 func (w *Watcher) upsert(obj any) {
 	pod, ok := obj.(*corev1.Pod)
 	if !ok || pod.Spec.HostNetwork || pod.Status.PodIP == "" {
@@ -980,14 +1009,15 @@ func (w *Watcher) upsert(obj any) {
 	w.mu.Unlock()
 }
 
-// remove 移除一個 pod 的對照。
+// remove drops a pod's mapping.
 //
-// 立即移除是必要的：pod IP 會被回收給新的 pod，沿用舊值會讓新 pod 拿到前一個
-// 租用者的 zone —— 而那個答案看起來完全正常。
+// Removing immediately is necessary: pod IPs are recycled to new pods, and
+// keeping the old value would give the new pod the previous tenant's zone — an
+// answer that looks entirely normal.
 func (w *Watcher) remove(obj any) {
 	pod, ok := obj.(*corev1.Pod)
 	if !ok {
-		// informer 在 relist 時可能給出 DeletedFinalStateUnknown。
+		// On a relist the informer may hand over a DeletedFinalStateUnknown.
 		tombstone, isTombstone := obj.(cache.DeletedFinalStateUnknown)
 		if !isTombstone {
 			return
@@ -1010,10 +1040,10 @@ func (w *Watcher) remove(obj any) {
 	w.mu.Unlock()
 }
 
-// Zone 查出該 IP 所屬的 zone。
+// Zone finds the zone an IP belongs to.
 //
-// 尚未就緒時一律回 false：啟動期間的查詢會走非 zone-aware 路徑，而不是猜一個
-// 可能錯誤的 zone。
+// Before the watcher is ready it always returns false: queries during startup
+// take the non-zone-aware path rather than guess a zone that could be wrong.
 func (w *Watcher) Zone(ip netip.Addr) (string, bool) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
@@ -1024,14 +1054,14 @@ func (w *Watcher) Zone(ip netip.Addr) (string, bool) {
 	return zone, ok
 }
 
-// Ready 回報 informer 是否已完成首次同步。
+// Ready reports whether the informer has completed its first sync.
 func (w *Watcher) Ready() bool {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	return w.ready
 }
 
-// Len 回傳目前索引的 pod 數。
+// Len returns the number of pods currently indexed.
 func (w *Watcher) Len() int {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
@@ -1039,7 +1069,7 @@ func (w *Watcher) Len() int {
 }
 ```
 
-- [ ] **Step 5: 執行測試確認通過**
+- [ ] **Step 5: Run the test and confirm it passes**
 
 Run: `go test ./internal/podzone/ -race -v`
 Expected: PASS
@@ -1053,7 +1083,7 @@ git commit -m "feat(podzone): index local pod IPs to zones via a node-scoped inf
 
 ---
 
-### Task 4: plugin 的查詢路徑
+### Task 4: the plugin's query path
 
 **Files:**
 - Create: `plugin/zonedns_agent/agent.go`
@@ -1062,18 +1092,18 @@ git commit -m "feat(podzone): index local pod IPs to zones via a node-scoped inf
 - Test: `plugin/zonedns_agent/agent_test.go`
 
 **Interfaces:**
-- Consumes: `zonecache.Cache`、`dohupstream.Client`、`ednszone.Set`、`ednszone.DefaultCode`
+- Consumes: `zonecache.Cache`, `dohupstream.Client`, `ednszone.Set`, `ednszone.DefaultCode`
 - Produces:
-  - `zonedns_agent.ZoneResolver` 介面（方法 `Zone(netip.Addr) (string, bool)`）
-  - `zonedns_agent.StaticResolver` 型別與 `NewStaticResolver(zone string) StaticResolver`
-  - `zonedns_agent.Upstream` 介面（方法 `Exchange(context.Context, *dns.Msg) (*dns.Msg, error)`）
-  - `zonedns_agent.Agent` 結構（欄位 `Next`、`Resolver`、`Cache`、`Upstream`、`EDNS0Code`、`NodeIP`）
+  - the `zonedns_agent.ZoneResolver` interface, with the method `Zone(netip.Addr) (string, bool)`
+  - the `zonedns_agent.StaticResolver` type and `NewStaticResolver(zone string) StaticResolver`
+  - the `zonedns_agent.Upstream` interface, with the method `Exchange(context.Context, *dns.Msg) (*dns.Msg, error)`
+  - the `zonedns_agent.Agent` struct, with fields `Next`, `Resolver`, `Cache`, `Upstream`, `EDNS0Code` and `NodeIP`
   - `(Agent).Name() string`
   - `(Agent).ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error)`
 
-- [ ] **Step 1: 寫失敗的測試**
+- [ ] **Step 1: Write the failing test**
 
-建立 `plugin/zonedns_agent/agent_test.go`：
+Create `plugin/zonedns_agent/agent_test.go`:
 
 ```go
 package zonedns_agent
@@ -1093,7 +1123,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
-// fakeUpstream 記錄它收到的查詢並回一筆固定答案。
+// fakeUpstream records the query it received and returns one fixed answer.
 type fakeUpstream struct {
 	seen  []*dns.Msg
 	err   error
@@ -1112,7 +1142,7 @@ func (f *fakeUpstream) Exchange(_ context.Context, m *dns.Msg) (*dns.Msg, error)
 	return resp, nil
 }
 
-// writerFrom 建立一個 source IP 為 ip 的 ResponseWriter。
+// writerFrom builds a ResponseWriter whose source IP is ip.
 func writerFrom(ip string) *dnstest.Recorder {
 	w := &test.ResponseWriter{}
 	w.RemoteIP = ip
@@ -1141,7 +1171,7 @@ func queryFor(name string) *dns.Msg {
 	return m
 }
 
-// mapResolver 是最小的 ZoneResolver 測試替身。
+// mapResolver is the smallest possible ZoneResolver test double.
 type mapResolver map[string]string
 
 func (m mapResolver) Zone(ip netip.Addr) (string, bool) {
@@ -1173,7 +1203,8 @@ func TestServeDNSDeclaresTheSourceZone(t *testing.T) {
 	}
 }
 
-// 認不出來源時仍要轉發，但不可宣告任何 zone —— 猜一個 zone 比不宣告危險得多。
+// An unrecognised source is still forwarded, but must declare no zone — guessing
+// one is far more dangerous than declaring none.
 func TestServeDNSUnknownSourceDeclaresNothing(t *testing.T) {
 	up := &fakeUpstream{}
 	a := newAgent(t, mapResolver{}, up)
@@ -1189,7 +1220,8 @@ func TestServeDNSUnknownSourceDeclaresNothing(t *testing.T) {
 	}
 }
 
-// 這是本套件存在的理由：同名查詢、不同 zone，不可共用快取。
+// This package's reason to exist: queries for the same name from different zones
+// must not share a cache entry.
 func TestCacheIsKeyedByZone(t *testing.T) {
 	up := &fakeUpstream{}
 	a := newAgent(t, mapResolver{"10.1.0.5": "zone-a", "10.1.0.9": "zone-b"}, up)
@@ -1219,8 +1251,9 @@ func TestCacheHitAvoidsUpstream(t *testing.T) {
 	}
 }
 
-// 上游失敗必須是 SERVFAIL，不可交給下一個 plugin —— 那會繞過 zone 路由並回一個
-// 看起來正常的直連位址。
+// An upstream failure must be SERVFAIL and must not fall through to the next
+// plugin — that would bypass zone routing and return a direct address that looks
+// perfectly normal.
 func TestUpstreamErrorIsServfail(t *testing.T) {
 	up := &fakeUpstream{err: errors.New("central unreachable")}
 	a := newAgent(t, mapResolver{"10.1.0.5": "zone-a"}, up)
@@ -1234,7 +1267,8 @@ func TestUpstreamErrorIsServfail(t *testing.T) {
 	}
 }
 
-// source IP 等於節點 IP 是 masquerade 的徵兆，必須可觀測。
+// A source IP equal to the node IP is a sign of masquerading, and must be
+// observable.
 func TestNodeIPSourceIsCounted(t *testing.T) {
 	up := &fakeUpstream{}
 	a := newAgent(t, mapResolver{}, up)
@@ -1254,7 +1288,7 @@ func TestStaticResolver(t *testing.T) {
 	if !ok || zone != "zone-c" {
 		t.Fatalf("got (%q,%v), want (zone-c,true)", zone, ok)
 	}
-	// VM 模式下 zone 與來源無關。
+	// Under VM mode the zone is independent of the source.
 	zone, ok = r.Zone(netip.MustParseAddr("172.16.0.1"))
 	if !ok || zone != "zone-c" {
 		t.Fatalf("got (%q,%v), want (zone-c,true)", zone, ok)
@@ -1267,42 +1301,46 @@ func readCounter(t *testing.T, vec *prometheus.CounterVec, label string) float64
 }
 ```
 
-- [ ] **Step 2: 執行測試確認失敗**
+- [ ] **Step 2: Run the test and confirm it fails**
 
 Run: `go test ./plugin/zonedns_agent/ -v`
 Expected: FAIL — `undefined: Agent`
 
-- [ ] **Step 3: 寫 resolver**
+- [ ] **Step 3: Write the resolver**
 
-建立 `plugin/zonedns_agent/resolver.go`：
+Create `plugin/zonedns_agent/resolver.go`:
 
 ```go
 package zonedns_agent
 
 import "net/netip"
 
-// ZoneResolver 從查詢的來源位址判定發問 workload 的 zone。
+// ZoneResolver determines the asking workload's zone from a query's source
+// address.
 //
-// 抽成介面是因為 k8s 與 VM 兩種部署的判定方式本質不同：k8s 上每個 pod 有自己的 IP
-// 且同節點可混多個 zone，所以要逐查詢判斷；VM 上整台機器屬於同一個 zone，開機時
-// 決定一次即可。
+// It is an interface because the two deployments determine it in fundamentally
+// different ways: on Kubernetes every pod has its own IP and one node can mix
+// several zones, so each query must be judged on its own; on a VM the whole
+// machine belongs to one zone, settled once at startup.
 type ZoneResolver interface {
-	// Zone 回傳該來源位址所屬的 zone。認不出來時回 ok=false —— 呼叫端必須把它
-	// 當成「不宣告 zone」，而不是猜一個。
+	// Zone returns the zone a source address belongs to. An unrecognised source
+	// returns ok=false, and the caller must take that as "declare no zone" rather
+	// than guess one.
 	Zone(src netip.Addr) (zone string, ok bool)
 }
 
-// StaticResolver 是 VM 模式的解析器：整台機器一個 zone，與來源位址無關。
+// StaticResolver is the VM-mode resolver: one zone for the whole machine,
+// independent of the source address.
 type StaticResolver struct {
 	zone string
 }
 
-// NewStaticResolver 建立固定回傳 zone 的解析器。
+// NewStaticResolver builds a resolver that always returns zone.
 func NewStaticResolver(zone string) StaticResolver {
 	return StaticResolver{zone: zone}
 }
 
-// Zone 實作 ZoneResolver。
+// Zone implements ZoneResolver.
 func (s StaticResolver) Zone(netip.Addr) (string, bool) {
 	if s.zone == "" {
 		return "", false
@@ -1311,9 +1349,9 @@ func (s StaticResolver) Zone(netip.Addr) (string, bool) {
 }
 ```
 
-- [ ] **Step 4: 寫 metrics**
+- [ ] **Step 4: Write the metrics**
 
-建立 `plugin/zonedns_agent/metrics.go`：
+Create `plugin/zonedns_agent/metrics.go`:
 
 ```go
 package zonedns_agent
@@ -1325,12 +1363,13 @@ import (
 )
 
 var (
-	// zoneResolutionTotal 依判定結果分類。
+	// zoneResolutionTotal is broken down by outcome.
 	//
-	// result="node_ip" 是最重要的一個：它表示查詢的 source IP 就是節點自己的 IP。
-	// 正常情況下 pod 的查詢帶著 pod IP 抵達（node-local DNS 走 link-local 位址，
-	// 不經 DNAT），所以這個數字跳升代表節點上有東西在做 SNAT/masquerade，而那會
-	// 讓整個節點退化成單一 zone —— 靜默地。
+	// result="node_ip" is the one that matters most: it means a query's source IP
+	// was the node's own. Normally a pod's query arrives carrying the pod IP —
+	// node-local DNS uses a link-local address and no DNAT — so a jump in this
+	// number means something on the node is doing SNAT or masquerading, which
+	// collapses the whole node into a single zone. Silently.
 	zoneResolutionTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: plugin.Namespace,
 		Subsystem: "zonedns_agent",
@@ -1338,7 +1377,7 @@ var (
 		Help:      "Count of source zone resolution attempts by outcome.",
 	}, []string{"result"})
 
-	// cacheTotal 區分命中與未命中。
+	// cacheTotal separates hits from misses.
 	cacheTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: plugin.Namespace,
 		Subsystem: "zonedns_agent",
@@ -1346,7 +1385,7 @@ var (
 		Help:      "Count of zone-aware cache lookups by outcome.",
 	}, []string{"result"})
 
-	// upstreamErrorsTotal 記錄對 central 的查詢失敗次數。
+	// upstreamErrorsTotal counts failed queries to central.
 	upstreamErrorsTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: plugin.Namespace,
 		Subsystem: "zonedns_agent",
@@ -1354,7 +1393,7 @@ var (
 		Help:      "Count of failed DoH exchanges with the central server.",
 	})
 
-	// resolverReady 為 0 時所有查詢都不宣告 zone。
+	// While resolverReady is 0, no query declares a zone.
 	resolverReady = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: plugin.Namespace,
 		Subsystem: "zonedns_agent",
@@ -1364,16 +1403,17 @@ var (
 )
 ```
 
-- [ ] **Step 5: 寫 ServeDNS**
+- [ ] **Step 5: Write ServeDNS**
 
-建立 `plugin/zonedns_agent/agent.go`：
+Create `plugin/zonedns_agent/agent.go`:
 
 ```go
-// Package zonedns_agent 是 zone-based DNS 的節點端 CoreDNS plugin。
+// Package zonedns_agent is the node-side CoreDNS plugin for zone-based DNS.
 //
-// 它判定發問 workload 的 zone，以該 zone 為快取 key 的一部分，並在向 central 查詢
-// 時把 zone 宣告在 EDNS0 option 裡。它只負責參與 zone 路由的網域（由 Corefile 的
-// server block 界定），其餘查詢完全不經過它。
+// It determines the asking workload's zone, makes that zone part of the cache
+// key, and declares it in an EDNS0 option when querying central. It handles only
+// the domains that take part in zone routing, as delimited by the Corefile's
+// server block; every other query bypasses it entirely.
 package zonedns_agent
 
 import (
@@ -1391,15 +1431,15 @@ import (
 
 var log = clog.NewWithPlugin("zonedns_agent")
 
-// timeNow 讓快取的過期判斷可在測試中控制。
+// timeNow lets tests control how cache expiry is judged.
 var timeNow = time.Now
 
-// Upstream 對 central 發送查詢。
+// Upstream sends queries to central.
 type Upstream interface {
 	Exchange(ctx context.Context, m *dns.Msg) (*dns.Msg, error)
 }
 
-// Agent 是 plugin 的處理器。
+// Agent is the plugin's handler.
 type Agent struct {
 	Next      plugin.Handler
 	Resolver  ZoneResolver
@@ -1407,15 +1447,15 @@ type Agent struct {
 	Upstream  Upstream
 	EDNS0Code uint16
 
-	// NodeIP 是本機節點的位址，只用於偵測 masquerade。查詢的 source IP 等於它，
-	// 代表 pod IP 在途中被改寫了。
+	// NodeIP is this node's own address, used only to detect masquerading. A query
+	// whose source IP equals it had its pod IP rewritten along the way.
 	NodeIP netip.Addr
 }
 
-// Name 實作 plugin.Handler。
+// Name implements plugin.Handler.
 func (a Agent) Name() string { return "zonedns_agent" }
 
-// ServeDNS 實作 plugin.Handler。
+// ServeDNS implements plugin.Handler.
 func (a Agent) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
 	state := request.Request{W: w, Req: r}
 
@@ -1453,11 +1493,14 @@ func (a Agent) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (
 	return dns.RcodeSuccess, nil
 }
 
-// resolveZone 判定來源的 zone 並記錄結果。
+// resolveZone determines the source's zone and records the outcome.
 //
-// 認不出來源時回 ok=false，呼叫端會照常轉發但不宣告 zone。這是刻意的：central 對
-// 沒有宣告的查詢會走非 zone-aware 路徑並回一般答案，而在 zone 之間網路隔離的前提
-// 下，那個答案要嘛可用、要嘛連不上 —— 都比猜錯 zone 把流量導向錯誤的 gateway 好。
+// An unrecognised source returns ok=false, and the caller forwards as usual
+// without declaring a zone. This is deliberate: central takes the non-zone-aware
+// path for an undeclared query and returns the ordinary answer, and given that
+// zones are network-isolated, that answer is either usable or unreachable —
+// either of which beats guessing the wrong zone and sending traffic to the wrong
+// gateway.
 func (a Agent) resolveZone(srcIP string) (string, bool) {
 	src, err := netip.ParseAddr(srcIP)
 	if err != nil {
@@ -1465,8 +1508,9 @@ func (a Agent) resolveZone(srcIP string) (string, bool) {
 		return "", false
 	}
 	if a.NodeIP.IsValid() && src == a.NodeIP {
-		// 節點上有東西在改寫 source IP，或這是一個 hostNetwork 的 workload。
-		// 兩種情況都無法分辨是哪個 workload 在問。
+		// Either something on the node is rewriting the source IP, or this is a
+		// hostNetwork workload. In neither case can we tell which workload is
+		// asking.
 		zoneResolutionTotal.WithLabelValues("node_ip").Inc()
 		return "", false
 	}
@@ -1481,7 +1525,7 @@ func (a Agent) resolveZone(srcIP string) (string, bool) {
 }
 ```
 
-- [ ] **Step 6: 執行測試確認通過**
+- [ ] **Step 6: Run the test and confirm it passes**
 
 ```bash
 go get github.com/prometheus/client_golang@latest
@@ -1500,20 +1544,20 @@ git commit -m "feat(zonedns_agent): resolve source zone, cache per zone, declare
 
 ---
 
-### Task 5: setup — Corefile 解析與模式選擇
+### Task 5: setup — parsing the Corefile and choosing the mode
 
 **Files:**
 - Create: `plugin/zonedns_agent/setup.go`
 - Test: `plugin/zonedns_agent/setup_test.go`
 
 **Interfaces:**
-- Consumes: Task 4 的全部型別、`podzone.New`、`dohupstream.NewMTLS`、`zonecache.New`
+- Consumes: every type from Task 4, plus `podzone.New`, `dohupstream.NewMTLS` and `zonecache.New`
 - Produces:
   - `zonedns_agent.CheckDirectiveOrder(directives []string) error`
 
-- [ ] **Step 1: 寫失敗的測試**
+- [ ] **Step 1: Write the failing test**
 
-建立 `plugin/zonedns_agent/setup_test.go`：
+Create `plugin/zonedns_agent/setup_test.go`:
 
 ```go
 package zonedns_agent
@@ -1531,8 +1575,8 @@ func TestCheckDirectiveOrder(t *testing.T) {
 	}
 }
 
-// 順序錯了必須是啟動失敗：cache 排在前面時，zone-盲的快取會把某個 zone 的答案
-// 回給另一個 zone 的 pod，而執行期看不出任何異狀。
+// A wrong order must fail startup: with cache first, a zone-blind cache hands one
+// zone's answer to a pod in another, and nothing looks amiss at runtime.
 func TestCheckDirectiveOrderRejectsCacheFirst(t *testing.T) {
 	err := CheckDirectiveOrder([]string{"cache", "zonedns_agent", "forward"})
 	if err == nil {
@@ -1599,8 +1643,8 @@ func TestParseK8sMode(t *testing.T) {
 	}
 }
 
-// central_spiffe_id 沒有安全的預設值：少了它就只剩憑證鏈驗證，信任域內任何一張
-// SVID 都能冒充 central。
+// central_spiffe_id has no safe default: without it only chain verification
+// remains, and any SVID in the trust domain could impersonate central.
 func TestParseRequiresCentralSPIFFEID(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns_agent {
 		mode vm
@@ -1692,14 +1736,14 @@ func TestParseRejectsMalformedCacheSize(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 執行測試確認失敗**
+- [ ] **Step 2: Run the test and confirm it fails**
 
 Run: `go test ./plugin/zonedns_agent/ -run 'TestCheck|TestParse' -v`
 Expected: FAIL — `undefined: CheckDirectiveOrder`
 
-- [ ] **Step 3: 寫實作**
+- [ ] **Step 3: Write the implementation**
 
-建立 `plugin/zonedns_agent/setup.go`：
+Create `plugin/zonedns_agent/setup.go`:
 
 ```go
 package zonedns_agent
@@ -1736,9 +1780,9 @@ func init() { plugin.Register("zonedns_agent", setup) }
 
 type config struct {
 	mode            mode
-	zone            string // vm 模式
-	nodeName        string // k8s 模式
-	zoneLabel       string // k8s 模式
+	zone            string // vm mode
+	nodeName        string // k8s mode
+	zoneLabel       string // k8s mode
 	upstreamURL     string
 	centralSPIFFEID string
 	workloadAPI     string
@@ -1747,12 +1791,13 @@ type config struct {
 	nodeIP          netip.Addr
 }
 
-// CheckDirectiveOrder 確認 zonedns_agent 排在 cache 之前。
+// CheckDirectiveOrder confirms that zonedns_agent sorts before cache.
 //
-// 這是正確性要求而非偏好：既有的 cache plugin 以 (qname, qtype) 為 key，不含發問者
-// 的 zone。若它排在前面，zone-a 的 pod 問過之後，zone-b 的 pod 會拿到同一份答案 ——
-// 而且拿得像模像樣，執行期沒有任何徵兆。順序由編譯期的 plugin.cfg 決定，所以這是
-// 建置設定的檢查。
+// This is a correctness requirement, not a preference: the existing cache plugin
+// keys on (qname, qtype) and does not include the asking workload's zone. If it
+// sorts first, then once a zone-a pod has asked, a zone-b pod receives that same
+// answer — convincingly, with no sign of it at runtime. The order comes from
+// plugin.cfg at compile time, making this a check on the build configuration.
 func CheckDirectiveOrder(directives []string) error {
 	agentAt, cacheAt := -1, -1
 	for i, d := range directives {
@@ -1953,8 +1998,9 @@ func parseConfig(c *caddy.Controller) (*config, error) {
 	if cfg.upstreamURL == "" {
 		return nil, c.Err("upstream is required")
 	}
-	// central_spiffe_id 沒有安全的預設值：少了它就只剩憑證鏈驗證，信任域內任何
-	// 一張 SVID 都能冒充 central 並回傳任意答案。
+	// central_spiffe_id has no safe default: without it only chain verification
+	// remains, and any SVID in the trust domain could impersonate central and return
+	// whatever it liked.
 	if cfg.centralSPIFFEID == "" {
 		return nil, c.Err("central_spiffe_id is required; without it any SVID in the trust domain could impersonate the central server")
 	}
@@ -1967,8 +2013,9 @@ func parseConfig(c *caddy.Controller) (*config, error) {
 		if cfg.zone == "" {
 			return nil, c.Err("vm mode requires zone")
 		}
-		// zone 名稱必須是線上格式承載得了的 —— 否則 central 會靜默忽略宣告，
-		// 這台 VM 的查詢會永遠拿到不分 zone 的答案。
+		// The zone name must be something the wire format can carry — otherwise
+		// central silently ignores the declaration and this VM's queries receive
+		// zone-blind answers forever.
 		if !ednszone.Valid(cfg.zone) {
 			return nil, c.Errf("zone %q is not a valid zone name (letters, digits, '-' and '_' only, at most %d bytes)",
 				cfg.zone, ednszone.MaxLen)
@@ -1983,7 +2030,7 @@ func parseConfig(c *caddy.Controller) (*config, error) {
 }
 ```
 
-- [ ] **Step 4: 執行測試確認通過**
+- [ ] **Step 4: Run the test and confirm it passes**
 
 Run: `go test ./plugin/zonedns_agent/ -race -v`
 Expected: PASS
@@ -1997,7 +2044,7 @@ git commit -m "feat(zonedns_agent): parse Corefile, select k8s or vm mode, enfor
 
 ---
 
-### Task 6: 端到端驗證與部署文件
+### Task 6: end-to-end verification and the deployment doc
 
 **Files:**
 - Create: `plugin/zonedns_agent/e2e_test.go`
@@ -2005,12 +2052,12 @@ git commit -m "feat(zonedns_agent): parse Corefile, select k8s or vm mode, enfor
 - Modify: `README.md`
 
 **Interfaces:**
-- Consumes: 全部前述套件
-- Produces: 無新的程式介面
+- Consumes: all of the packages above
+- Produces: no new programmatic interface
 
-- [ ] **Step 1: 寫端到端測試**
+- [ ] **Step 1: Write the end-to-end test**
 
-建立 `plugin/zonedns_agent/e2e_test.go`：
+Create `plugin/zonedns_agent/e2e_test.go`:
 
 ```go
 package zonedns_agent
@@ -2030,8 +2077,8 @@ import (
 	"github.com/miekg/dns"
 )
 
-// 同一個名字、兩個不同 zone 的 pod，必須得到不同的答案，而且兩次都真的問了上游。
-// 這是節點端存在的理由。
+// One name, two pods in different zones, and the answers must differ — with
+// upstream really queried both times. This is the node side's reason to exist.
 func TestEndToEndSameNameDifferentZones(t *testing.T) {
 	var declared []string
 
@@ -2045,7 +2092,8 @@ func TestEndToEndSameNameDifferentZones(t *testing.T) {
 		zone, _ := ednszone.Get(req, ednszone.DefaultCode)
 		declared = append(declared, zone)
 
-		// central 的行為：zone-a 是同 zone（回服務位址），其餘回 gateway。
+		// Central's behaviour: zone-a is the same zone (the service address comes
+		// back), everything else gets the gateway.
 		addr := "203.0.113.10"
 		if zone == "zone-a" {
 			addr = "10.96.0.7"
@@ -2099,40 +2147,43 @@ func TestEndToEndSameNameDifferentZones(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 執行測試確認通過**
+- [ ] **Step 2: Run the test and confirm it passes**
 
 Run: `go test ./plugin/zonedns_agent/ -race -run TestEndToEnd -v`
 Expected: PASS
 
-- [ ] **Step 3: 更新部署文件**
+- [ ] **Step 3: Update the deployment doc**
 
-在 `docs/deployment.md` 末端加入節點端的章節。內容必須涵蓋：
+Add the node-side sections at the end of `docs/deployment.md`. They must cover:
 
-**建置** —— `zonedns_agent` 編譯進自建的 node-local DNS image。取得
-`sigs.k8s.io/node-local-dns` 原始碼，在 `cmd/node-cache/main.go` 的 blank import
-區塊加入 `_ "github.com/jenting/zonedns/plugin/zonedns_agent"`，並把
-`"zonedns_agent"` 插進 `dnsserver.Directives`，**位置必須在 `"cache"` 之前**
-（否則 plugin 啟動時會拒絕啟動）。用該專案既有的 `Makefile` 與
-`Dockerfile.node-cache` 建置。
+**Building** — `zonedns_agent` compiles into a self-built node-local DNS image.
+Fetch the `sigs.k8s.io/node-local-dns` source, add
+`_ "github.com/jenting/zonedns/plugin/zonedns_agent"` to the blank import block
+in `cmd/node-cache/main.go`, and insert `"zonedns_agent"` into
+`dnsserver.Directives` **before `"cache"`**, or the plugin refuses to start.
+Build with that project's existing `Makefile` and `Dockerfile.node-cache`.
 
-**image 體積** —— 明確寫出：上游的 node-local-dns 只相依 `k8s.io/apimachinery`，
-不含 `client-go`。k8s 模式需要 `client-go` 做本機 pod 的 informer，因此自建 image
-會明顯大於上游版本。VM 模式不需要，但 binary 是同一份。
+**Image size** — state it plainly: upstream node-local-dns depends only on
+`k8s.io/apimachinery` and does not include `client-go`. k8s mode needs
+`client-go` for the local pod informer, so the self-built image is noticeably
+larger than upstream's. VM mode does not need it, but the binary is the same
+one.
 
-**DaemonSet 的變更** —— 只有三處：`image` 指向自建 registry；ServiceAccount 加上
-pods 的 `get/list/watch` RBAC；Corefile ConfigMap 加一個 server block。部署形態
-（DaemonSet、每節點一份、link-local 位址、iptables 規則、pod 的 resolv.conf）完全
-不變。
+**Changes to the DaemonSet** — three only: `image` points at the self-built
+registry; the ServiceAccount gains `get/list/watch` RBAC on pods; the Corefile
+ConfigMap gains one server block. The deployment shape — a DaemonSet, one per
+node, the link-local address, the iptables rules, pods' resolv.conf — is entirely
+unchanged.
 
 **Corefile（k8s）**：
 
 ```
-cluster.local:53 { ... 既有設定完全不動 ... }
+cluster.local:53 { ... existing configuration entirely untouched ... }
 
 example.com:53 {
     zonedns_agent {
         mode              k8s
-        node_name         # 由 downward API 注入的 NODE_NAME
+        node_name         # NODE_NAME, injected by the downward API
         zone_label        zone
         upstream          https://central.example.org/dns-query
         central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
@@ -2141,13 +2192,13 @@ example.com:53 {
     }
 }
 
-.:53 { ... 既有 cache + forward 完全不動 ... }
+.:53 { ... existing cache + forward entirely untouched ... }
 ```
 
-**Corefile（VM）**：與上相同，但 `mode vm` 加 `zone <該 VM 的 zone>`，不需要
-`node_name` 與 `zone_label`。
+**Corefile (VM)**: the same as above, but with `mode vm` plus
+`zone <this VM's zone>`, and neither `node_name` nor `zone_label`.
 
-**RBAC** —— 需要的最小權限：
+**RBAC** — the minimum permissions needed:
 
 ```yaml
 rules:
@@ -2156,36 +2207,39 @@ rules:
     verbs: ["get", "list", "watch"]
 ```
 
-**必要的告警**（metric 名稱以 `plugin/zonedns_agent/metrics.go` 為準，不可憑記憶
-撰寫，實作時請讀該檔確認 Prometheus 實際渲染出的名稱）：
+**Required alerts** — take the metric names from
+`plugin/zonedns_agent/metrics.go` rather than from memory; read that file while
+implementing to confirm the names Prometheus actually renders:
 
-| 條件 | 意義 |
+| Condition | Meaning |
 |---|---|
-| `zone_resolution_total{result="node_ip"}` 有非零增長 | 節點上有東西在做 SNAT/masquerade，改寫了查詢的 source IP。整個節點會靜默退化成不分 zone |
-| `zone_resolution_total{result="unknown"}` 持續增長 | 有 pod 沒有 zone label，或 informer 落後於 pod 建立 |
-| `resolver_ready == 0` 超過一個啟動週期 | pod watcher 未同步，所有查詢都不宣告 zone |
-| `upstream_errors_total` 有非零增長 | 對 central 的 DoH 失敗；查詢會回 SERVFAIL |
-| `cache_total{result="miss"}` 佔比異常高 | 快取容量不足，或 TTL 過短 |
+| Non-zero growth in `zone_resolution_total{result="node_ip"}` | Something on the node is doing SNAT/masquerading and has rewritten queries' source IPs. The whole node silently degrades to not distinguishing zones |
+| Sustained growth in `zone_resolution_total{result="unknown"}` | Some pod has no zone label, or the informer is lagging behind pod creation |
+| `resolver_ready == 0` for longer than one startup cycle | The pod watcher has not synced and no query declares a zone |
+| Non-zero growth in `upstream_errors_total` | DoH to central is failing; queries return SERVFAIL |
+| An unusually high proportion of `cache_total{result="miss"}` | The cache is too small, or the TTL too short |
 
-**兩端必須成對維護的設定** —— agent 自身 SVID 的 SPIFFE ID 必須出現在 central 的
-`authorized_agent` 清單中；central 的 SPIFFE ID 必須填在 agent 的
-`central_spiffe_id`。任一邊漏掉，zone 路由都會靜默停止運作。
+**Settings that must be maintained as a pair** — the SPIFFE ID of the agent's own
+SVID must appear in central's `authorized_agent` list, and central's SPIFFE ID
+must be set as the agent's `central_spiffe_id`. Miss either side and zone routing
+stops working silently.
 
-- [ ] **Step 4: 更新 README**
+- [ ] **Step 4: Update the README**
 
-在 `README.md` 的元件表格加入節點端的列：
+Add the node-side rows to the components table in `README.md`:
 
-| 路徑 | 說明 |
+| Path | What it does |
 |---|---|
-| `plugin/zonedns_agent` | 節點端 CoreDNS plugin：判定來源 zone、以 zone 為 key 快取、向 central 宣告 |
-| `internal/podzone` | 本機 pod IP → zone（node-scoped informer） |
-| `internal/zonecache` | 以 `(qname, qtype, zone)` 為 key 的答案快取 |
-| `internal/dohupstream` | 釘住 central SPIFFE ID 的 mTLS DoH client |
+| `plugin/zonedns_agent` | The node-side CoreDNS plugin: determines the source zone, keys the cache by it, declares it to central |
+| `internal/podzone` | Local pod IP → zone (a node-scoped informer) |
+| `internal/zonecache` | An answer cache keyed by `(qname, qtype, zone)` |
+| `internal/dohupstream` | The mTLS DoH client that pins central's SPIFFE ID |
 
-並在說明中補上：節點端與中心端共用 `internal/ednszone` 定義的線上格式，這是兩者
-唯一的相容性介面。
+And add to the prose: the node side and the central side share the wire format
+defined by `internal/ednszone`, which is the sole compatibility interface between
+them.
 
-- [ ] **Step 5: 執行完整測試與靜態檢查**
+- [ ] **Step 5: Run the full test suite and static checks**
 
 ```bash
 gofmt -l .
@@ -2194,7 +2248,8 @@ go build ./...
 go test ./... -race -cover
 ```
 
-Expected: `gofmt -l .` 無輸出；vet 與 build 無警告；全部測試通過。
+Expected: `gofmt -l .` prints nothing; vet and build are clean; the whole suite
+passes.
 
 - [ ] **Step 6: Commit**
 

@@ -10,7 +10,8 @@ func TestLookupNormalizesName(t *testing.T) {
 		{SPIFFEIDPath: "/zone/zone-a/ns/prod/sa/payments", DNSNames: []string{"payments.example.com"}},
 	})
 
-	// DNS 查詢帶結尾點且大小寫不定，registry 的 key 來自 SPIRE entry 則不帶點。
+	// A DNS query carries a trailing dot and arbitrary case, while the registry's
+	// keys come from SPIRE entries and carry none.
 	for _, q := range []string{
 		"payments.example.com.",
 		"payments.example.com",
@@ -53,11 +54,13 @@ func TestBuildSnapshotSkipsEntriesWithoutZone(t *testing.T) {
 	}
 }
 
-// k8s label value 允許點字元，但 ednszone.Valid（identity 端驗證 agent 宣告的
-// source zone 所用的同一套規則）拒絕。這個 entry 若被放進可查詢的快照，這個
-// zone 就能正常當 dest zone 用，但該 zone 裡每一個 workload 當 source 發問時，
-// 它們的 source zone 宣告都會在 identity.SourceZone 被判定不合法而丟棄 ——
-// 必須跟「沒有 zone 段」一樣，整個 entry 計進 Skipped。
+// A Kubernetes label value permits a dot, but ednszone.Valid — the same rule
+// identity uses to validate the source zone an agent declares — rejects it. Were
+// such an entry placed in the queryable snapshot, the zone would work perfectly
+// as a dest zone, while every workload inside it asking as a source would have
+// its declaration judged invalid by identity.SourceZone and discarded. The whole
+// entry must therefore be counted in Skipped, exactly like a missing zone
+// segment.
 func TestBuildSnapshotSkipsEntriesWithNonConformingZone(t *testing.T) {
 	snap, stats := BuildSnapshot([]Entry{
 		{SPIFFEIDPath: "/zone/zone.a/ns/prod/sa/legacy", DNSNames: []string{"legacy.example.com"}},
@@ -78,7 +81,8 @@ func TestBuildSnapshotSkipsEntriesWithNonConformingZone(t *testing.T) {
 	}
 }
 
-// 兩筆 entry 對同一個名字宣告不同 zone：不可任選一個，該名字整個視為不可解析。
+// Two entries declaring one name into different zones: neither may be picked,
+// and the name becomes unresolvable entirely.
 func TestBuildSnapshotConflictMakesNameUnresolvable(t *testing.T) {
 	snap, stats := BuildSnapshot([]Entry{
 		{SPIFFEIDPath: "/zone/zone-a/ns/prod/sa/payments", DNSNames: []string{"payments.example.com"}},
@@ -93,7 +97,7 @@ func TestBuildSnapshotConflictMakesNameUnresolvable(t *testing.T) {
 	}
 }
 
-// 同一個 zone 的多個副本共用一個名字是正常的，不算衝突。
+// Several replicas in one zone sharing a name is normal and not a conflict.
 func TestBuildSnapshotSameZoneIsNotConflict(t *testing.T) {
 	snap, stats := BuildSnapshot([]Entry{
 		{SPIFFEIDPath: "/zone/zone-a/ns/prod/sa/payments", DNSNames: []string{"payments.example.com"}},
@@ -138,7 +142,8 @@ func TestBuildSnapshotIgnoresEmptyDNSName(t *testing.T) {
 	}
 }
 
-// 未就緒的 Store 一律回 false — 啟動期間必須走非 zone-aware 路徑，不可猜測。
+// A Store that is not ready always returns false — during startup the query must
+// take the non-zone-aware path rather than guess.
 func TestStoreNotReady(t *testing.T) {
 	st := NewStore()
 	if st.Ready() {

@@ -8,15 +8,16 @@ func TestShouldSkipHost(t *testing.T) {
 		host string
 		want SkipReason
 	}{
-		{"對外 FQDN 要比對", "payments.example.com", ""},
-		{"萬用 host", "*.example.com", SkipWildcard},
-		{"單獨的萬用字元", "*", SkipWildcard},
-		{"cluster 短名", "payments", SkipShortName},
-		{"cluster 內部 FQDN", "payments.default.svc.cluster.local", SkipClusterLocal},
-		{"帶結尾點的 cluster domain 也要認得", "payments.default.svc.cluster.local", SkipClusterLocal},
-		// 尾綴比對必須以點為界，否則 notcluster.local 這種對外名稱會被誤判成
-		// 內部名稱而靜靜地不比對 —— 漏掉的正是我們要抓的漂移。
-		{"只是尾巴長得像的對外名稱", "notcluster.local", ""},
+		{"external FQDN is compared", "payments.example.com", ""},
+		{"wildcard host", "*.example.com", SkipWildcard},
+		{"bare wildcard", "*", SkipWildcard},
+		{"cluster short name", "payments", SkipShortName},
+		{"cluster-internal FQDN", "payments.default.svc.cluster.local", SkipClusterLocal},
+		{"cluster domain with a trailing dot is recognised too", "payments.default.svc.cluster.local", SkipClusterLocal},
+		// The suffix match must be bounded by a dot. Otherwise an external name
+		// like notcluster.local is mistaken for an internal one and quietly
+		// dropped from the comparison — losing exactly the drift we are after.
+		{"external name that merely looks like the suffix", "notcluster.local", ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -31,7 +32,8 @@ func TestShouldSkipHostCustomClusterDomain(t *testing.T) {
 	if got := ShouldSkipHost("payments.default.svc.k8s.internal", "k8s.internal"); got != SkipClusterLocal {
 		t.Errorf("got %q, want %q", got, SkipClusterLocal)
 	}
-	// 換了 cluster domain 之後，預設的那個就只是一個普通對外名稱了。
+	// Once the cluster domain changes, the default one is just an ordinary
+	// external name.
 	if got := ShouldSkipHost("payments.default.svc.cluster.local", "k8s.internal"); got != "" {
 		t.Errorf("got %q, want no skip", got)
 	}
@@ -49,11 +51,11 @@ func TestShouldSkipVirtualService(t *testing.T) {
 		gateways []string
 		want     SkipReason
 	}{
-		{"未設定等同 mesh", nil, ""},
-		{"空 slice 等同 mesh", []string{}, ""},
-		{"明確寫 mesh", []string{"mesh"}, ""},
-		{"同時服務 gateway 和 mesh", []string{"istio-ingressgateway", "mesh"}, ""},
-		{"只綁 ingress gateway", []string{"istio-ingressgateway"}, SkipGatewayBound},
+		{"unset means mesh", nil, ""},
+		{"empty slice means mesh", []string{}, ""},
+		{"mesh named explicitly", []string{"mesh"}, ""},
+		{"serves both a gateway and the mesh", []string{"istio-ingressgateway", "mesh"}, ""},
+		{"bound to an ingress gateway only", []string{"istio-ingressgateway"}, SkipGatewayBound},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

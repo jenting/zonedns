@@ -1,13 +1,15 @@
-# node-local-dns 的 Corefile。
+# node-local-dns's Corefile.
 #
-# 相對上游只多了一件事：一個專屬於 zone 路由網域的 server block。既有的
-# cluster.local、in-addr.arpa、ip6.arpa 與預設 forward 完全照上游，行為不變。
+# It adds exactly one thing to upstream's: a server block dedicated to the
+# zone-routed domain. The existing cluster.local, in-addr.arpa, ip6.arpa and
+# default forward follow upstream exactly, and their behaviour is unchanged.
 #
-# 為什麼要獨立一個 block（spec §7.4）：node-local-dns 內建的 cache plugin 以
-# (qname, qtype) 為 key，不含發問者的 zone。若讓它快取參與 zone 路由的名稱，
-# zone-a 的 pod 問過之後，zone-b 的 pod 會拿到同一份答案 —— 而且拿得像模像樣，
-# 執行期沒有任何徵兆。把 zonedns_agent 限縮在自己的 block，它用自己的
-# zone-aware 快取，其餘設定一行都不受影響。
+# Why a separate block (spec §7.4): node-local-dns's built-in cache plugin keys on
+# (qname, qtype) and does not include the asking workload's zone. Were it to cache
+# zone-routed names, then once a zone-a pod had asked, a zone-b pod would receive
+# that same answer — convincingly, with no sign of it at runtime. Confining
+# zonedns_agent to its own block gives it its own zone-aware cache and leaves every
+# other line of the configuration untouched.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -17,9 +19,9 @@ metadata:
     addonmanager.kubernetes.io/mode: Reconcile
 data:
   Corefile: |
-    # ── 以下為 zonedns 新增 ────────────────────────────────────────────────
-    # example.com 換成你們 VirtualService hosts 實際使用的網域。只有落在這個
-    # block 的查詢會走 zone 路由。
+    # ── added by zonedns ───────────────────────────────────────────────────
+    # Replace example.com with the domain your VirtualService hosts actually use.
+    # Only queries landing in this block take the zone-routed path.
     example.com:53 {
         errors
         reload
@@ -29,8 +31,9 @@ data:
             mode              k8s
             node_name         {$NODE_NAME}
             zone_label        zone
-            # 不含路徑：DoH 的 /dns-query 由函式庫自動接上，寫進去會變成
-            # /dns-query/dns-query 並得到 HTTP 404。帶路徑的值會在啟動時被拒絕。
+            # No path: the DoH library appends /dns-query itself, so writing it
+            # here produces /dns-query/dns-query and an HTTP 404. A value carrying
+            # a path is refused at startup.
             upstream          https://zonedns-central.example.org:8443
             central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
             workload_api      unix:///run/spire/sockets/agent.sock
@@ -39,7 +42,7 @@ data:
         }
         prometheus :9253
         }
-    # ── 以上為 zonedns 新增 ────────────────────────────────────────────────
+    # ── end of the zonedns addition ────────────────────────────────────────
     __PILLAR__DNS__DOMAIN__:53 {
         errors
         cache {

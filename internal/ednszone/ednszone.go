@@ -1,27 +1,34 @@
-// Package ednszone 定義 agent 與 central 之間傳遞 source zone 的線上格式。
+// Package ednszone defines the wire format that carries the source zone between
+// the agent and central.
 //
-// 這是兩個子專案唯一的相容性介面（spec §6.6）：agent 用 Set 寫入，central 用 Get
-// 讀出。編碼與解碼刻意放在同一個套件並一起測試，避免任一端單方面改動。
+// This is the only compatibility interface between the two subprojects (spec
+// §6.6): the agent writes with Set, central reads with Get. Encoding and
+// decoding deliberately live in one package and are tested together, so that
+// neither end can change the format on its own.
 //
-// 選 EDNS0 而非 EDNS Client Subnet：ECS 的語意是網段而非身分，且會被中間的
-// resolver 依 RFC 7871 改寫。選 local/experimental 區間的 option code：該區間
-// (65001-65534) 由 IANA 保留給私有用途，不會與標準 option 衝突。
+// EDNS0 rather than EDNS Client Subnet: ECS means a network prefix, not an
+// identity, and intermediate resolvers rewrite it per RFC 7871. An option code
+// from the local/experimental range: IANA reserves that range (65001-65534) for
+// private use, so it cannot collide with a standard option.
 package ednszone
 
 import (
 	"github.com/miekg/dns"
 )
 
-// DefaultCode 是預設的 EDNS0 option code，取自 IANA 的 local/experimental 區間。
+// DefaultCode is the default EDNS0 option code, taken from IANA's
+// local/experimental range.
 const DefaultCode uint16 = 65001
 
-// MaxLen 是 zone 字串的長度上限，與 k8s label value 的上限一致。
+// MaxLen bounds the length of a zone string, matching the limit on a Kubernetes
+// label value.
 const MaxLen = 63
 
-// Valid 回報 zone 字串是否合法。
+// Valid reports whether a zone string is well formed.
 //
-// 這道檢查在解碼端也會執行 — 即使宣告來自已驗證的 agent，字串內容仍是外部輸入，
-// 不可直接用於後續的 map 查詢或日誌輸出。
+// The decoding side runs this check too: even when the declaration comes from a
+// verified agent, the string itself is external input and must not go straight
+// into a map lookup or a log line.
 func Valid(zone string) bool {
 	if zone == "" || len(zone) > MaxLen {
 		return false
@@ -40,10 +47,12 @@ func Valid(zone string) bool {
 	return true
 }
 
-// Set 在訊息上寫入 source zone，必要時建立 OPT record。
+// Set writes the source zone onto a message, creating an OPT record if needed.
 //
-// 已存在的 OPT record 會被保留（含 UDP size 與 DO bit），同 code 的舊 option 會被
-// 取代而非附加 — 否則重試或轉發路徑上可能累積出多個彼此矛盾的宣告。
+// An existing OPT record is preserved along with its UDP size and DO bit, and an
+// older option with the same code is replaced rather than appended — otherwise a
+// retry or forwarding path could accumulate several declarations that contradict
+// each other.
 func Set(m *dns.Msg, code uint16, zone string) {
 	opt := m.IsEdns0()
 	if opt == nil {
@@ -61,14 +70,17 @@ func Set(m *dns.Msg, code uint16, zone string) {
 	opt.Option = append(kept, &dns.EDNS0_LOCAL{Code: code, Data: []byte(zone)})
 }
 
-// Get 讀出 source zone。zone 不合法時回 ok=false，與「不存在」同樣處理。
+// Get reads the source zone. An invalid zone returns ok=false, handled the same
+// way as one that is absent.
 //
-// 出現兩個以上帶同一個 code 的 option 時也回 ok=false，即使其中之一內容合法 ——
-// Set 會防止單一呼叫端疊加出這種訊息，但 central 端解析的是線上位元組，
-// 惡意或有 bug 的 agent 送出的封包不受 Set 保護。任選其中一個（例如「取第一個」）
-// 等於接受一個可能已被攻擊者插入的宣告冒充另一個，與本專案在
-// SPIFFEIDFromCert 拒絕多個 URI SAN 憑證的理由相同：模糊就是要 fail closed，
-// 不嘗試挑出「最合理」的那個。
+// Two or more options carrying the same code also return ok=false, even when one
+// of them is well formed. Set prevents a single caller from stacking them up,
+// but central parses bytes off the wire, and a packet from a malicious or buggy
+// agent is not protected by Set. Picking one of them (taking the first, say)
+// would accept a declaration an attacker may have inserted in place of another —
+// the same reasoning that makes SPIFFEIDFromCert refuse certificates with
+// several URI SANs: ambiguity must fail closed, with no attempt to pick the
+// "most plausible" one.
 func Get(m *dns.Msg, code uint16) (string, bool) {
 	opt := m.IsEdns0()
 	if opt == nil {

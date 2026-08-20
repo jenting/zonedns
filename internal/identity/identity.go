@@ -7,17 +7,21 @@ import (
 	"github.com/miekg/dns"
 )
 
-// Reason 說明 SourceZone 為何得到（或得不到）結果。呼叫端用它輸出 metric。
+// Reason explains why SourceZone did (or did not) produce a result. Callers use
+// it as a metric label.
 type Reason int
 
 const (
-	// ReasonOK 成功取得可信的 source zone。
+	// ReasonOK: a trustworthy source zone was obtained.
 	ReasonOK Reason = iota
-	// ReasonNoTLS 連線沒有 client certificate — 非 zone-aware 的正常路徑。
+	// ReasonNoTLS: the connection carries no client certificate — the ordinary
+	// non-zone-aware path.
 	ReasonNoTLS
-	// ReasonUnauthorizedAgent 憑證有效但不在授權清單中。這是攻擊訊號，需告警。
+	// ReasonUnauthorizedAgent: the certificate is valid but absent from the
+	// authorized list. This is an attack signal and must be alerted on.
 	ReasonUnauthorizedAgent
-	// ReasonNoDeclaration agent 已授權，但沒有帶宣告、或宣告的 zone 不合法。
+	// ReasonNoDeclaration: the agent is authorized but carried no declaration, or
+	// declared an invalid zone.
 	ReasonNoDeclaration
 )
 
@@ -36,16 +40,16 @@ func (r Reason) String() string {
 	}
 }
 
-// Config 是信任邊界的設定。
+// Config configures the trust boundary.
 type Config struct {
 	authorized map[string]struct{}
 	code       uint16
 }
 
-// NewConfig 建立 Config。
+// NewConfig builds a Config.
 //
-// agents 為空表示「沒有任何 agent 被授權」，不是「全部放行」— 設定漏掉時必須是
-// 拒絕而非開放。
+// An empty agents list means "no agent is authorized", not "let everyone
+// through" — a missing configuration must deny rather than open up.
 func NewConfig(agents []string, code uint16) Config {
 	set := make(map[string]struct{}, len(agents))
 	for _, a := range agents {
@@ -54,19 +58,24 @@ func NewConfig(agents []string, code uint16) Config {
 	return Config{authorized: set, code: code}
 }
 
-// SourceZone 取得這次查詢可信的 source zone，實作 spec §6.1 的五個步驟。
+// SourceZone obtains a trustworthy source zone for this query, implementing the
+// five steps of spec §6.1.
 //
-// 步驟順序不可調換 —— 特別是「先確認 agent 已授權，才讀 EDNS0 宣告」。若把讀取
-// 提前，未授權者的宣告就會流進後續邏輯。
+// The order of the steps must not be rearranged — in particular, the agent is
+// confirmed authorized before the EDNS0 declaration is read. Reading it earlier
+// would let an unauthorized party's declaration flow into the logic that
+// follows.
 func (c Config) SourceZone(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (string, Reason) {
-	// 步驟 1、2：取得 client certificate。憑證鏈本身已由 TLS 層以 SPIRE trust
-	// bundle 驗證過，這裡不重複驗證。
+	// Steps 1 and 2: obtain the client certificate. The chain itself has already
+	// been verified by the TLS layer against the SPIRE trust bundle, so it is not
+	// verified again here.
 	certs, ok := PeerCertificates(ctx, w)
 	if !ok {
 		return "", ReasonNoTLS
 	}
 
-	// 步驟 3：只看葉憑證。中繼憑證帶什麼身分都與呼叫者無關。
+	// Step 3: look only at the leaf. Whatever identity an intermediate carries has
+	// nothing to do with the caller.
 	id, ok := SPIFFEIDFromCert(certs[0])
 	if !ok {
 		return "", ReasonUnauthorizedAgent
@@ -75,7 +84,8 @@ func (c Config) SourceZone(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 		return "", ReasonUnauthorizedAgent
 	}
 
-	// 步驟 4、5：通過授權才讀宣告。ednszone.Get 內含格式驗證，不合法時回 false。
+	// Steps 4 and 5: read the declaration only once authorization passes.
+	// ednszone.Get validates the format and returns false when it is invalid.
 	zone, ok := ednszone.Get(r, c.code)
 	if !ok {
 		return "", ReasonNoDeclaration

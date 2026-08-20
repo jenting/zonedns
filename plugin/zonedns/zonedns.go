@@ -1,11 +1,14 @@
-// Package zonedns 是 zone-based DNS 的中心端 CoreDNS plugin。
+// Package zonedns is the central CoreDNS plugin for zone-based DNS.
 //
-// 它依查詢者的 zone（由 node-local agent 經 mTLS + EDNS0 宣告）與被查詢名稱所屬的
-// zone（來自 SPIRE registration entry）決定回應：同 zone 交給下游回一般答案，
-// 跨 zone 則回該 zone 的 gateway VIP。
+// It decides the response from the asking workload's zone — declared by the
+// node-local agent over mTLS with EDNS0 — and the zone the queried name belongs
+// to, which comes from SPIRE registration entries: within a zone it hands the
+// query downstream for the ordinary answer, and across zones it answers with that
+// zone's gateway VIP.
 //
-// 只有「跨 zone 且 gateway 已設定」這一種情況會改變答案，其餘一律不介入 ——
-// 這讓匯入本 plugin 的影響面盡可能小。
+// Only one case changes an answer, cross-zone with a configured gateway;
+// everything else passes through untouched, which keeps the blast radius of
+// importing this plugin as small as possible.
 package zonedns
 
 import (
@@ -21,7 +24,7 @@ import (
 	"github.com/miekg/dns"
 )
 
-// ZoneDNS 是 plugin 的處理器。
+// ZoneDNS is the plugin's handler.
 type ZoneDNS struct {
 	Next     plugin.Handler
 	Identity identity.Config
@@ -30,15 +33,15 @@ type ZoneDNS struct {
 	TTL      uint32
 }
 
-// Name 實作 plugin.Handler。
+// Name implements plugin.Handler.
 func (z ZoneDNS) Name() string { return "zonedns" }
 
-// ServeDNS 實作 plugin.Handler。
+// ServeDNS implements plugin.Handler.
 func (z ZoneDNS) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
 	state := request.Request{W: w, Req: r}
 
-	// 只處理位址查詢。SRV、TXT 等一律交給下游 —— 本 plugin 沒有能力為它們產生
-	// 有意義的跨 zone 答案。
+	// Address queries only. SRV, TXT and the rest go downstream — this plugin has
+	// no way to produce a meaningful cross-zone answer for them.
 	if state.QType() != dns.TypeA && state.QType() != dns.TypeAAAA {
 		return plugin.NextOrFailure(z.Name(), z.Next, ctx, w, r)
 	}
@@ -75,11 +78,12 @@ func (z ZoneDNS) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg)
 	}
 }
 
-// answerGateway 以 gateway VIP 回應。
+// answerGateway responds with the gateway VIP.
 //
-// gateway 是 IPv4 而查詢是 AAAA（或反之）時回 NODATA（NOERROR + 空 answer），
-// 讓 client 正常退回另一種位址族。回 NXDOMAIN 會讓 client 認為整個名字不存在，
-// 連 A 查詢也一併放棄。
+// When the gateway is IPv4 and the query is AAAA, or the other way round, it
+// returns NODATA (NOERROR with an empty answer) so the client falls back to the
+// other address family as usual. NXDOMAIN would tell the client the name does not
+// exist at all, and it would give up on the A query too.
 func (z ZoneDNS) answerGateway(state request.Request, gw string) (int, error) {
 	ip := net.ParseIP(gw)
 	isV4 := ip.To4() != nil
@@ -87,10 +91,12 @@ func (z ZoneDNS) answerGateway(state request.Request, gw string) (int, error) {
 	m := new(dns.Msg)
 	m.SetReply(state.Req)
 	m.Authoritative = true
-	// 查詢一定帶 OPT record — 它是攜帶 zone 宣告的 EDNS0 option 所在，走到這裡
-	// 代表宣告已經讀出來了。SizeAndDo 依請求的 OPT 在回應上補回對應的 OPT
-	// record；漏了這一步會讓每個 gateway 答案都變成對一個帶 EDNS0 查詢的
-	// 非 EDNS 回應，部分 resolver 會視為格式錯誤而重試或報錯。
+	// The query necessarily carries an OPT record — it is where the EDNS0 option
+	// holding the zone declaration lives, and reaching this point means the
+	// declaration was read. SizeAndDo puts the corresponding OPT record back on the
+	// response based on the request's; skipping it would make every gateway answer
+	// a non-EDNS response to an EDNS0 query, which some resolvers treat as a format
+	// error and retry or report.
 	state.SizeAndDo(m)
 
 	hdr := dns.RR_Header{

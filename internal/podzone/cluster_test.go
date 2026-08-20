@@ -1,12 +1,14 @@
 //go:build cluster
 
-// 這些測試需要一個至少兩個節點的真實 Kubernetes cluster，因此以 build tag 隔開，
-// 一般的 go test ./... 不會跑到。CI 用 kind 起 cluster 後以 -tags=cluster 執行。
+// These tests need a real Kubernetes cluster with at least two nodes, so they
+// sit behind a build tag and an ordinary go test ./... does not reach them. CI
+// brings up a kind cluster and runs them with -tags=cluster.
 //
-// 為什麼非得要真實 cluster：單元測試用的 fake.NewSimpleClientset 不套用 field
-// selector —— 它的 object tracker 直接忽略。所以「informer 只看本機節點的 pod」
-// 這個行為在其他測試裡從來沒有真正發生過，而那正是節點端把 source IP 對應到
-// 正確 workload 的前提。
+// Why a real cluster is required: the fake.NewSimpleClientset used by the unit
+// tests does not apply field selectors — its object tracker ignores them
+// outright. So "the informer sees only this node's pods" has never actually
+// happened in any other test, and it is the premise for the node mapping a source
+// IP to the right workload.
 package podzone
 
 import (
@@ -27,17 +29,19 @@ import (
 )
 
 const (
-	// 與 deploy/k8s/01-rbac.yaml 一致 —— 這個測試要驗的就是那份 manifest 給的
-	// 權限夠不夠，所以刻意不另外建一個寬鬆的 ServiceAccount。
+	// Matching deploy/k8s/01-rbac.yaml — what these tests check is whether the
+	// permissions that manifest grants are sufficient, so no separate, more
+	// permissive ServiceAccount is created.
 	saNamespace = "kube-system"
 	saName      = "node-local-dns"
 	pauseImage  = "registry.k8s.io/pause:3.10"
 )
 
-// namespaceFor 讓每個測試用自己的 namespace。
+// namespaceFor gives every test its own namespace.
 //
-// 共用一個會出問題：namespace 的刪除是非同步的，前一個測試清理時它會停在
-// Terminating，而在那個狀態下建立資源會被拒絕 —— 測試順序一換就壞。
+// Sharing one breaks: namespace deletion is asynchronous, so cleanup from the
+// previous test leaves it in Terminating, and creating resources in that state is
+// refused — reorder the tests and it falls over.
 func namespaceFor(t *testing.T) string {
 	t.Helper()
 	name := "zonedns-it-" + strings.ToLower(t.Name())
@@ -48,25 +52,27 @@ func namespaceFor(t *testing.T) string {
 	return strings.Trim(name, "-")
 }
 
-// adminClient 用 KUBECONFIG 的身分建立 client，只用來準備與清理測試資料。
+// adminClient builds a client with the KUBECONFIG identity, used only to set up
+// and clean up test data.
 func adminClient(t *testing.T) *kubernetes.Clientset {
 	t.Helper()
 	cfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
 		clientcmd.NewDefaultClientConfigLoadingRules(), nil).ClientConfig()
 	if err != nil {
-		t.Fatalf("載入 kubeconfig: %v", err)
+		t.Fatalf("loading kubeconfig: %v", err)
 	}
 	c, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
-		t.Fatalf("建立 admin client: %v", err)
+		t.Fatalf("building the admin client: %v", err)
 	}
 	return c
 }
 
-// scopedClient 以 node-local-dns ServiceAccount 的 token 建立 client。
+// scopedClient builds a client from the node-local-dns ServiceAccount's token.
 //
-// informer 用這個 client，所以測試若通過，代表 deploy/k8s/01-rbac.yaml 給的權限
-// 確實足夠；若 RBAC 不足，informer 會同步不了而測試逾時失敗。
+// The informer uses this client, so a passing test means the permissions granted
+// by deploy/k8s/01-rbac.yaml really are sufficient; were the RBAC short, the
+// informer could not sync and the test would fail on timeout.
 func scopedClient(t *testing.T, admin *kubernetes.Clientset) *kubernetes.Clientset {
 	t.Helper()
 	ctx := context.Background()
@@ -76,15 +82,16 @@ func scopedClient(t *testing.T, admin *kubernetes.Clientset) *kubernetes.Clients
 			ExpirationSeconds: ptr(int64(3600)),
 		}}, metav1.CreateOptions{})
 	if err != nil {
-		t.Fatalf("為 %s/%s 取得 token（RBAC manifest 套用了嗎？）: %v", saNamespace, saName, err)
+		t.Fatalf("obtaining a token for %s/%s (was the RBAC manifest applied?): %v", saNamespace, saName, err)
 	}
 
 	base, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
 		clientcmd.NewDefaultClientConfigLoadingRules(), nil).ClientConfig()
 	if err != nil {
-		t.Fatalf("載入 kubeconfig: %v", err)
+		t.Fatalf("loading kubeconfig: %v", err)
 	}
-	// 只保留連線資訊與 CA，把身分換成 ServiceAccount 的 token。
+	// Keep only the connection details and the CA, swapping the identity for the
+	// ServiceAccount's token.
 	cfg := &rest.Config{
 		Host:            base.Host,
 		TLSClientConfig: rest.TLSClientConfig{CAData: base.CAData, CAFile: base.CAFile},
@@ -92,27 +99,28 @@ func scopedClient(t *testing.T, admin *kubernetes.Clientset) *kubernetes.Clients
 	}
 	c, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
-		t.Fatalf("建立 scoped client: %v", err)
+		t.Fatalf("building the scoped client: %v", err)
 	}
 	return c
 }
 
 func ptr[T any](v T) *T { return &v }
 
-// twoNodes 回傳兩個不同節點的名稱。
+// twoNodes returns the names of two different nodes.
 func twoNodes(t *testing.T, c *kubernetes.Clientset) (string, string) {
 	t.Helper()
 	nodes, err := c.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
 	if err != nil {
-		t.Fatalf("列出節點: %v", err)
+		t.Fatalf("listing nodes: %v", err)
 	}
 	if len(nodes.Items) < 2 {
-		t.Fatalf("需要至少兩個節點才能驗證 field selector，目前只有 %d 個", len(nodes.Items))
+		t.Fatalf("verifying the field selector needs at least two nodes, found %d", len(nodes.Items))
 	}
 	return nodes.Items[0].Name, nodes.Items[1].Name
 }
 
-// createPod 直接指定 nodeName，繞過排程器，讓落點確定。
+// createPod sets nodeName directly, bypassing the scheduler so the placement is
+// certain.
 func createPod(t *testing.T, c *kubernetes.Clientset, ns, name, node, zone string) *corev1.Pod {
 	t.Helper()
 	p := &corev1.Pod{
@@ -129,12 +137,12 @@ func createPod(t *testing.T, c *kubernetes.Clientset, ns, name, node, zone strin
 	}
 	got, err := c.CoreV1().Pods(ns).Create(context.Background(), p, metav1.CreateOptions{})
 	if err != nil {
-		t.Fatalf("建立 pod %s: %v", name, err)
+		t.Fatalf("creating pod %s: %v", name, err)
 	}
 	return got
 }
 
-// waitForPodIP 等到 pod 拿到 IP。
+// waitForPodIP waits until the pod has an IP.
 func waitForPodIP(t *testing.T, c *kubernetes.Clientset, ns, name string) netip.Addr {
 	t.Helper()
 	deadline := time.Now().Add(90 * time.Second)
@@ -148,11 +156,11 @@ func waitForPodIP(t *testing.T, c *kubernetes.Clientset, ns, name string) netip.
 		}
 		time.Sleep(time.Second)
 	}
-	t.Fatalf("pod %s 在期限內沒有拿到 IP", name)
+	t.Fatalf("pod %s did not get an IP in time", name)
 	return netip.Addr{}
 }
 
-// setupNamespace 建立測試 namespace，並註冊清理。
+// setupNamespace creates the test namespace and registers its cleanup.
 func setupNamespace(t *testing.T, c *kubernetes.Clientset) string {
 	t.Helper()
 	ctx := context.Background()
@@ -160,7 +168,7 @@ func setupNamespace(t *testing.T, c *kubernetes.Clientset) string {
 	_, err := c.CoreV1().Namespaces().Create(ctx,
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}, metav1.CreateOptions{})
 	if err != nil && !apierrors.IsAlreadyExists(err) {
-		t.Fatalf("建立 namespace: %v", err)
+		t.Fatalf("creating the namespace: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = c.CoreV1().Namespaces().Delete(context.Background(), ns, metav1.DeleteOptions{})
@@ -168,7 +176,8 @@ func setupNamespace(t *testing.T, c *kubernetes.Clientset) string {
 	return ns
 }
 
-// startWatcher 啟動 watcher 並等到就緒。就緒本身就是 RBAC 足夠的證據。
+// startWatcher runs the watcher and waits until it is ready. Readiness is itself
+// the evidence that the RBAC suffices.
 func startWatcher(t *testing.T, c *kubernetes.Clientset, nodeName string) *Watcher {
 	t.Helper()
 	w := New(c, nodeName, "zone")
@@ -182,12 +191,13 @@ func startWatcher(t *testing.T, c *kubernetes.Clientset, nodeName string) *Watch
 	select {
 	case <-ready:
 	case <-time.After(60 * time.Second):
-		t.Fatal("informer 在 60 秒內未就緒 —— 最可能的原因是 deploy/k8s/01-rbac.yaml 的權限不足")
+		t.Fatal("the informer was not ready within 60s — most likely the permissions in deploy/k8s/01-rbac.yaml are insufficient")
 	}
 	return w
 }
 
-// eventually 反覆檢查直到條件成立或逾時。informer 是非同步的，斷言必須容忍延遲。
+// eventually re-checks until the condition holds or the deadline passes. The
+// informer is asynchronous, so assertions must tolerate delay.
 func eventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
@@ -197,14 +207,15 @@ func eventually(t *testing.T, what string, cond func() bool) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	t.Fatalf("逾時：%s", what)
+	t.Fatalf("timed out: %s", what)
 }
 
-// 這是本檔存在的理由：驗證 field selector 對真實 API server 生效。
-// fake clientset 忽略 field selector，所以這件事在其他測試裡從未真正發生。
+// This is the file's reason to exist: proving the field selector takes effect
+// against a real API server. The fake clientset ignores field selectors, so this
+// has never actually happened in any other test.
 func TestClusterFieldSelectorScopesToLocalNode(t *testing.T) {
 	if os.Getenv("KUBECONFIG") == "" && os.Getenv("HOME") == "" {
-		t.Skip("沒有 kubeconfig")
+		t.Skip("no kubeconfig")
 	}
 	admin := adminClient(t)
 	ns := setupNamespace(t, admin)
@@ -218,18 +229,18 @@ func TestClusterFieldSelectorScopesToLocalNode(t *testing.T) {
 
 	w := startWatcher(t, scopedClient(t, admin), nodeA)
 
-	eventually(t, "本機 pod 應被索引", func() bool {
+	eventually(t, "the local pod should be indexed", func() bool {
 		z, ok := w.Zone(localIP)
 		return ok && z == "zone-a"
 	})
-	// 另一個節點的 pod 有 IP、有 zone label，唯一的差別就是節點 —— 若 field
-	// selector 沒生效，它會被索引。
+	// The pod on the other node has an IP and a zone label; the node is the only
+	// difference — were the field selector not in effect, it would be indexed.
 	if z, ok := w.Zone(remoteIP); ok {
-		t.Fatalf("其他節點的 pod 被索引了（zone=%q）—— field selector 沒有生效", z)
+		t.Fatalf("a pod from another node was indexed (zone=%q) — the field selector is not in effect", z)
 	}
 }
 
-// 沒有 zone label 的 pod 不可被索引成空 zone。
+// A pod with no zone label must not be indexed under the empty zone.
 func TestClusterPodWithoutZoneLabelNotIndexed(t *testing.T) {
 	admin := adminClient(t)
 	ns := setupNamespace(t, admin)
@@ -242,21 +253,22 @@ func TestClusterPodWithoutZoneLabelNotIndexed(t *testing.T) {
 
 	w := startWatcher(t, scopedClient(t, admin), nodeA)
 
-	eventually(t, "有 label 的 pod 應被索引", func() bool {
+	eventually(t, "the labelled pod should be indexed", func() bool {
 		_, ok := w.Zone(labelledIP)
 		return ok
 	})
 	if z, ok := w.Zone(unlabelledIP); ok {
-		t.Fatalf("沒有 zone label 的 pod 被索引成 %q", z)
+		t.Fatalf("a pod with no zone label was indexed as %q", z)
 	}
 }
 
-// 移除活著的 pod 的 zone label，對應必須立刻失效。
+// Removing the zone label from a live pod must invalidate the mapping at once.
 //
-// 這條路徑的單元測試用的是 fake clientset；這裡驗的是真實 informer 的 update
-// 事件。它守的是 Task 3 審查抓到的一個 Critical：原本的 upsert 只增不刪，
-// 失去索引資格的 pod 會留下永不過期的對應，而它的 IP 被回收後，新 pod 會繼承
-// 前一個租用者的 zone。
+// The unit test for this path uses the fake clientset; what is checked here is a
+// real informer's update event. It guards a Critical the Task 3 review caught:
+// the original upsert only added and never removed, so a pod that lost its
+// eligibility left behind a mapping that never expired, and once its IP was
+// recycled the new pod inherited the previous tenant's zone.
 func TestClusterLabelRemovalEvictsImmediately(t *testing.T) {
 	admin := adminClient(t)
 	ns := setupNamespace(t, admin)
@@ -266,22 +278,22 @@ func TestClusterLabelRemovalEvictsImmediately(t *testing.T) {
 	ip := waitForPodIP(t, admin, ns, pod.Name)
 
 	w := startWatcher(t, scopedClient(t, admin), nodeA)
-	eventually(t, "初始應被索引", func() bool {
+	eventually(t, "should be indexed initially", func() bool {
 		z, ok := w.Zone(ip)
 		return ok && z == "zone-a"
 	})
 
-	// 移除 label
+	// Remove the label
 	cur, err := admin.CoreV1().Pods(ns).Get(context.Background(), pod.Name, metav1.GetOptions{})
 	if err != nil {
-		t.Fatalf("取得 pod: %v", err)
+		t.Fatalf("getting the pod: %v", err)
 	}
 	delete(cur.Labels, "zone")
 	if _, err := admin.CoreV1().Pods(ns).Update(context.Background(), cur, metav1.UpdateOptions{}); err != nil {
-		t.Fatalf("更新 pod: %v", err)
+		t.Fatalf("updating the pod: %v", err)
 	}
 
-	eventually(t, "移除 label 後應立即失效", func() bool {
+	eventually(t, "should be invalidated immediately after the label is removed", func() bool {
 		_, ok := w.Zone(ip)
 		return !ok
 	})

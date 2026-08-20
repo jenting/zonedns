@@ -23,7 +23,8 @@ func TestGateway(t *testing.T) {
 func TestGatewayMissing(t *testing.T) {
 	tbl := New(map[string]netip.Addr{"zone-a": netip.MustParseAddr("203.0.113.10")})
 
-	// 未設定的 zone 必須回 false，讓決策層產生 SERVFAIL 而非靜默放行。
+	// An unconfigured zone must return false so the decision layer produces a
+	// SERVFAIL rather than silently letting the query through.
 	if _, ok := tbl.Gateway("zone-z"); ok {
 		t.Fatal("unconfigured zone must not resolve")
 	}

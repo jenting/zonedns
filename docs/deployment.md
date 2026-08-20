@@ -1,35 +1,37 @@
-# zonedns central 部署
+# Deploying zonedns central
 
-## 建置
+## Building
 
-zonedns 是 external CoreDNS plugin。CoreDNS 的 plugin 是編譯期連結的，沒有執行期
-載入機制，因此必須重新建置 CoreDNS binary。
+zonedns is an external CoreDNS plugin. CoreDNS plugins are linked at compile time
+with no runtime loading mechanism, so the CoreDNS binary has to be rebuilt.
 
-1. 取得 CoreDNS 原始碼（版本需與 `go.mod` 的 pin 一致）
-2. 在 `plugin.cfg` 中 **cache 之前** 加入一行：
+1. Fetch the CoreDNS source (the version must match the pin in `go.mod`)
+2. Add one line to `plugin.cfg`, **before cache**:
 
    ```
    zonedns:github.com/jenting/zonedns/plugin/zonedns
    ```
 
-   順序不可放在 `cache` 之後 —— `setup()` 一啟動就會呼叫
-   `CheckDirectiveOrder(dnsserver.Directives)`，順序錯誤會直接拒絕啟動而不是
-   靜默接受（見 `plugin/zonedns/setup.go`）：把 `cache` 排在前面，cache 會用
-   `(qname, qtype)` 這個不含 zone 的 key 回答，跨 zone 的 client 會拿到別的
-   zone 快取的答案，而且執行期沒有任何徵兆。
+   It must not go after `cache`. `setup()` calls
+   `CheckDirectiveOrder(dnsserver.Directives)` the moment it starts, and a wrong
+   order is refused outright rather than accepted silently (see
+   `plugin/zonedns/setup.go`): with `cache` first, it answers from a
+   `(qname, qtype)` key that carries no zone, and a cross-zone client receives an
+   answer cached for another zone — with no sign of it at runtime.
 
-3. 建置：
+3. Build:
 
    ```bash
    go generate && go build
    ```
 
-## SPIRE 前置條件
+## SPIRE preconditions
 
-### 一、workload 的 registration entry（registry 的資料來源）
+### 1. Workload registration entries — the registry's data source
 
-zonedns 的 registry 完全來自 SPIRE registration entry：`dns_names` 提供名稱，
-`spiffe_id` 的 path 提供 zone。k8s 這一側用 `ClusterSPIFFEID` 產生：
+zonedns's registry comes entirely from SPIRE registration entries: `dns_names`
+supply the names and the `spiffe_id` path supplies the zone. On the Kubernetes
+side they are produced by a `ClusterSPIFFEID`:
 
 ```yaml
 apiVersion: spire.spiffe.io/v1alpha1
@@ -37,9 +39,10 @@ kind: ClusterSPIFFEID
 metadata:
   name: zonedns-workloads
 spec:
-  # 必要守衛：沒有這一行，未標 zonedns.io/host 的 pod 會渲染出空的 dns_names，
-  # SPIRE Server 以 ErrEmptyDomain 拒絕整筆 entry，該 pod 會拿不到 SVID ——
-  # 失效範圍遠大於 DNS，見設計文件 §5。
+  # A required guard: without this line, a pod not labelled zonedns.io/host
+  # renders empty dns_names, SPIRE Server refuses the whole entry with
+  # ErrEmptyDomain, and that pod gets no SVID at all — damage reaching far beyond
+  # DNS. See §5 of the design doc.
   podSelector:
     matchExpressions:
       - {key: zonedns.io/host, operator: Exists}
@@ -48,7 +51,7 @@ spec:
     - '{{ index .PodMeta.Labels "zonedns.io/host" }}'
 ```
 
-對應的 Deployment pod template：
+The corresponding Deployment pod template:
 
 ```yaml
 metadata:
@@ -57,7 +60,8 @@ metadata:
     zonedns.io/host: payments.example.com
 ```
 
-VM 這一側的 entry 形式相同，registry 看不出差別：
+On the VM side the entry has the same shape and the registry cannot tell the
+difference:
 
 ```bash
 spire-server entry create \
@@ -67,26 +71,30 @@ spire-server entry create \
   -dns billing.example.com
 ```
 
-**一個 workload 只能有一個對外 FQDN**（設計文件 §9 已知限制 1）。加第二個選配
-label 會在未填時渲染出空字串導致 entry 被拒；開第二個 `ClusterSPIFFEID` 會因
-SPIFFE ID 與 selector 相同而被 `entriesMasked` 遮蔽。
+**A workload may have exactly one external FQDN** (design doc §9, known
+limitation 1). A second optional label renders the empty string when unset and
+the entry is refused; a second `ClusterSPIFFEID` is masked by `entriesMasked`
+because its SPIFFE ID and selector are identical.
 
-### 二、central 自己存取 Entry API 的權限
+### 2. Central's own access to the Entry API
 
-兩種形態，Corefile 的 `spire_server` 決定走哪一種：
+Two shapes, chosen by `spire_server` in the Corefile:
 
-**同機（建議）** —— central 與 SPIRE Server 在同一台 VM，走本機管理 socket：
+**Same machine (recommended)** — central and SPIRE Server share a VM and use the
+local admin socket:
 
 ```
 spire_server unix:///run/spire/sockets/server.sock
 ```
 
-存取權由檔案權限控制，不需要 SVID，也不需要 `spire_server_id` 或
-`workload_api`（`spire_server_id` 若設了也沒有作用，因為這條路徑不做 mTLS
-握手——直接留空即可，設了只會徒增混淆）。
+Access is governed by file permissions and needs no SVID, no
+`spire_server_id` and no `workload_api`. Setting `spire_server_id` here does
+nothing, since this path performs no mTLS handshake — leave it out; setting it
+only invites confusion.
 
-**跨機** —— 走 mTLS，此時 central 需要**同機的 SPIRE agent**（取得 admin SVID
-用），且其 registration entry 必須設 `admin: true`：
+**Across machines** — mTLS, for which central needs a **SPIRE agent on the same
+machine** to obtain an admin SVID, and that agent's registration entry must set
+`admin: true`:
 
 ```bash
 spire-server entry create \
@@ -96,8 +104,8 @@ spire-server entry create \
   -admin
 ```
 
-Corefile 除了 `workload_api`（central 自己的 Workload API socket，取得上面那張
-admin SVID）之外，**必須**設定 `spire_server_id`：
+Besides `workload_api` — central's own Workload API socket, through which it
+obtains that admin SVID — the Corefile **must** set `spire_server_id`:
 
 ```
 spire_server     spire-server.example.org:8081
@@ -105,37 +113,44 @@ spire_server_id  spiffe://example.org/spire/server
 workload_api     unix:///run/spire/sockets/agent.sock
 ```
 
-`spire_server_id` 釘住 SPIRE Server **確切的** SPIFFE ID（`AuthorizeID`），而不只
-是驗證「trust domain 內的某個成員」（`AuthorizeMemberOf`）。少了它，任何持有同
-trust domain 內任一張 SVID、且能攔截這條連線的人，都能冒充 SPIRE Server 餵一份
-偽造的 registry、把任意名字導向任意 zone，進而左右 zonedns 的每一個路由決策 ——
-`spire_server` 為網路位址時，`parseConfig` 會直接拒絕沒有 `spire_server_id` 的
-設定檔，fail closed。
+`spire_server_id` pins SPIRE Server's **exact** SPIFFE ID (`AuthorizeID`) rather
+than merely verifying "some member of the trust domain"
+(`AuthorizeMemberOf`). Without it, anyone holding any SVID from the same trust
+domain who can intercept this connection could impersonate SPIRE Server, feed a
+forged registry, point any name at any zone, and thereby steer every routing
+decision zonedns makes. When `spire_server` is a network address, `parseConfig`
+refuses a configuration lacking `spire_server_id` outright — it fails closed.
 
-沒有獨立的 `trust_domain` 選項：`spire_server_id` 本身就是一個完整的 SPIFFE ID
-（含 trust domain），不需要另外重複宣告。
+There is no separate `trust_domain` option: `spire_server_id` is itself a
+complete SPIFFE ID, trust domain included, so there is nothing to declare
+twice.
 
 ## Corefile
 
-**傳輸方式是 DNS-over-HTTPS，不是 DNS-over-TLS。** 兩者看起來都是「TLS 上跑
-DNS」，但 zonedns 的身分擷取只有在 DoH 上才可靠：
+**The transport is DNS-over-HTTPS, not DNS-over-TLS.** Both look like "DNS over
+TLS", but zonedns's identity extraction is only reliable over DoH:
 
-- DoH 的 client 憑證是從 context 裡的 `*http.Request` 取得（`identity` 套件），
-  與 CoreDNS 如何包裝 `dns.ResponseWriter` 無關。
-- DoT 的 client 憑證則要對 `ResponseWriter` 做 `dns.ConnectionStater` 型別斷言。
-  CoreDNS 內建的 `metrics` plugin 會用一個把 `dns.ResponseWriter` 存成
-  **介面欄位**（而非具名的具體型別內嵌）的 Recorder 包住 writer，這個斷言在
-  它包過的 writer 上必然失敗。
+- A DoH client certificate is taken from the `*http.Request` in the context (the
+  `identity` package), regardless of how CoreDNS wraps the
+  `dns.ResponseWriter`.
+- A DoT client certificate requires type-asserting the `ResponseWriter` to
+  `dns.ConnectionStater`. CoreDNS's built-in `metrics` plugin wraps the writer in
+  a Recorder that stores `dns.ResponseWriter` as an **interface field** rather
+  than embedding a named concrete type, and the assertion necessarily fails on a
+  writer it has wrapped.
 
-後果是：把 zonedns 接在 `853` 這種 DoT listener 上，每個查詢都會被判定成
-「沒有憑證」，安靜地退回非 zone-aware 路徑 —— zone 隔離整個關閉，而
-`unauthorized_agent` 這個原本該告警的 metric 永遠不會遞增，因為根本沒有走到
-會檢查 client cert 的那段程式碼。`setup()` 會在偵測到 DoT listener 時印出
-啟動警告（見 `plugin/zonedns/setup.go` 的 `warnIfDoT`），但**不會拒絕啟動**——
-這是刻意的：把 `zonedns` 排到 `metrics` 之前雖可修好 DoT，卻會讓 CoreDNS 的
-標準 request metrics 從此看不到任何跨 zone 答案，對一個已經決定不部署的傳輸
-而言代價過高（設計文件 §9 限制 5）。實務上請直接使用下面的 `https://` 監聽，
-`853` 只是操作者出於習慣可能會伸手去用的錯誤設定，這裡先說清楚原因。
+The consequence: attach zonedns to a DoT listener such as `853` and every query
+is judged to have "no certificate" and falls quietly back to the non-zone-aware
+path — zone isolation switches off entirely, while the `unauthorized_agent`
+metric that ought to raise the alarm never increments, because the code that
+checks the client cert is never reached. `setup()` prints a startup warning when
+it detects a DoT listener (see `warnIfDoT` in `plugin/zonedns/setup.go`) but
+**does not refuse to start**. That is deliberate: sorting `zonedns` before
+`metrics` would fix DoT, but CoreDNS's standard request metrics would then never
+see a cross-zone answer again — too high a price for a transport already decided
+against (design doc §9, limitation 5). In practice, use the `https://` listener
+below; `853` is simply the misconfiguration an operator may reach for out of
+habit, and the reason is set out here first.
 
 ```
 https://example.com:443 {
@@ -147,8 +162,8 @@ https://example.com:443 {
         spire_server unix:///run/spire/sockets/server.sock
         poll_interval 30s
 
-        # 只有這些 SPIFFE ID 宣告的 source zone 會被採信。
-        # 精確比對，不支援前綴。
+        # Only source zones declared by these SPIFFE IDs are believed.
+        # Matched exactly; prefixes are not supported.
         authorized_agent spiffe://example.org/zone/infra/node/node-01
         authorized_agent spiffe://example.org/zone/infra/node/node-02
 
@@ -168,199 +183,231 @@ https://example.com:443 {
 }
 ```
 
-`client_auth require_and_verify` 是必要的 —— 沒有它，CoreDNS 不會要求 client 憑證，
-`identity` 取不到憑證就會讓所有查詢走非 zone-aware 路徑，**zone 路由會完全失效
-而且沒有錯誤訊息**。
+`client_auth require_and_verify` is required — without it CoreDNS does not ask
+for a client certificate, `identity` gets none, every query takes the
+non-zone-aware path, and **zone routing fails completely with no error
+message**.
 
-### `zonedns` 區塊的設定項
+### Options in the `zonedns` block
 
-以下是 `plugin/zonedns/setup.go` 實際支援、且僅支援的選項。沒有列出的名字
-（包含 `trust_domain` —— 舊版曾有，已移除）在解析時會被 `parseConfig` 直接
-拒絕。
+These are the options `plugin/zonedns/setup.go` actually supports, and the only
+ones. Any name not listed — including `trust_domain`, which older versions had
+and which has been removed — is refused outright by `parseConfig`.
 
-| 選項 | 必要性 | 說明 |
+| Option | Required? | What it does |
 |---|---|---|
-| `spire_server` | **必要** | `unix://` socket 或 `host:port`。決定走哪一種存取模式，見上一節。 |
-| `authorized_agent` | **必要，至少一筆**，可重複 | 允許宣告 source zone 的 agent SPIFFE ID，精確比對。一筆都沒有等於這個 plugin 永遠不會 zone-aware，`parseConfig` 視為設定錯誤而拒絕。 |
-| `spire_server_id` | `spire_server` 為 `host:port` 時**必要**；`unix://` 時不需要（設了也無作用） | 釘住 SPIRE Server 的確切 SPIFFE ID，見上一節。 |
-| `workload_api` | `spire_server` 為 `host:port` 時必要 | central 自己的 Workload API socket，取得存取 Entry API 用的 admin SVID。 |
-| `poll_interval` | 選填，預設 `30s` | 輪詢 SPIRE Entry API 的週期。必須是正值，否則啟動時直接拒絕。 |
-| `edns0_code` | 選填，預設 `65001` | agent/central 之間攜帶 source zone 的 EDNS0 option code，須落在 IANA local/experimental 區間 `65001`–`65534`，且與 agent 端設定一致。 |
-| `ttl` | 選填，預設 `30` | 跨 zone 答案（gateway 位址）的 TTL 秒數。 |
-| `gateway` | 選填，可重複；語法 `gateway <zone> <address>` | zone 到 gateway VIP 的對照。同一個 zone 重複宣告會被拒絕（不是「後面覆蓋前面」）。 |
+| `spire_server` | **Required** | A `unix://` socket or `host:port`, choosing the access mode; see the previous section. |
+| `authorized_agent` | **Required, at least one**; repeatable | The agent SPIFFE IDs permitted to declare a source zone, matched exactly. None at all means the plugin can never be zone-aware, which `parseConfig` treats as a misconfiguration and refuses. |
+| `spire_server_id` | **Required** when `spire_server` is `host:port`; not needed for `unix://`, where setting it does nothing | Pins SPIRE Server's exact SPIFFE ID; see the previous section. |
+| `workload_api` | Required when `spire_server` is `host:port` | Central's own Workload API socket, through which it obtains the admin SVID used to access the Entry API. |
+| `poll_interval` | Optional, defaults to `30s` | How often the SPIRE Entry API is polled. Must be positive, or startup is refused. |
+| `edns0_code` | Optional, defaults to `65001` | The EDNS0 option code carrying the source zone between agent and central. Must fall in IANA's local/experimental range `65001`–`65534`, and must match the agent's setting. |
+| `ttl` | Optional, defaults to `30` | The TTL in seconds of a cross-zone answer, that is, a gateway address. |
+| `gateway` | Optional, repeatable; syntax `gateway <zone> <address>` | The zone to gateway VIP mapping. Declaring one zone twice is refused, rather than the later entry winning. |
 
-## 必要的告警
+## Required alerts
 
-以下 metric 定義於 `plugin/zonedns/metrics.go`，皆以 `coredns_zonedns_` 為字首
-（CoreDNS 的 metrics namespace 是 `coredns`，subsystem 是 `zonedns`）。
+These metrics are defined in `plugin/zonedns/metrics.go` and all carry the
+`coredns_zonedns_` prefix — CoreDNS's metrics namespace is `coredns` and the
+subsystem is `zonedns`.
 
-| Metric | 條件 | 意義 |
+| Metric | Condition | Meaning |
 |---|---|---|
-| `coredns_zonedns_source_zone_total{reason="unauthorized_agent"}` | 任何非零增長 | 有未授權的來源在宣告 zone，這是攻擊訊號。**處置見下方「不可回頭的前提」—— 絕不可以把該身分加進 `authorized_agent` 來消音** |
-| `coredns_zonedns_decision_total{action="servfail"}` | 任何非零增長 | 某個 zone 缺 gateway 設定 |
-| `coredns_zonedns_registry_conflicts` | > 0 | 有 FQDN 被宣告成多個 zone，這些名字目前不可解析 |
-| `coredns_zonedns_registry_ready` | == 0 持續超過一個 `poll_interval` | registry 未載入，全部查詢退回非 zone-aware |
-| `coredns_zonedns_registry_poll_errors` | > 0 | 連續輪詢 SPIRE Entry API 失敗（admin SVID 過期、`admin: true` 被收回、網路分斷…）。Store 會沿用上一份快照，`registry_ready` 與 `registry_names` 都不會變 —— 這是這種失效唯一會動的 metric，新註冊或改 zone 的名稱會持續查不到而靜默走非 zone-aware 路徑，直到輪詢恢復 |
-| `coredns_zonedns_source_zone_total{reason="no_tls"}` | 遷移完成後仍持續增長 | 有 client 沒走 mTLS 路徑 |
+| `coredns_zonedns_source_zone_total{reason="unauthorized_agent"}` | Any non-zero growth | An unauthorized source is declaring a zone; this is an attack signal. **For the response see "An irreversible precondition" below — the identity must never be added to `authorized_agent` to silence it** |
+| `coredns_zonedns_decision_total{action="servfail"}` | Any non-zero growth | Some zone has no gateway configured |
+| `coredns_zonedns_registry_conflicts` | > 0 | An FQDN is declared into several zones, and those names are currently unresolvable |
+| `coredns_zonedns_registry_ready` | == 0 for longer than one `poll_interval` | The registry has not loaded and every query falls back to non-zone-aware |
+| `coredns_zonedns_registry_poll_errors` | > 0 | Consecutive failures polling the SPIRE Entry API — an expired admin SVID, `admin: true` revoked, a network partition. The Store keeps the previous snapshot, so neither `registry_ready` nor `registry_names` changes; this is the only metric that moves under this failure, while newly registered names or names that changed zone stay unresolvable and silently take the non-zone-aware path until polling recovers |
+| `coredns_zonedns_source_zone_total{reason="no_tls"}` | Still growing after the migration is complete | Some client is not using the mTLS path |
 
-`coredns_zonedns_registry_names`（目前可解析的名稱數）雖非告警項，掉到 0 或
-異常驟降也值得留意，通常代表 SPIRE Server 端的 entry 大量消失。
+`coredns_zonedns_registry_names`, the number of currently resolvable names, is
+not an alert, but dropping to 0 or falling sharply is worth watching — it usually
+means entries have disappeared en masse on the SPIRE Server side.
 
-## 不可回頭的前提
+## An irreversible precondition
 
-central 與各節點 agent 之間的路徑上**不得有任何終結 TLS 的設備**（L7 ingress、
-反向代理、TLS 終結負載平衡器）。若有，central 看到的 client 憑證會是該設備的，
-`authorized_agent` 比對會失敗或誤中，而**查詢仍會正常得到答案** —— 失效完全無聲
-（設計文件 §11 第 3 項）。
+**No device may terminate TLS on the path between central and the node agents** —
+no L7 ingress, no reverse proxy, no TLS-terminating load balancer. With one in
+place, the client certificate central sees is that device's, the
+`authorized_agent` comparison either fails or matches the wrong thing, and
+**queries still return answers normally** — the failure is entirely silent
+(design doc §11, item 3).
 
-**2026-08-20 已向環境負責人確認：打到 DNS server 的路徑上不會有 TLS
-termination。** 本設計的安全基礎成立。
+**Confirmed with the environment owner on 2026-08-20: there will be no TLS
+termination on the path to the DNS server.** The design's security foundation
+holds.
 
-執行期本身就在持續驗證這件事，而且比任何定期測試都強 —— 它在每一次查詢上生效：
+The runtime verifies this continuously, and more strongly than any periodic test
+could — it takes effect on every query:
 
-- **agent → central 方向由建構方式擋住。** agent 以 `AuthorizeID(central)` 釘死
-  對方的 SPIFFE ID，中間設備出示自己的憑證時握手直接失敗（SERVFAIL 加
-  `upstream_errors_total`）。這一側不可能靜默。
-- **central → agent 方向會降級，但 `unauthorized_agent` 會動。** 這就是那個
-  告警存在的理由。
+- **agent → central is stopped by construction.** The agent pins the other
+  side's SPIFFE ID with `AuthorizeID(central)`, and a device presenting its own
+  certificate fails the handshake outright, giving SERVFAIL plus
+  `upstream_errors_total`. This side cannot fail silently.
+- **central → agent degrades, but `unauthorized_agent` moves.** That is why the
+  alert exists.
 
-### 這個告警的正確處置
+### The correct response to that alert
 
-`unauthorized_agent` 上升時，**唯一正確的處置是找出那個未授權身分並移除它**
-（若是中間設備，就是把該設備從路徑上拿掉）。
+When `unauthorized_agent` rises, **the only correct response is to find the
+unauthorized identity and remove it** — and if it is an intermediary, to take
+that device off the path.
 
-**絕對不要把它的 SPIFFE ID 加進 `authorized_agent` 來讓告警消失。** 那一步之後
-該身分就能宣告任意 zone，整套 zone 隔離失效，而且從此完全無聲 —— 告警不再響，
-查詢照常有答案，只是答案不再受任何約束。這是程式碼防不住的一步：`authorized_agent`
-是設定，設定說誰可信，central 就信誰。
+**Never add its SPIFFE ID to `authorized_agent` to make the alert go away.**
+After that step the identity can declare any zone it likes, the whole of zone
+isolation is defeated, and from then on it is entirely silent — the alert stops
+firing, queries keep returning answers, and the answers are simply no longer
+bound by anything. This is the step no code can prevent: `authorized_agent` is
+configuration, and central trusts whoever the configuration says to trust.
 
-若要另外做主動檢查，方式是定期以非授權憑證發出查詢，確認 zone 宣告確實被忽略
-（即回應為非 zone-aware 的一般答案，而不是 SERVFAIL 或連線層級的拒絕 ——
-`identity` 把「未授權」與「沒有憑證」都當成同一種退路處理，這是設計上刻意的
-fail-safe，見設計文件 §6.1，但也代表這個檢查沒辦法只靠「查詢有沒有失敗」來做，
-必須實際比對回應內容）。
+For an additional active check, issue queries periodically with an unauthorized
+certificate and confirm the zone declaration really is ignored — that is, that
+the response is the ordinary non-zone-aware answer rather than a SERVFAIL or a
+connection-level refusal. `identity` treats "unauthorized" and "no certificate"
+as the same fallback, a deliberate fail-safe (design doc §6.1), which also means
+this check cannot rest on whether the query failed and must compare the response
+contents.
 
-# zonedns 節點端（agent）部署
+# Deploying the zonedns node side (the agent)
 
-`plugin/zonedns_agent` 判定發問 workload 的 zone、以 `(qname, qtype, zone)` 為
-key 快取答案，並以 mTLS DoH 向 central 宣告 zone。跟 central 一樣是 external
-CoreDNS plugin，必須編譯進 binary；不同的是它編譯進的不是普通 CoreDNS，而是
-`sigs.k8s.io/node-local-dns`（NodeLocal DNSCache，本質上也是 CoreDNS）。
+`plugin/zonedns_agent` determines the asking workload's zone, caches answers
+under `(qname, qtype, zone)`, and declares the zone to central over mTLS DoH.
+Like central it is an external CoreDNS plugin and must be compiled into the
+binary; unlike central, what it compiles into is not ordinary CoreDNS but
+`sigs.k8s.io/node-local-dns` — NodeLocal DNSCache, which is CoreDNS underneath.
 
-**這份文件的份量不是意外。** 這個系統幾乎每一種失效模式都會回一個看起來正常
-的答案，而不是報錯 —— 設定錯了不會自己喊出來。以下每一節都在回答同一個問題：
-哪一種設定錯誤會讓 zone 隔離安靜地失效。
+**The length of this document is not an accident.** Nearly every failure mode in
+this system returns an answer that looks normal rather than raising an error; a
+wrong setting does not announce itself. Every section below answers the same
+question: which misconfiguration makes zone isolation fail quietly.
 
-## 建置
+## Building
 
-1. 取得 `sigs.k8s.io/node-local-dns` 原始碼。
-2. 在 `cmd/node-cache/main.go` 的 blank import 區塊加入：
+1. Fetch the `sigs.k8s.io/node-local-dns` source.
+2. Add this to the blank import block in `cmd/node-cache/main.go`:
 
    ```go
    _ "github.com/jenting/zonedns/plugin/zonedns_agent"
    ```
 
-3. 把 `"zonedns_agent"` 插進 `dnsserver.Directives`，**位置必須在 `"cache"`
-   之前**。跟 central 端的 `CheckDirectiveOrder` 是同一種保護、同一個理由：
-   node-local-dns 內建的 `cache` plugin 以 `(qname, qtype)` 為 key，不含發問者
-   的 zone；若它排在前面，zone-a 的 pod 問過之後，zone-b 的 pod 會拿到同一份
-   答案，而且執行期沒有任何徵兆。`setup()` 一啟動就會呼叫
-   `CheckDirectiveOrder(dnsserver.Directives)`，順序錯誤會直接拒絕啟動而不是
-   靜默接受（見 `plugin/zonedns_agent/setup.go`）。
-4. **`go mod vendor`，不是 `go mod tidy`。** node-local-dns 把相依 vendor 進
-   repo（有 `vendor/` 目錄），所以加入本 module 後必須重新 vendor，否則建置會
-   以「marked as explicit in vendor/modules.txt, but not explicitly required in
-   go.mod」失敗。本 repo 是 private，容器內 `go get` 拉不到，因此還需要一條
-   `replace` 指向原始碼：
+3. Insert `"zonedns_agent"` into `dnsserver.Directives`, **before `"cache"`**.
+   It is the same guard as central's `CheckDirectiveOrder`, for the same reason:
+   node-local-dns's built-in `cache` plugin keys on `(qname, qtype)` and does not
+   include the asking workload's zone; with it first, once a zone-a pod has
+   asked, a zone-b pod receives that same answer, and there is no sign of it at
+   runtime. `setup()` calls `CheckDirectiveOrder(dnsserver.Directives)` the
+   moment it starts, and a wrong order is refused outright rather than accepted
+   silently (see `plugin/zonedns_agent/setup.go`).
+4. **`go mod vendor`, not `go mod tidy`.** node-local-dns vendors its
+   dependencies into the repo — there is a `vendor/` directory — so adding this
+   module requires re-vendoring, or the build fails with "marked as explicit in
+   vendor/modules.txt, but not explicitly required in go.mod". This repo is
+   private and `go get` cannot reach it from inside a container, so a `replace`
+   pointing at the source is needed too:
 
    ```bash
    go mod edit -replace github.com/jenting/zonedns=/path/to/zonedns
    go mod edit -require github.com/jenting/zonedns@v0.0.0
-   go mod tidy          # 必須在 vendor 之前
+   go mod tidy          # must come before vendor
    GOOS=linux go mod vendor
    ```
 
-   `go mod tidy` 不能省，也不能跟 vendor 對調：本 module 帶進上游 `go.mod` 沒有
-   的相依，沒先 tidy 的話 `go mod vendor` 會直接以
-   `updates to go.mod needed` 失敗。
+   `go mod tidy` cannot be skipped, and cannot swap places with vendor: this
+   module brings in dependencies upstream's `go.mod` does not have, and without
+   tidying first `go mod vendor` fails outright with
+   `updates to go.mod needed`.
 
-5. **vendor 與建置都必須指定 `GOOS=linux`。** 在 macOS 上直接 `go mod vendor`
-   會漏掉 `k8s.io/kubernetes/pkg/util/iptables` —— 它是 linux-only 的，而
-   node-local-dns 用它管理 iptables 規則。症狀是一連串
-   `undefined: utiliptables.Table`，看起來像相依版本衝突，實際上是 vendor 樹
-   缺了那個平台的檔案。node-local-dns 本來就只為 linux 建置，用它既有的
-   `Dockerfile.node-cache` 不會遇到這個問題；只有在本機直接建置時才會。
+5. **Both the vendoring and the build must specify `GOOS=linux`.** Running
+   `go mod vendor` directly on macOS omits
+   `k8s.io/kubernetes/pkg/util/iptables` — it is linux-only, and node-local-dns
+   uses it to manage iptables rules. The symptom is a run of
+   `undefined: utiliptables.Table`, which looks like a dependency version
+   conflict when the vendor tree is simply missing that platform's files.
+   node-local-dns only ever builds for linux, so its existing
+   `Dockerfile.node-cache` does not run into this; only a direct local build
+   does.
 
-6. 用 `sigs.k8s.io/node-local-dns` 既有的 `Makefile` 與 `Dockerfile.node-cache`
-   建置 —— 部署形態完全沿用該專案的產物，不需要另外自建 CI/CD 管線。
+6. Build with `sigs.k8s.io/node-local-dns`'s existing `Makefile` and
+   `Dockerfile.node-cache` — the deployment shape follows that project's
+   artifacts entirely, and no separate CI/CD pipeline is needed.
 
-以上步驟已實際驗證過：對 `sigs.k8s.io/node-local-dns` 主線建置成功，
-`zonedns_agent` 在產出的 binary 中正常載入（會走到 `NewMTLS` 才因為沒有 SPIRE
-socket 而停，代表 Corefile 解析與 plugin 註冊都成立）。
+These steps have been verified in practice: the build against
+`sigs.k8s.io/node-local-dns`'s mainline succeeds and `zonedns_agent` loads
+normally in the resulting binary — it reaches `NewMTLS` and stops there for want
+of a SPIRE socket, which shows both the Corefile parse and the plugin
+registration hold.
 
-## image 體積
+## Image size
 
-上游的 `node-local-dns` 只相依 `k8s.io/apimachinery`，不含 `client-go`。
-`zonedns_agent` 的 k8s 模式（`internal/podzone`）需要 `client-go` 建立本機
-pod 的 node-scoped informer，因此自建 image 明顯大於上游版本 —— 這是預期之內
-的取捨，不是建置設定出錯的徵兆。
+Upstream `node-local-dns` depends only on `k8s.io/apimachinery` and does not
+include `client-go`. `zonedns_agent`'s k8s mode (`internal/podzone`) needs
+`client-go` to build the node-scoped informer over local pods, so the self-built
+image is noticeably larger than upstream's — an expected trade, not a sign that
+the build configuration is wrong.
 
-實測（同一台機器、同一組建置參數、`linux/arm64`）：
+Measured on one machine with one set of build parameters, `linux/arm64`:
 
-| binary | 大小 |
+| Binary | Size |
 |---|---|
-| 上游 node-local-dns | 44.7 MB |
-| 含 `zonedns_agent` | 86.0 MB |
+| Upstream node-local-dns | 44.7 MB |
+| With `zonedns_agent` | 86.0 MB |
 
-**接近翻倍（+39.4 MB，+92%）。** 這個數字值得在導入前讓管理 image 散佈的人
-知道：每個節點都要拉這份 image。
+**Close to double: +39.4 MB, +92%.** This number is worth putting in front of
+whoever manages image distribution before adoption: every node pulls this image.
 
-VM 模式在執行期完全不會用到 `client-go`（見下方 Corefile），但因為 binary 是
-同一份，體積差異在兩種模式下都存在。
+VM mode never touches `client-go` at runtime (see the Corefile below), but since
+it is the same binary, the size difference is present in both modes.
 
-## 版本 pinning
+## Version pinning
 
-`go.mod` 把 k8s 相關套件（`k8s.io/api`、`k8s.io/apimachinery`、
-`k8s.io/client-go`）釘在 `v0.35.4`、`go` 指令釘在 `1.25.0`，刻意跟
-`sigs.k8s.io/node-local-dns` 上游用的版本完全一致，**不是**跟著這個 repo 自己
-的步調升級。往前推進任一個都會弄壞這個 plugin 存在的目的所要編譯進去的那個
-專案：
+`go.mod` pins the Kubernetes packages (`k8s.io/api`, `k8s.io/apimachinery`,
+`k8s.io/client-go`) to `v0.35.4` and the `go` directive to `1.25.0`,
+deliberately identical to what `sigs.k8s.io/node-local-dns` uses upstream rather
+than following this repo's own pace. Moving any of them forward breaks the very
+project this plugin exists to be compiled into:
 
-- `go` 指令若領先上游，會要求一個比上游 `node-local-dns` 建置環境更新的
-  Go toolchain；上游的建置腳本、CI image 未必配得起。
-- k8s 函式庫若領先上游，等於把上游自己相依的那份 Kubernetes 函式庫一併往前
-  拖，而那份函式庫底下還壓著 `k8s.io/kubernetes` 本身的版本相容性約束 ——
-  這不是這個 repo 能單方面決定的事。
+- A `go` directive ahead of upstream demands a newer Go toolchain than
+  upstream `node-local-dns`'s build environment, which its build scripts and CI
+  images may not provide.
+- Kubernetes libraries ahead of upstream drag upstream's own Kubernetes
+  dependency forward with them, and underneath that sit `k8s.io/kubernetes`'s own
+  version compatibility constraints — not something this repo can decide
+  unilaterally.
 
-升級這三個版本前，先確認 `sigs.k8s.io/node-local-dns` 上游本身已經升級到
-對應版本，而不是反過來。
+Before raising any of these three versions, confirm that
+`sigs.k8s.io/node-local-dns` upstream has already moved to the corresponding
+version, not the other way round.
 
-## Kubernetes manifest
+## Kubernetes manifests
 
-可直接套用的完整 manifest 在 `deploy/k8s/`（RBAC、ConfigMap、DaemonSet、
-ClusterSPIFFEID），含必須按環境替換的值一覽表。以下說明相對上游改了什麼。
+The complete, directly applyable manifests are in `deploy/k8s/` — RBAC,
+ConfigMap, DaemonSet and ClusterSPIFFEID — together with a table of the values
+that must be replaced per environment. What follows explains what changed
+relative to upstream.
 
-## DaemonSet 的變更
+## Changes to the DaemonSet
 
-部署形態（DaemonSet、每節點一份、link-local 位址、iptables 規則、pod 的
-`resolv.conf`）完全不變 —— 這是 §7 開頭就承諾的：新增 zone 時節點不需任何
-變更，換成 zone-aware image 也一樣不動既有拓樸。需要變更的只有三處：
+The deployment shape — a DaemonSet, one per node, the link-local address, the
+iptables rules, pods' `resolv.conf` — is entirely unchanged. This is what §7
+promised at the outset: adding a zone requires no change to any node, and
+switching to the zone-aware image leaves the existing topology alone too. Only
+three things change:
 
-1. **`image`** 指向前面建置出來的自建 registry。
-2. **RBAC** 加上 pods 的 `get`/`list`/`watch`（見下方）。
-3. **Corefile ConfigMap** 加一個新的 server block（見下方），其餘既有的
-   `cluster.local:53`、`.:53` 區塊不動。
+1. **`image`** points at the self-built registry from the previous section.
+2. **RBAC** gains `get`/`list`/`watch` on pods (see below).
+3. **The Corefile ConfigMap** gains one new server block (see below), leaving the
+   existing `cluster.local:53` and `.:53` blocks alone.
 
 ## Corefile
 
-跟 central 端一樣，`zonedns_agent` 只負責參與 zone 路由的網域，放在獨立的
-server block；node-local-dns 既有的 cluster-internal 解析與預設 forward 完全
-不受影響。
+As on the central side, `zonedns_agent` handles only the zone-routed domains, in
+a server block of its own; node-local-dns's existing cluster-internal resolution
+and default forward are entirely unaffected.
 
-### k8s 模式
+### Kubernetes mode
 
 ```
-cluster.local:53 { ... 既有設定完全不動 ... }
+cluster.local:53 { ... existing configuration entirely untouched ... }
 
 example.com:53 {
     zonedns_agent {
@@ -374,12 +421,13 @@ example.com:53 {
     }
 }
 
-.:53 { ... 既有 cache + forward 完全不動 ... }
+.:53 { ... existing cache + forward entirely untouched ... }
 ```
 
-`{$NODE_NAME}` 由 downward API 注入的環境變數展開（`spec.nodeName`）。
+`{$NODE_NAME}` expands from the environment variable injected by the downward
+API (`spec.nodeName`).
 
-### VM 模式
+### VM mode
 
 ```
 example.com:53 {
@@ -394,33 +442,34 @@ example.com:53 {
 }
 ```
 
-VM 模式不需要 `node_name` 與 `zone_label`（沒有 per-query 判斷，整台機器一個
-zone），改用 `zone` 直接指定。
+VM mode needs neither `node_name` nor `zone_label` — there is no per-query
+determination, the whole machine has one zone — and specifies it directly with
+`zone`.
 
-### `zonedns_agent` 區塊的設定項
+### Options in the `zonedns_agent` block
 
-以下是 `plugin/zonedns_agent/setup.go` 的 `parseConfig` 實際支援、且僅支援的
-選項；沒有列出的名字會被直接拒絕。
+These are the options `parseConfig` in `plugin/zonedns_agent/setup.go` actually
+supports, and the only ones; any name not listed is refused outright.
 
-| 選項 | 必要性 | 說明 |
+| Option | Required? | What it does |
 |---|---|---|
-| `mode` | **必要**，`k8s` 或 `vm` | 決定用哪一種 `ZoneResolver`。其他值直接拒絕。 |
-| `upstream` | **必要** | central 的位址，**不含路徑**。DoH 路徑固定是 `/dns-query`，由 CoreDNS 的 doh 套件自動接上；若自己寫進去，實際請求會變成 `/dns-query/dns-query`，central 回 HTTP 404，而 agent 端只看得到「上游回 404」，指不到原因 —— 因此帶路徑的值會在啟動時被拒絕。必須是 `https://` URL。純 `http://` 會在啟動時被拒絕 —— 不是風格偏好：走純文字傳輸時，`http.Transport` 的 `TLSClientConfig` 根本不會被用上，`central_spiffe_id` 的 SPIFFE pin 形同虛設，而且不會有任何錯誤或警告，查詢照常送出去。 |
-| `central_spiffe_id` | **必要，無預設值** | 少了它，信任域內任何一張 SVID 都能冒充 central，而 agent 對收到的答案沒有任何獨立查核手段，會完整採信。 |
-| `workload_api` | **必要** | agent 自己的 SPIRE Workload API socket，取得出示給 central 的 SVID。 |
-| `zone` | `vm` 模式**必要** | 該 VM 所屬的 zone；必須通過 `ednszone.Valid`（字母、數字、`-`、`_`，長度不超過 63 bytes），否則 central 會靜默忽略這台 VM 的 zone 宣告。 |
-| `node_name` | `k8s` 模式**必要** | 由 downward API 注入，`podzone.Watcher` 用它把 pod watch 過濾到本節點。 |
-| `zone_label` | 選填，預設 `zone` | 讀取 pod 上哪一個 label 當作 zone；必須跟 SPIRE 的 `spiffeIDTemplate` 讀的是同一個 label（見 central 部署一節），否則節點端判定的 zone 會跟 registry 裡的 zone 對不上。 |
-| `cache_size` | 選填，預設 `4096` | zone-aware 快取的筆數上限；必須是正整數。 |
-| `node_ip` | 選填，也可用 `NODE_IP` 環境變數 | 本機節點自己的位址，僅用於偵測 masquerade（source IP 等於節點 IP 時無法判斷是哪個 workload 在問）。**兩個來源中任一個若給了格式錯誤的值，都是啟動失敗，不是被靜默忽略** —— 這個位址是 masquerade 偵測唯一的依據，DaemonSet manifest 裡打錯一個字元若被吞掉，就會沒有任何記錄地讓這個訊號永遠不動。Corefile 的 `node_ip` 優先於環境變數（後解析）。 |
-| `edns0_code` | 選填，預設 `65001` | agent/central 之間攜帶 source zone 的 EDNS0 option code，須落在 IANA local/experimental 區間 `65001`–`65534`，驗證規則與 central 端的 `edns0_code`（見本文件前段）完全一致。**必須與 central Corefile 的 `edns0_code` 相同**，見下一節。 |
+| `mode` | **Required**, `k8s` or `vm` | Chooses which `ZoneResolver` is used. Any other value is refused. |
+| `upstream` | **Required** | Central's address, **without a path**. The DoH path is always `/dns-query` and CoreDNS's doh package appends it; writing it in yourself makes the actual request `/dns-query/dns-query`, central answers HTTP 404, and all the agent sees is "upstream returned 404", which points at nothing — so a value carrying a path is refused at startup. It must be an `https://` URL. Plain `http://` is refused at startup, and not as a matter of style: over a plaintext transport the `http.Transport`'s `TLSClientConfig` is never consulted, the SPIFFE pin from `central_spiffe_id` is moot, and there is no error or warning while queries go out as usual. |
+| `central_spiffe_id` | **Required, no default** | Without it, any SVID in the trust domain can impersonate central, and the agent — having no independent way to check the answers it receives — believes them entirely. |
+| `workload_api` | **Required** | The agent's own SPIRE Workload API socket, through which it obtains the SVID it presents to central. |
+| `zone` | **Required** in `vm` mode | The zone this VM belongs to. It must pass `ednszone.Valid` — letters, digits, `-`, `_`, at most 63 bytes — or central silently ignores this VM's zone declaration. |
+| `node_name` | **Required** in `k8s` mode | Injected by the downward API; `podzone.Watcher` uses it to filter the pod watch to this node. |
+| `zone_label` | Optional, defaults to `zone` | Which label on a pod is read as its zone. It must be the same label SPIRE's `spiffeIDTemplate` reads (see the central deployment section), or the zone the node determines will not match the zone in the registry. |
+| `cache_size` | Optional, defaults to `4096` | The maximum number of entries in the zone-aware cache; must be a positive integer. |
+| `node_ip` | Optional; also settable through the `NODE_IP` environment variable | This node's own address, used only to detect masquerading — when the source IP equals the node IP there is no way to tell which workload is asking. **A malformed value from either source fails startup rather than being ignored silently**: this address is the sole basis for masquerade detection, and swallowing one mistyped character in the DaemonSet manifest would leave that signal permanently dead with nothing recorded. The Corefile's `node_ip` takes precedence over the environment variable, being parsed later. |
+| `edns0_code` | Optional, defaults to `65001` | The EDNS0 option code carrying the source zone between agent and central. Must fall in IANA's local/experimental range `65001`–`65534`, validated exactly as central's `edns0_code` is (see earlier in this document). **It must be identical to the `edns0_code` in central's Corefile**; see the next section. |
 
-`central_spiffe_id`、`workload_api`、`cache_size` 在 k8s／vm 兩種模式下語意相同，
-不隨模式改變。
+`central_spiffe_id`, `workload_api` and `cache_size` mean the same thing in both
+k8s and vm mode and do not vary with it.
 
 ## RBAC
 
-k8s 模式需要的最小權限：
+The minimum permissions k8s mode needs:
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -433,94 +482,110 @@ rules:
     verbs: ["get", "list", "watch"]
 ```
 
-繫結給 node-local-dns DaemonSet 使用的 ServiceAccount。VM 模式不需要這份
-RBAC —— `NewStaticResolver` 不接觸 Kubernetes API。
+Bound to the ServiceAccount the node-local-dns DaemonSet uses. VM mode needs none
+of this RBAC — `NewStaticResolver` never touches the Kubernetes API.
 
-## 必要的告警
+## Required alerts
 
-以下 metric 定義於 `plugin/zonedns_agent/metrics.go`，皆以
-`coredns_zonedns_agent_` 為字首（CoreDNS 的 metrics namespace 是 `coredns`，
-subsystem 是 `zonedns_agent`）。
+These metrics are defined in `plugin/zonedns_agent/metrics.go` and all carry the
+`coredns_zonedns_agent_` prefix — CoreDNS's metrics namespace is `coredns` and
+the subsystem is `zonedns_agent`.
 
-| Metric | 條件 | 意義 |
+| Metric | Condition | Meaning |
 |---|---|---|
-| `coredns_zonedns_agent_zone_resolution_total{result="node_ip"}` | 任何非零增長 | 查詢的 source IP 等於節點自己的 IP：節點上有東西在做 SNAT/masquerade 改寫來源位址，或這是一個 hostNetwork workload。兩種情況都無法判斷是哪個 workload 在問，整個節點會靜默退化成不宣告 zone |
-| `coredns_zonedns_agent_zone_resolution_total{result="unknown"}` | 持續增長 | 有 pod 沒有 zone label，或本機 informer 落後於 pod 建立（k8s 模式）|
-| `coredns_zonedns_agent_resolver_ready` | `== 0` 超過一個啟動週期 | pod watcher 尚未完成初次同步，所有查詢都不宣告 zone（VM 模式一律是 1，不適用） |
-| `coredns_zonedns_agent_upstream_errors_total` | 任何非零增長 | 對 central 的 DoH exchange 失敗；查詢會回 SERVFAIL 而不是交給下一個 plugin（本 plugin 沒有下一個 plugin 可交） |
-| `coredns_zonedns_agent_cache_total{result="miss"}` | 佔比異常高 | 快取容量（`cache_size`）不足，或 central 給的 TTL 過短，導致大部分查詢都要繞去問一次 central |
+| `coredns_zonedns_agent_zone_resolution_total{result="node_ip"}` | Any non-zero growth | A query's source IP equals the node's own: either something on the node is doing SNAT/masquerading and rewriting source addresses, or this is a hostNetwork workload. In neither case can the asking workload be identified, and the whole node silently degrades to declaring no zone |
+| `coredns_zonedns_agent_zone_resolution_total{result="unknown"}` | Sustained growth | Some pod has no zone label, or the local informer is lagging behind pod creation (k8s mode) |
+| `coredns_zonedns_agent_resolver_ready` | `== 0` for longer than one startup cycle | The pod watcher has not finished its first sync and no query declares a zone (always 1 in VM mode, where it does not apply) |
+| `coredns_zonedns_agent_upstream_errors_total` | Any non-zero growth | A DoH exchange with central failed; the query returns SERVFAIL rather than passing to the next plugin (this plugin has no next plugin to pass to) |
+| `coredns_zonedns_agent_cache_total{result="miss"}` | An unusually high proportion | The cache is too small (`cache_size`), or the TTL central hands out is too short, so most queries make the round trip to central |
 
-`coredns_zonedns_agent_zone_resolution_total{result="bad_source"}` 與
-`{result="ok"}` 不是告警項，但排查時有用：`bad_source` 代表拿到的 source IP
-無法解析（幾乎不該發生），`ok` 是正常判定成功的計數，可以拿來對照
-`unknown`／`node_ip` 的比例是否異常。
+`coredns_zonedns_agent_zone_resolution_total{result="bad_source"}` and
+`{result="ok"}` are not alerts but are useful while investigating: `bad_source`
+means the source IP received could not be parsed, which should almost never
+happen, and `ok` counts ordinary successful determinations, useful for judging
+whether the proportion of `unknown`/`node_ip` is out of the ordinary.
 
-## 兩端必須成對維護的設定
+## Settings that must be maintained as a pair
 
-zone 路由的信任關係是雙向釘住的，兩邊都要改，改一邊就會有一邊靜默停止運作：
+Zone routing's trust relationship is pinned in both directions. Both sides must
+change together, and changing one leaves the other silently out of service:
 
-- **agent → central**：agent 出示給 central 的 SVID，其 SPIFFE ID 必須出現在
-  central Corefile 的 `authorized_agent` 清單中（見本文件前段）。若不在清單
-  裡，central 會忽略這個 agent 宣告的所有 zone，查詢一律走非 zone-aware 路徑
-  —— 不會拒絕連線，`coredns_zonedns_source_zone_total{reason="unauthorized_agent"}`
-  才是唯一會動的訊號。
-- **central → agent**：central 自己的 SPIFFE ID 必須填在 agent Corefile 的
-  `central_spiffe_id`。這一項本來就是啟動時的必填項，不會出現「忘了填」的
-  情況，但若填的 SPIFFE ID 跟 central 實際出示的 SVID 不一致（例如 central
-  換了憑證但這裡沒同步更新），mTLS 握手會直接失敗，`upstream_errors_total`
-  上升、查詢回 SERVFAIL —— 這一側的失效不是靜默的，因為 `AuthorizeID` 拒絕連線
-  本身就是可觀測事件。
-- **agent ↔ central 的 `edns0_code`**：兩端 Corefile 的 `edns0_code` 必須是
-  同一個值。兩邊都有各自的預設值 `65001`，只要都不改就自動一致；一旦其中一端
-  被改成非預設值而另一端沒有同步，agent 會繼續在它自己的 code 上寫入 zone，
-  但 central 端的 `ednszone.Get` 讀的是另一個 code，等於「沒有這個 option」——
-  查詢仍然「正常」回應，只是每一筆都回退到非 zone-aware 的一般答案，
-  且沒有任何一端的啟動流程能偵測出這個不一致（兩個值各自都通過各自的
-  範圍檢查）。改動任一端的 `edns0_code` 之前，先確認另一端會同時改。
+- **agent → central**: the SPIFFE ID of the SVID the agent presents to central
+  must appear in the `authorized_agent` list of central's Corefile (see earlier
+  in this document). Absent from that list, central ignores every zone this
+  agent declares and every query takes the non-zone-aware path — the connection
+  is not refused, and
+  `coredns_zonedns_source_zone_total{reason="unauthorized_agent"}` is the only
+  signal that moves.
+- **central → agent**: central's own SPIFFE ID must be set as
+  `central_spiffe_id` in the agent's Corefile. It is required at startup anyway,
+  so it cannot simply be forgotten; but if the SPIFFE ID set here does not match
+  the SVID central actually presents — central rotated its certificate and this
+  was not updated with it — the mTLS handshake fails outright,
+  `upstream_errors_total` rises, and queries return SERVFAIL. This side's failure
+  is not silent, because `AuthorizeID` refusing the connection is itself an
+  observable event.
+- **`edns0_code` on both sides**: the `edns0_code` in both Corefiles must be the
+  same value. Each side defaults to `65001`, so leaving both alone keeps them in
+  step automatically; but once one side is changed to a non-default value and the
+  other is not, the agent keeps writing the zone under its own code while
+  central's `ednszone.Get` reads a different one — which amounts to "the option
+  is not there". Queries still respond "normally", every one of them falling back
+  to the ordinary non-zone-aware answer, and neither side's startup can detect
+  the mismatch, since both values pass their own range checks. Before changing
+  `edns0_code` on either side, confirm the other will change at the same time.
 
-新增一個節點時，記得把它的 SPIFFE ID（由 SPIRE registration entry 決定，見
-central 部署一節）加進 `authorized_agent`；除役一個節點時記得從清單移除，
-否則舊節點的憑證只要還沒過期就仍是有效的授權來源。
+When adding a node, remember to add its SPIFFE ID — determined by its SPIRE
+registration entry, see the central deployment section — to `authorized_agent`;
+when decommissioning one, remember to remove it, since the old node's certificate
+remains a valid authorized source for as long as it has not expired.
 
-## 漂移檢查（zonedns-drift）
+## The drift check (zonedns-drift)
 
-上面那些是「兩端」之間的成對設定；還有一組成對宣告不在兩端之間，而在**部署契約
-裡**：一個 workload 的對外名稱同時被寫在 pod 的 `zonedns.io/host` label 與 Istio
-VirtualService 的 `hosts:`。前者經 `ClusterSPIFFEID` 的 `dnsNameTemplates` 變成
-SPIRE entry 的 dns_name，也就是 central registry 的 key；後者決定 client 實際查
-什麼名字。
+The above are pairs of settings between the two ends; there is another pair that
+lives not between the ends but in **the deployment contract**: a workload's
+external name is written both in the pod's `zonedns.io/host` label and in the
+Istio VirtualService's `hosts:`. The former becomes the dns_name of the SPIRE
+entry through the `ClusterSPIFFEID`'s `dnsNameTemplates`, and therefore the key of
+central's registry; the latter determines the name clients actually query.
 
-**漂移時沒有任何東西會報錯。** central 在 registry 裡查不到那個名字，就把它當成
-不歸自己管而交給下游 —— 查詢照常有答案，只是那個服務靜靜地失去 zone 路由。既不會
-SERVFAIL，也不會有告警：`unauthorized_agent` 不會動，`upstream_errors_total` 不會
-動，因為兩端都運作正常，只是在談論不同的名字。
+**When they drift, nothing raises an error.** Central cannot find the name in the
+registry, treats it as not its own and hands it downstream — queries keep
+returning answers while that service silently loses zone routing. There is no
+SERVFAIL and no alert: `unauthorized_agent` does not move,
+`upstream_errors_total` does not move, because both ends are working perfectly
+well and simply talking about different names.
 
 ```bash
 go run ./cmd/zonedns-drift --show-skipped
 ```
 
-| 離開碼 | 意義 | 該做什麼 |
+| Exit code | Meaning | What to do |
 |---|---|---|
-| 0 | 沒有漂移 | — |
-| 1 | 發現漂移 | 依報告修正 label 或 VirtualService |
-| 2 | 檢查失敗 | 修好之後重跑 —— **這不是「沒有漂移」** |
+| 0 | No drift | — |
+| 1 | Drift found | Fix the label or the VirtualService per the report |
+| 2 | The check failed | Fix that and re-run — **this is not "no drift"** |
 
-報告分兩個方向：
+The report has two directions:
 
-- **沒有 pod 認領的 VirtualService host** —— 危險的一邊。client 會查這個名字，
-  registry 沒有它，所以它永遠拿不到跨 zone 的正確答案。
-- **沒有 VirtualService 宣告的 pod label** —— registry 裡多一筆沒人會查的資料。
-  通常是打錯字或改名時漏改，本身無害，但它幾乎總是伴隨著前一種。
+- **VirtualService hosts no pod claims** — the dangerous side. Clients query this
+  name, the registry does not have it, and so it never receives the correct
+  cross-zone answer.
+- **Pod labels no VirtualService declares** — one more registry entry nobody
+  queries. Usually a typo, or a rename where one side was missed; harmless in
+  itself, but it almost always accompanies the first kind.
 
-改名是最典型的觸發情境：改了 VirtualService 忘了改 label（或反過來），一次改動
-會同時在兩個方向產生一筆。
+A rename is the most typical trigger: change the VirtualService and forget the
+label, or the other way round, and one change produces an entry in both
+directions at once.
 
-### 什麼時候跑
+### When to run it
 
-- **CI**：對 staging 叢集跑，離開碼 1 直接擋下部署。
-- **CronJob**：正式叢集每小時跑一次。漂移多半是人改出來的，不會自己好。
+- **In CI**: against a staging cluster, with exit code 1 blocking the deployment.
+- **As a CronJob**: hourly against production. Drift is nearly always something a
+  person introduced, and it does not heal on its own.
 
-叢集內執行需要的權限 —— cluster 範圍的 `list`：
+Permissions needed to run inside the cluster — cluster-wide `list`:
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -536,16 +601,19 @@ rules:
     verbs: ["list"]
 ```
 
-權限不足時工具會以離開碼 2 失敗並印出原始的 Forbidden 錯誤，不會被誤判成
-「沒裝 Istio CRD」，也不會被當成一份乾淨的報告。
+With insufficient permission the tool fails with exit code 2 and prints the
+original Forbidden error, which is neither mistaken for "Istio's CRD is not
+installed" nor passed off as a clean report.
 
-`--namespace` 可以限縮到單一 namespace。**正式用途不要用它**：Istio 允許 A
-namespace 的 VirtualService 指向 B namespace 的服務，限縮後那種設定會被誤報成
-「沒有 pod 認領」。它存在是為了測試與範圍受限的檢查。
+`--namespace` narrows the check to a single namespace. **Do not use it for real
+checks**: Istio lets a VirtualService in namespace A point at a service in
+namespace B, and scoping reports that arrangement as "no pod claims it". It
+exists for testing and deliberately scoped checks.
 
-### 它不檢查什麼
+### What it does not check
 
-只比對名稱。兩邊都對得上的名稱**仍然可能指向錯誤的 workload** —— 要驗那件事得
-追蹤 VirtualService → destination Service → pod 的路由，也就是設計時評估後否決
-的 Istio traversal 方案（見設計文件 §9 限制 2）。工具每次報告都會把這句話印
-出來，避免一份乾淨報告被讀成「設定正確」。
+Names only. Names matching on both sides **can still point at the wrong
+workload** — verifying that would mean tracing the route from VirtualService to
+destination Service to pod, the Istio traversal approach considered and rejected
+during design (see design doc §9, limitation 2). The tool prints this sentence in
+every report, so a clean one cannot be read as "correctly configured".

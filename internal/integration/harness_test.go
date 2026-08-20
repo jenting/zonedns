@@ -1,12 +1,14 @@
-// Package integration 把節點端與中心端接起來測試。
+// Package integration tests the node side and the central side wired together.
 //
-// 為什麼需要它：兩端不共用程式碼，只共用 internal/ednszone 定義的線上格式。
-// 各自的單元測試都在自己那一側驗證那個格式，所以只要兩邊對格式的理解一致地
-// 錯了，兩邊都是綠的。真實部署時才會發現 —— 而且症狀通常是「查詢有答案，只是
-// 不再分 zone」，沒有任何錯誤。
+// Why it is needed: the two ends share no code, only the wire format defined by
+// internal/ednszone. Each side's unit tests verify that format on its own side,
+// so if both sides misunderstand it in the same way, both stay green. The
+// mistake surfaces only in a real deployment — and the symptom is usually
+// "queries still return answers, they just stop distinguishing zones", with no
+// error at all.
 //
-// 這個 harness 讓真正的 Agent.ServeDNS 經過真實的 mTLS 握手，打到真正的
-// ZoneDNS.ServeDNS，中間不替換任何一端的邏輯。
+// This harness runs the real Agent.ServeDNS through a real mTLS handshake into
+// the real ZoneDNS.ServeDNS, substituting neither end's logic.
 package integration
 
 import (
@@ -44,13 +46,14 @@ const (
 	downstreamIP = "10.96.0.7"
 )
 
-// options 讓每個案例只覆寫它關心的那一項，其餘用一致的預設。
+// options lets each case override only what it cares about, with consistent
+// defaults for the rest.
 type options struct {
-	agentZone      string // agent 宣告的 zone
-	agentEDNS0Code uint16 // 節點端使用的 option code
-	centralCode    uint16 // 中心端期待的 option code
-	clientSPIFFEID string // agent 出示的憑證身分
-	upstreamPath   string // 附加在 upstream URL 後的路徑（用來重現路徑重複的錯誤）
+	agentZone      string // the zone the agent declares
+	agentEDNS0Code uint16 // the option code the node side uses
+	centralCode    uint16 // the option code central expects
+	clientSPIFFEID string // the identity in the certificate the agent presents
+	upstreamPath   string // path appended to the upstream URL, to reproduce the doubled-path bug
 }
 
 func defaults() options {
@@ -62,8 +65,9 @@ func defaults() options {
 	}
 }
 
-// downstream 模擬 central 背後的一般 DNS —— 同 zone 或不歸 zonedns 管的名字
-// 最終會落到這裡。回一個固定位址，讓測試分得出「走了 zone 路由」與「沒走」。
+// downstream stands in for the ordinary DNS behind central — same-zone names, and
+// names that are not zonedns's business, end up here. It returns one fixed
+// address so tests can tell zone routing from its absence.
 type downstream struct{ called bool }
 
 func (d *downstream) Name() string { return "downstream" }
@@ -76,22 +80,24 @@ func (d *downstream) ServeDNS(_ context.Context, w dns.ResponseWriter, r *dns.Ms
 	return dns.RcodeSuccess, nil
 }
 
-// stack 是接好的兩端。
+// stack is the two ends wired together.
 type stack struct {
 	agent      agentplugin.Agent
 	downstream *downstream
 	server     *httptest.Server
-	// seenPath 記錄 central 實際收到的 HTTP 路徑。
+	// seenPath records the HTTP path central actually received.
 	seenPath string
 }
 
 func (s *stack) Close() { s.server.Close() }
 
-// query 從 client 的角度發一個查詢。
+// query sends a query from a client's point of view.
 //
-// 回傳 rcode 與寫出的訊息。訊息可能是 nil —— 失敗路徑刻意不自己寫回應，因為
-// plugin.ClientWrite(RcodeServerFailure) 為 false，由 CoreDNS 的 server 產生
-// 那個回應。斷言失敗情境時要看 rcode，不是看訊息內容。
+// It returns the rcode and the message written. The message may be nil — the
+// failure path deliberately writes no response of its own, because
+// plugin.ClientWrite(RcodeServerFailure) is false and CoreDNS's server produces
+// that response instead. Assertions about failure must look at the rcode, not at
+// the message contents.
 func (s *stack) query(t *testing.T, qname string, qtype uint16, clientIP string) (int, *dns.Msg) {
 	t.Helper()
 	m := new(dns.Msg)
@@ -99,7 +105,8 @@ func (s *stack) query(t *testing.T, qname string, qtype uint16, clientIP string)
 	return s.queryMsg(t, m, clientIP)
 }
 
-// queryMsg 發一個呼叫端自己組好的查詢 —— 用來模擬 client 帶了自製的 EDNS0 內容。
+// queryMsg sends a query the caller assembled — used to simulate a client
+// carrying EDNS0 contents of its own making.
 func (s *stack) queryMsg(t *testing.T, m *dns.Msg, clientIP string) (int, *dns.Msg) {
 	t.Helper()
 	w := &test.ResponseWriter{}
@@ -113,12 +120,14 @@ func (s *stack) queryMsg(t *testing.T, m *dns.Msg, clientIP string) (int, *dns.M
 	return code, rec.Msg
 }
 
-// newStack 把兩端接起來。
+// newStack wires the two ends together.
 //
-// central 那側刻意用 CoreDNS 自己的 doh 套件解析請求，並套用跟 CoreDNS 的 DoH
-// server 完全相同的路徑檢查（r.URL.Path == doh.Path）。寬鬆的測試替身會複製它
-// 本來要防的盲點：真實部署裡 upstream URL 若多帶了路徑，central 會回 404，而
-// 一個接受任何路徑的假伺服器永遠不會顯示這件事。
+// The central side deliberately parses requests with CoreDNS's own doh package
+// and applies exactly the path check CoreDNS's DoH server applies
+// (r.URL.Path == doh.Path). A permissive test double reproduces the very blind
+// spot it exists to prevent: in a real deployment an upstream URL carrying an
+// extra path makes central answer 404, and a fake server that accepts any path
+// would never reveal it.
 func newStack(t *testing.T, opt options) *stack {
 	t.Helper()
 
@@ -126,7 +135,7 @@ func newStack(t *testing.T, opt options) *stack {
 	serverCert := ca.Issue(t, centralSPIFFEID)
 	clientCert := ca.Issue(t, opt.clientSPIFFEID)
 
-	// ── 中心端：真的 ZoneDNS handler
+	// ── Central side: the real ZoneDNS handler
 	store := registry.NewStore()
 	snap, _ := registry.BuildSnapshot([]registry.Entry{
 		{SPIFFEIDPath: "/zone/zone-a/ns/prod/sa/payments", DNSNames: []string{"payments.example.com"}},
@@ -150,7 +159,7 @@ func newStack(t *testing.T, opt options) *stack {
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.seenPath = r.URL.Path
-		// 與 CoreDNS 的 DoH server 相同的檢查，一字不改。
+		// The same check CoreDNS's DoH server applies, word for word.
 		if r.URL.Path != doh.Path {
 			http.Error(w, "", http.StatusNotFound)
 			return
@@ -160,8 +169,8 @@ func newStack(t *testing.T, opt options) *stack {
 			http.Error(w, "", http.StatusBadRequest)
 			return
 		}
-		// CoreDNS 的 DoH server 把 *http.Request 放進 context，identity 就是從
-		// 那裡取 peer certificate 的。
+		// CoreDNS's DoH server puts the *http.Request into the context, and that is
+		// where identity takes the peer certificate from.
 		ctx := context.WithValue(r.Context(), dnsserver.HTTPRequestKey{}, r)
 		rec := dnstest.NewRecorder(&test.ResponseWriter{})
 		if _, err := central.ServeDNS(ctx, rec, req); err != nil {
@@ -186,7 +195,7 @@ func newStack(t *testing.T, opt options) *stack {
 	srv.StartTLS()
 	s.server = srv
 
-	// ── 節點端：真的 Agent，經真實 mTLS 連上上面那個 server
+	// ── Node side: the real Agent, connecting to that server over real mTLS
 	hc := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{
 		Certificates: []tls.Certificate{clientCert},
 		RootCAs:      ca.Pool(),
@@ -208,8 +217,9 @@ func newStack(t *testing.T, opt options) *stack {
 	return s
 }
 
-// staticZone 讓每個查詢都被判定成同一個 zone —— 這裡要測的是兩端的協定，
-// 不是節點端怎麼查出 zone（那有 podzone 自己的測試）。
+// staticZone resolves every query to the same zone — what is under test here is
+// the protocol between the two ends, not how the node side determines the zone
+// (podzone has its own tests for that).
 type staticZone string
 
 func (z staticZone) Zone(netip.Addr) (string, bool) {
