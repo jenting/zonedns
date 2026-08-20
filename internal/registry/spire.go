@@ -1,8 +1,9 @@
-// Package registry（本檔）負責從 SPIRE Server 取得 registration entry。
+// This file of package registry fetches registration entries from SPIRE Server.
 //
-// SPIRE 的 Entry API 沒有 watch/stream RPC：ListEntries 是分頁的一元呼叫，唯一的
-// 串流 RPC（SyncAuthorizedEntries）是給 agent 同步自己被授權的 entry 用的，不能
-// 列出全部 entry。因此本檔實作的是輪詢器而非監看器。
+// SPIRE's Entry API has no watch or stream RPC: ListEntries is a paginated unary
+// call, and the one streaming RPC (SyncAuthorizedEntries) exists for an agent to
+// sync the entries it is authorized for — it cannot list them all. So what this
+// file implements is a poller, not a watcher.
 package registry
 
 import (
@@ -18,39 +19,43 @@ import (
 
 var log = clog.NewWithPlugin("zonedns")
 
-// EntryLister 取得一頁 registration entry。
+// EntryLister fetches one page of registration entries.
 //
-// 抽成介面是為了讓輪詢邏輯（分頁、錯誤處理、快照替換）可以脫離 gRPC 測試。
+// It is an interface so the polling logic — pagination, error handling, snapshot
+// replacement — can be tested without gRPC.
 type EntryLister interface {
 	ListEntries(ctx context.Context, pageToken string) ([]Entry, string, error)
 }
 
-// pageSize 是每次向 SPIRE 索取的 entry 數。
+// pageSize is how many entries are requested from SPIRE at a time.
 const pageSize = 500
 
-// maxPollPages 是單次 PollOnce 最多追隨的分頁數。
+// maxPollPages bounds how many pages a single PollOnce will follow.
 //
-// 這是防禦性上限：SPIRE 沒有已知部署會逼近 pageSize(500) * maxPollPages =
-// 5,000,000 筆 entry（SPIRE 官方文件描述的測試規模落在數萬筆等級），所以任何
-// 合法的 registry 都不可能碰到這個上限。它存在的目的是防止一個行為異常的
-// SPIRE server（例如永遠回傳非空的 NextPageToken）讓 PollOnce 無限迴圈：那樣
-// all 會無限成長且永遠不會產生新快照，而 Run 也不會記錄任何錯誤 —— 對外看
-// 起來像是「凍結在最後一次成功的快照」，但實際上是卡死且持續漏記憶體。超過
-// 上限時視為錯誤，走既有的失敗路徑（保留舊快照）。
+// A defensive limit: no known SPIRE deployment approaches pageSize(500) *
+// maxPollPages = 5,000,000 entries — SPIRE's own documentation describes test
+// scales in the tens of thousands — so no legitimate registry can reach it. It
+// exists to stop a misbehaving SPIRE server (one that always returns a non-empty
+// NextPageToken, say) from spinning PollOnce forever: `all` would grow without
+// bound, no new snapshot would ever be produced, and Run would log no error —
+// looking from outside like "frozen on the last successful snapshot" while
+// really being wedged and leaking memory. Exceeding the limit is an error and
+// takes the existing failure path, which keeps the old snapshot.
 const maxPollPages = 10000
 
 type spireLister struct {
 	client entryv1.EntryClient
 }
 
-// NewSPIRELister 以 SPIRE Entry API 實作 EntryLister。
+// NewSPIRELister implements EntryLister over the SPIRE Entry API.
 //
-// 注意 Entry API 沒有 watch/stream RPC：ListEntries 是分頁的一元呼叫，唯一的串流
-// RPC (SyncAuthorizedEntries) 是給 agent 同步自己被授權的 entry 用的，不能列出全部。
-// 因此這裡是輪詢而非監看。
+// Note that the Entry API has no watch or stream RPC: ListEntries is a paginated
+// unary call, and the one streaming RPC (SyncAuthorizedEntries) exists for an
+// agent to sync the entries it is authorized for — it cannot list them all. So
+// this polls rather than watches.
 //
-// 呼叫此 API 需要 admin SVID —— central 所在主機的 SPIRE registration entry 必須
-// 設定 admin: true。
+// Calling this API requires an admin SVID: the SPIRE registration entry for the
+// host central runs on must set admin: true.
 func NewSPIRELister(client entryv1.EntryClient) EntryLister {
 	return &spireLister{client: client}
 }
@@ -59,7 +64,8 @@ func (l *spireLister) ListEntries(ctx context.Context, pageToken string) ([]Entr
 	resp, err := l.client.ListEntries(ctx, &entryv1.ListEntriesRequest{
 		PageSize:  pageSize,
 		PageToken: pageToken,
-		// 只取需要的兩個欄位，避免把 selector 等大量無關資料拉過來。
+		// Request only the two fields needed, so selectors and other bulk we do not
+		// use are not pulled across.
 		OutputMask: &types.EntryMask{
 			SpiffeId: true,
 			DnsNames: true,
@@ -82,63 +88,75 @@ func (l *spireLister) ListEntries(ctx context.Context, pageToken string) ([]Entr
 	return out, resp.NextPageToken, nil
 }
 
-// Poller 週期性地把 SPIRE 的 entry 拉成新快照放進 Store。
+// Poller periodically pulls SPIRE's entries into a new snapshot in the Store.
 type Poller struct {
 	lister   EntryLister
 	store    *Store
 	interval time.Duration
 
-	// pollErrors 記錄這個 Poller 連續輪詢失敗的次數。
+	// pollErrors counts this Poller's consecutive polling failures.
 	//
-	// 這是 Poller 的欄位而非套件層級變數 —— 目前的部署只會建立一個 Poller，
-	// 兩種做法效果相同，但套件層級的單一計數器會被「本 process 中每一個
-	// Poller」共用：將來若有第二個 Poller（例如同時輪詢兩個 SPIRE Server），
-	// 它會跟第一個共用同一個計數器而非各自獨立計數，讓 ConsecutivePollErrors
-	// 這個「連續失敗次數」的意義變得不可靠。做成欄位讓每個 Poller 天生互相
-	// 獨立，不必等到真的出現第二個 Poller 才發現這個問題。
+	// It is a field on Poller rather than a package-level variable. The current
+	// deployment builds only one Poller, so the two are equivalent today, but a
+	// single package-level counter would be shared by every Poller in the process:
+	// a second one — polling two SPIRE Servers at once, say — would share the
+	// first's counter instead of counting separately, and the meaning of
+	// ConsecutivePollErrors as "consecutive failures" would stop being reliable.
+	// As a field, every Poller is independent by construction, rather than the
+	// problem waiting to be discovered when a second one appears.
 	pollErrors atomic.Int64
 
-	// OnSnapshot 在每次成功輪詢後被呼叫，帶入該次快照的 Stats。
+	// OnSnapshot is called after each successful poll with that snapshot's Stats.
 	//
-	// 這是 Run 把統計值交給外層（例如 plugin 層要把它們發布成 Prometheus
-	// gauge）的唯一管道 —— PollOnce 的回傳值只在呼叫端手動呼叫時看得到，
-	// Run 內部的輪詢迴圈本身不會回傳任何東西。可留空（nil）。
+	// It is Run's only channel for handing the statistics outward — to the plugin
+	// layer publishing them as Prometheus gauges, for instance. PollOnce's return
+	// value is visible only when a caller invokes it directly; the polling loop
+	// inside Run returns nothing at all. May be nil.
 	OnSnapshot func(Stats)
 
-	// OnPollErrors 在每次輪詢（成功或失敗）結束後被呼叫，帶入呼叫當下的連續
-	// 失敗次數（與 ConsecutivePollErrors() 同步）。
+	// OnPollErrors is called after every poll, successful or not, with the
+	// consecutive failure count as of that moment (in step with
+	// ConsecutivePollErrors()).
 	//
-	// 這是 registry_poll_errors gauge 的唯一資料來源：與 OnSnapshot 不同，
-	// 它在成功與失敗時都會被呼叫 —— 失敗時才能把次數往上發布，成功時才能把
-	// gauge 歸零，缺一都會讓這個 metric 卡在舊值或永遠是 0。可留空（nil）。
+	// It is the only data source for the registry_poll_errors gauge. Unlike
+	// OnSnapshot it fires on success as well as failure — failures are what raise
+	// the count, successes are what reset the gauge to zero, and dropping either
+	// leaves the metric stuck at an old value or pinned at 0 forever. May be
+	// nil.
 	OnPollErrors func(count int64)
 }
 
-// NewPoller 建立 Poller。
+// NewPoller builds a Poller.
 func NewPoller(lister EntryLister, store *Store, interval time.Duration) *Poller {
 	return &Poller{lister: lister, store: store, interval: interval}
 }
 
-// ConsecutivePollErrors 回傳這個 Poller 連續輪詢失敗的次數。0 表示最近一次
-// 輪詢成功（或還沒輪詢過）。
+// ConsecutivePollErrors returns this Poller's consecutive polling failures. Zero
+// means the most recent poll succeeded, or that none has run yet.
 //
-// spec §6.2 要求輪詢失敗時「沿用上一份快照並遞增 metric」——這個方法（經
-// OnPollErrors 或呼叫端輪詢）就是那個 metric 唯一的資料來源。SPIRE 變得不可
-// 達（admin SVID 過期、admin 權限被收回、網路分斷）時，Store 會無限期沿用
-// 最後一份快照：registry_ready 停在 1、registry_names 停在最後的值，唯一的
-// 訊號就是這個計數器。
+// Spec §6.2 requires that a failed poll "keep the previous snapshot and increment
+// a metric" — this method, through OnPollErrors or by the caller polling it, is
+// that metric's only data source. When SPIRE becomes unreachable (an expired
+// admin SVID, admin rights revoked, a network partition), the Store keeps the
+// last snapshot indefinitely: registry_ready stays at 1 and registry_names stays
+// at its final value, and this counter is the only signal.
 func (p *Poller) ConsecutivePollErrors() int64 { return p.pollErrors.Load() }
 
-// PollOnce 拉取全部 entry 並替換快照。
+// PollOnce fetches every entry and replaces the snapshot.
 //
-// 失敗時**不會**動到既有快照：SPIRE 短暫不可用不應讓所有 zone 路由消失。首次輪詢
-// 就失敗時 Store 維持未就緒（而非變成空快照），因為「還不知道」與「查得到但都不在
-// registry」是不同的意思，後者會讓所有跨 zone 查詢靜默地退回一般答案。
+// On failure it does NOT touch the existing snapshot: a brief SPIRE outage must
+// not make all zone routing disappear. When the very first poll fails the Store
+// stays not-ready rather than becoming an empty snapshot, because "not known
+// yet" and "resolvable but absent from the registry" mean different things, and
+// the latter would silently drop every cross-zone query back to the ordinary
+// answer.
 //
-// 分頁迴圈有兩道防線防止行為異常的 server 讓它不停下來：一是 maxPollPages 的頁數
-// 上限，二是偵測「同一個 page token 被回傳第二次」——只有上限的話，一個卡住但每次
-// 都回傳同一個 token 的 server 仍會把整個上限跑完才失敗；有了重複偵測，這種情況會
-// 立刻被抓到。兩種情況都視為錯誤，走既有的失敗路徑（保留舊快照）。
+// The pagination loop has two defences against a misbehaving server that never
+// lets it stop: the maxPollPages page limit, and detecting the same page token
+// coming back a second time. With the limit alone, a server that is stuck but
+// returns the same token every time would still burn the entire budget before
+// failing; the repeat check catches that immediately. Both count as errors and
+// take the existing failure path, which keeps the old snapshot.
 func (p *Poller) PollOnce(ctx context.Context) (Stats, error) {
 	var all []Entry
 	seenTokens := make(map[string]struct{})
@@ -170,7 +188,8 @@ func (p *Poller) PollOnce(ctx context.Context) (Stats, error) {
 	return stats, nil
 }
 
-// Run 依設定的間隔持續輪詢，直到 ctx 結束。啟動時立即輪詢一次。
+// Run polls at the configured interval until ctx ends, polling once immediately
+// at startup.
 func (p *Poller) Run(ctx context.Context) {
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
