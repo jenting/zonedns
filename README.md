@@ -16,6 +16,8 @@ zone 之間在網路層是隔離的，跨 zone 流量只能走 zone gateway —�
 | `docs/superpowers/specs/2026-08-18-zonedns-design.md` | 設計與核心不變式、威脅模型、**已知限制** |
 | `docs/deployment.md` | 兩端的建置與部署、必要告警、兩端必須成對維護的設定 |
 | `deploy/k8s/` | 節點端可直接套用的 Kubernetes manifest |
+| `build/` | 兩份 Dockerfile 與注入 plugin 的 registration 檔 |
+| `Makefile` | 建置、測試、image、漂移檢查的入口（`make help`） |
 
 初次接觸建議先讀 spec 的 §3（核心不變式）與 §9（已知限制）—— 這個系統大部分的
 失效方式都是「回一個看起來合理的答案」而不是報錯，§9 列的就是那些。
@@ -32,6 +34,27 @@ pod ──一般 UDP DNS──▶ node-local DNS + zonedns_agent
                           │  registry: FQDN → zone（輪詢 SPIRE Entry API）
                           ▼  同 zone → 交給下游；跨 zone → 回 gateway VIP
 ```
+
+## 部署前提
+
+**agent 與 central 之間的路徑上不得有任何終結 TLS 的設備**（L7 ingress、反向
+代理、TLS 終結負載平衡器）。整套 zone 隔離建立在 central 看到的 client 憑證就是
+agent 本人的 SVID —— 中間一旦有設備終結 TLS，central 看到的會是它的憑證。
+
+（2026-08-20 已向環境負責人確認：本環境不會有 TLS termination 出現在打到 DNS
+server 的路徑上。）
+
+這個前提不必靠定期測試維護，執行期本身就在驗證它，而且在每一次查詢上生效：
+
+- **agent → central 由建構方式擋住** —— agent 以 `AuthorizeID(central)` 釘死對方
+  的 SPIFFE ID，中間設備出示自己的憑證時握手直接失敗。這一側不可能靜默。
+- **central → agent 會降級但有訊號** —— `coredns_zonedns_source_zone_total{reason="unauthorized_agent"}`
+  會上升。
+
+**`unauthorized_agent` 告警的正確處置是移除那個未授權身分，絕不是把它的
+SPIFFE ID 加進 `authorized_agent` 讓告警消失。** 那一步之後該身分能宣告任意
+zone，整套隔離失效且從此完全無聲。這是程式碼防不住的一步 —— 設定說誰可信，
+central 就信誰。
 
 ## 元件
 
@@ -190,3 +213,40 @@ VirtualService。這些不可能有對應的 workload label，比對它們只會
 
 在叢集內執行（CronJob）時需要的權限：對 `pods` 與 `networking.istio.io` 的
 `virtualservices` 有 cluster 範圍的 `list`。
+
+## CI
+
+`.github/workflows/ci.yaml` 有五個 job。每一個都對應一種「單元測試結構上證明不了」
+的東西：
+
+| Job | 它證明什麼 |
+|---|---|
+| `test` | 格式、`go vet`、`go build`、`go mod tidy` 是 no-op、`go test -race` |
+| `plugin-link` | 兩個 plugin 真的連結得進宿主 binary 並完成註冊；另外建一個**順序錯誤**的 binary，確認它啟動時真的被拒絕 |
+| `manifests` | `deploy/k8s/*.yaml` 對真實 API server 通過 server-side dry-run，且裝了真的 `ClusterSPIFFEID` CRD —— 少了 CRD，打錯的欄位名會被當成合法 YAML 放行 |
+| `informer` | 兩節點 kind cluster 上，`spec.nodeName` field selector 真的把範圍限縮到本機，且 `deploy/k8s/01-rbac.yaml` 的權限真的夠 |
+| `drift` | 漂移檢查對真實 Istio CRD 跑得動，三個離開碼都正確，而且報告會**指名道姓** |
+
+`tidy-check` 不是潔癖：CoreDNS 版本必須與上游 node-local-dns 一致、k8s 函式庫
+必須落在同一條線上，否則 agent plugin 連結不進去。那些 pin 全靠這個 job 守住。
+
+`plugin-link` 與 `drift` 都刻意包含**反向驗證** —— 建一個應該失敗的東西，確認它
+真的失敗。只驗成功路徑的話，一個永遠通過的檢查看起來跟一個正確的檢查一模一樣。
+
+## 目前狀態
+
+**可用的**：兩端 plugin 與其對接、節點端的 Kubernetes manifest、兩份 Dockerfile
+與 Makefile、漂移檢查工具、上述五個 CI job。
+
+**還沒做的**：
+
+| 項目 | 影響 |
+|---|---|
+| central 的 VM 端部署 artifact | central 跑在 VM 上，但 repo 裡只有 `docs/deployment.md` 的文字敘述，沒有 systemd unit 或任何可直接套用的檔案 |
+| `PrometheusRule` | 必要告警列在 `docs/deployment.md`，但沒有可直接套用的 rule 檔 —— 目前得手動照著建 |
+| spec §11 項 2 的尾巴 | 是否有 `Sidecar` 資源逐 namespace 覆寫成 `REGISTRY_ONLY`。若有，該範圍的跨 zone 流量會中斷而他處正常 |
+| spec §11 項 4 | CoreDNS 對多個 `bind` server block 的支援 —— 僅在日後改回 per-zone 位址時才需要 |
+
+另外有數項已記錄但未處理的次要問題，例如 `podzone.Run` 不可重入（重複呼叫會建出
+第二個 informer），以及 `zonecache` 會快取「非成功但帶有答案」的回應。兩者在目前
+的使用方式下不會觸發。
