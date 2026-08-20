@@ -539,6 +539,10 @@ rules:
 權限不足時工具會以離開碼 2 失敗並印出原始的 Forbidden 錯誤，不會被誤判成
 「沒裝 Istio CRD」，也不會被當成一份乾淨的報告。
 
+`--namespace` 可以限縮到單一 namespace。**正式用途不要用它**：Istio 允許 A
+namespace 的 VirtualService 指向 B namespace 的服務，限縮後那種設定會被誤報成
+「沒有 pod 認領」。它存在是為了測試與範圍受限的檢查。
+
 ### 它不檢查什麼
 
 只比對名稱。兩邊都對得上的名稱**仍然可能指向錯誤的 workload** —— 要驗那件事得

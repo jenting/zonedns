@@ -68,7 +68,7 @@ func TestCollectVirtualServiceHosts(t *testing.T) {
 		virtualService("v1", "prod", "wild", nil, []string{"*.example.com"}),
 	)
 
-	hosts, skipped, err := CollectVirtualServiceHosts(context.Background(), client, DefaultClusterDomain)
+	hosts, skipped, err := CollectVirtualServiceHosts(context.Background(), client, DefaultClusterDomain, "")
 	if err != nil {
 		t.Fatalf("CollectVirtualServiceHosts: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestCollectVirtualServiceHostsFallsBackToV1beta1(t *testing.T) {
 	client := newDynamic(t, "v1beta1",
 		virtualService("v1beta1", "prod", "payments", nil, []string{"payments.example.com"}),
 	)
-	hosts, _, err := CollectVirtualServiceHosts(context.Background(), client, DefaultClusterDomain)
+	hosts, _, err := CollectVirtualServiceHosts(context.Background(), client, DefaultClusterDomain, "")
 	if err != nil {
 		t.Fatalf("CollectVirtualServiceHosts: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestCollectVirtualServiceHostsRejectsMalformedSpec(t *testing.T) {
 	bad.Object["spec"].(map[string]any)["hosts"] = "payments.example.com"
 
 	client := newDynamic(t, "v1", bad)
-	if _, _, err := CollectVirtualServiceHosts(context.Background(), client, DefaultClusterDomain); err == nil {
+	if _, _, err := CollectVirtualServiceHosts(context.Background(), client, DefaultClusterDomain, ""); err == nil {
 		t.Fatal("expected an error for a malformed spec.hosts, got nil")
 	}
 }
@@ -129,7 +129,7 @@ func TestCollectPodHosts(t *testing.T) {
 			Labels: map[string]string{HostLabel: "payments.example.com", "zone": "zone-b"},
 		}},
 	)
-	hosts, err := CollectPodHosts(context.Background(), client, HostLabel)
+	hosts, err := CollectPodHosts(context.Background(), client, HostLabel, "")
 	if err != nil {
 		t.Fatalf("CollectPodHosts: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestCollectVirtualServiceHostsErrorsWhenNoCRD(t *testing.T) {
 	// 地別的兩件事：後者代表沒有漂移，前者代表這次檢查根本什麼都沒檢查到。
 	// 回空清單會讓「沒裝 Istio」被印成一份漂亮的乾淨報告。
 	client := newDynamic(t, "no-such-version")
-	_, _, err := CollectVirtualServiceHosts(context.Background(), client, DefaultClusterDomain)
+	_, _, err := CollectVirtualServiceHosts(context.Background(), client, DefaultClusterDomain, "")
 	if err == nil {
 		t.Fatal("expected an error when no VirtualService version is served, got nil")
 	}
@@ -156,8 +156,43 @@ func TestCollectVirtualServiceHostsPropagatesNonNotFoundErrors(t *testing.T) {
 	client.PrependReactor("list", "virtualservices", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, errors.NewForbidden(action.GetResource().GroupResource(), "", nil)
 	})
-	_, _, err := CollectVirtualServiceHosts(context.Background(), client, DefaultClusterDomain)
+	_, _, err := CollectVirtualServiceHosts(context.Background(), client, DefaultClusterDomain, "")
 	if !errors.IsForbidden(err) {
 		t.Fatalf("err = %v, want the Forbidden error to propagate unchanged", err)
+	}
+}
+
+func TestCollectScopesToNamespace(t *testing.T) {
+	// CI 上這個檢查曾經被「別的 namespace 裡還沒刪乾淨的 pod」污染而誤判。
+	// 範圍限縮必須真的生效，否則 --namespace 只是一個看起來有用的旗標。
+	client := newDynamic(t, "v1",
+		virtualService("v1", "wanted", "a", nil, []string{"a.example.com"}),
+		virtualService("v1", "other", "b", nil, []string{"b.example.com"}),
+	)
+	hosts, _, err := CollectVirtualServiceHosts(context.Background(), client, DefaultClusterDomain, "wanted")
+	if err != nil {
+		t.Fatalf("CollectVirtualServiceHosts: %v", err)
+	}
+	if want := []string{"a.example.com"}; !reflect.DeepEqual(hosts, want) {
+		t.Errorf("hosts = %v, want %v", hosts, want)
+	}
+}
+
+func TestCollectPodHostsScopesToNamespace(t *testing.T) {
+	pod := func(ns, name, host string) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns, Name: name, Labels: map[string]string{HostLabel: host},
+		}}
+	}
+	client := fake.NewSimpleClientset(
+		pod("wanted", "a", "a.example.com"),
+		pod("other", "b", "b.example.com"),
+	)
+	hosts, err := CollectPodHosts(context.Background(), client, HostLabel, "wanted")
+	if err != nil {
+		t.Fatalf("CollectPodHosts: %v", err)
+	}
+	if want := []string{"a.example.com"}; !reflect.DeepEqual(hosts, want) {
+		t.Errorf("hosts = %v, want %v", hosts, want)
 	}
 }

@@ -38,10 +38,11 @@ func main() {
 		clusterDomain = flag.String("cluster-domain", drift.DefaultClusterDomain, "cluster DNS domain; VirtualService hosts under it are cluster-internal names and are not compared")
 		hostLabel     = flag.String("host-label", drift.HostLabel, "pod label carrying the workload's external name")
 		showSkipped   = flag.Bool("show-skipped", false, "list the VirtualService hosts that were excluded from the comparison, and why")
+		namespace     = flag.String("namespace", "", "limit the check to one namespace (default: the whole cluster). Scoping narrows correctness: a VirtualService may route to a service in another namespace, and that reads as unclaimed here")
 	)
 	flag.Parse()
 
-	code, err := run(context.Background(), *kubeconfig, *clusterDomain, *hostLabel, *showSkipped)
+	code, err := run(context.Background(), *kubeconfig, *clusterDomain, *hostLabel, *namespace, *showSkipped)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "zonedns-drift: %v\n", err)
 		os.Exit(exitFailed)
@@ -49,7 +50,7 @@ func main() {
 	os.Exit(code)
 }
 
-func run(ctx context.Context, kubeconfig, clusterDomain, hostLabel string, showSkipped bool) (int, error) {
+func run(ctx context.Context, kubeconfig, clusterDomain, hostLabel, namespace string, showSkipped bool) (int, error) {
 	config, err := loadConfig(kubeconfig)
 	if err != nil {
 		return exitFailed, err
@@ -63,11 +64,11 @@ func run(ctx context.Context, kubeconfig, clusterDomain, hostLabel string, showS
 		return exitFailed, fmt.Errorf("building the dynamic client: %w", err)
 	}
 
-	vsHosts, skipped, err := drift.CollectVirtualServiceHosts(ctx, dyn, clusterDomain)
+	vsHosts, skipped, err := drift.CollectVirtualServiceHosts(ctx, dyn, clusterDomain, namespace)
 	if err != nil {
 		return exitFailed, err
 	}
-	podHosts, err := drift.CollectPodHosts(ctx, typed, hostLabel)
+	podHosts, err := drift.CollectPodHosts(ctx, typed, hostLabel, namespace)
 	if err != nil {
 		return exitFailed, err
 	}

@@ -37,9 +37,13 @@ type Skipped struct {
 	Reason SkipReason
 }
 
-// CollectVirtualServiceHosts 走訪所有 VirtualService，取出要參與比對的 host。
-func CollectVirtualServiceHosts(ctx context.Context, client dynamic.Interface, clusterDomain string) (hosts []string, skipped []Skipped, err error) {
-	list, err := listVirtualServices(ctx, client)
+// CollectVirtualServiceHosts 走訪 VirtualService，取出要參與比對的 host。
+//
+// namespace 為空字串代表整個 cluster —— 那是正式用途的預設值。指定 namespace 只
+// 適合測試與範圍受限的檢查：Istio 允許 A namespace 的 VirtualService 指向 B
+// namespace 的服務，所以縮小範圍會把那種情形誤報成「沒有 pod 認領」。
+func CollectVirtualServiceHosts(ctx context.Context, client dynamic.Interface, clusterDomain, namespace string) (hosts []string, skipped []Skipped, err error) {
+	list, err := listVirtualServices(ctx, client, namespace)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -79,10 +83,10 @@ func CollectVirtualServiceHosts(ctx context.Context, client dynamic.Interface, c
 // 全部版本都不存在時回傳錯誤而不是空清單：叢集裡沒有 Istio CRD，和叢集裡沒有
 // VirtualService，對這支工具而言是天差地別的兩件事 —— 後者代表沒有漂移，
 // 前者代表這次檢查根本沒檢查到東西。
-func listVirtualServices(ctx context.Context, client dynamic.Interface) (*unstructured.UnstructuredList, error) {
+func listVirtualServices(ctx context.Context, client dynamic.Interface, namespace string) (*unstructured.UnstructuredList, error) {
 	var lastErr error
 	for _, gvr := range VirtualServiceGVRs() {
-		list, err := client.Resource(gvr).Namespace(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+		list, err := client.Resource(gvr).Namespace(namespace).List(ctx, metav1.ListOptions{})
 		if err == nil {
 			return list, nil
 		}
@@ -94,9 +98,10 @@ func listVirtualServices(ctx context.Context, client dynamic.Interface) (*unstru
 	return nil, fmt.Errorf("no VirtualService CRD served at any known version (%v): %w", VirtualServiceGVRs(), lastErr)
 }
 
-// CollectPodHosts 取出所有帶 hostLabel 的 pod 所宣告的名稱。
-func CollectPodHosts(ctx context.Context, client kubernetes.Interface, hostLabel string) ([]string, error) {
-	pods, err := client.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
+// CollectPodHosts 取出帶 hostLabel 的 pod 所宣告的名稱。namespace 為空字串代表
+// 整個 cluster，語意與 CollectVirtualServiceHosts 相同。
+func CollectPodHosts(ctx context.Context, client kubernetes.Interface, hostLabel, namespace string) ([]string, error) {
+	pods, err := client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: hostLabel,
 	})
 	if err != nil {
