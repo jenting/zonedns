@@ -197,3 +197,82 @@ jobs:
           kubectl get pods -A -o wide || true
           kubectl auth can-i list pods \
             --as=system:serviceaccount:kube-system:node-local-dns || true
+
+  drift:
+    name: 漂移檢查對真實 cluster
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: 建立 kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: zonedns-drift
+
+      # 一定要用真的 Istio CRD：單元測試的 fake dynamic client 對 GVR 不做任何
+      # 驗證 —— 群組名、資源複數形、版本全部打錯，它一樣照列不誤。
+      - name: 安裝 Istio CRD
+        run: make istio-crds
+
+      - name: 執行 cluster 測試
+        run: make test-drift
+
+      # 這一段驗的是離開碼。工具的價值全在「有漂移時擋下 CI」，而一支永遠回 0
+      # 的檢查跟沒有檢查完全一樣 —— 所以兩個方向都要證明。
+      - name: 端對端驗證離開碼
+        run: |
+          set -euo pipefail
+          go build -o /tmp/zonedns-drift ./cmd/zonedns-drift
+          kubectl create namespace drift-ci
+          kubectl apply -n drift-ci -f - <<'EOF'
+          apiVersion: networking.istio.io/v1
+          kind: VirtualService
+          metadata: {name: payments}
+          spec:
+            hosts: [payments.example.com, payments, payments.drift-ci.svc.cluster.local]
+            http: [{route: [{destination: {host: payments}}]}]
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: payments-1
+            labels: {zonedns.io/host: paymnets.example.com}
+          spec:
+            containers: [{name: pause, image: registry.k8s.io/pause:3.10}]
+          EOF
+
+          echo "── 有漂移時應離開 1，而且要指名道姓"
+          set +e
+          out=$(/tmp/zonedns-drift --show-skipped); code=$?
+          set -e
+          echo "$out"
+          [ "$code" = "1" ] || { echo "預期離開碼 1，實得 $code"; exit 1; }
+          # 只驗離開碼不夠：一支永遠回 1 的工具也會通過。漂移的兩個方向都必須
+          # 被點名，否則報告等於一個沒有內容的警報。
+          grep -q "payments.example.com" <<<"$out" \
+            || { echo "沒有點名無人認領的 VirtualService host"; exit 1; }
+          grep -q "paymnets.example.com" <<<"$out" \
+            || { echo "沒有點名沒有路由的 pod label"; exit 1; }
+
+          echo "── 修好 label 後應離開 0"
+          kubectl label pod -n drift-ci payments-1 \
+            zonedns.io/host=payments.example.com --overwrite
+          /tmp/zonedns-drift
+
+          echo "── 沒有 Istio CRD 時應離開 2，而不是回報乾淨"
+          kubectl delete crd virtualservices.networking.istio.io
+          set +e
+          /tmp/zonedns-drift; code=$?
+          set -e
+          [ "$code" = "2" ] || { echo "預期離開碼 2，實得 $code"; exit 1; }
+
+      - name: 失敗時傾印 cluster 狀態
+        if: failure()
+        run: |
+          kubectl get crd | grep -i istio || true
+          kubectl get virtualservices -A -o yaml || true
+          kubectl get pods -A --show-labels || true

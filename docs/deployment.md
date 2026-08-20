@@ -460,3 +460,67 @@ zone 路由的信任關係是雙向釘住的，兩邊都要改，改一邊就會
 新增一個節點時，記得把它的 SPIFFE ID（由 SPIRE registration entry 決定，見
 central 部署一節）加進 `authorized_agent`；除役一個節點時記得從清單移除，
 否則舊節點的憑證只要還沒過期就仍是有效的授權來源。
+
+## 漂移檢查（zonedns-drift）
+
+上面那些是「兩端」之間的成對設定；還有一組成對宣告不在兩端之間，而在**部署契約
+裡**：一個 workload 的對外名稱同時被寫在 pod 的 `zonedns.io/host` label 與 Istio
+VirtualService 的 `hosts:`。前者經 `ClusterSPIFFEID` 的 `dnsNameTemplates` 變成
+SPIRE entry 的 dns_name，也就是 central registry 的 key；後者決定 client 實際查
+什麼名字。
+
+**漂移時沒有任何東西會報錯。** central 在 registry 裡查不到那個名字，就把它當成
+不歸自己管而交給下游 —— 查詢照常有答案，只是那個服務靜靜地失去 zone 路由。既不會
+SERVFAIL，也不會有告警：`unauthorized_agent` 不會動，`upstream_errors_total` 不會
+動，因為兩端都運作正常，只是在談論不同的名字。
+
+```bash
+go run ./cmd/zonedns-drift --show-skipped
+```
+
+| 離開碼 | 意義 | 該做什麼 |
+|---|---|---|
+| 0 | 沒有漂移 | — |
+| 1 | 發現漂移 | 依報告修正 label 或 VirtualService |
+| 2 | 檢查失敗 | 修好之後重跑 —— **這不是「沒有漂移」** |
+
+報告分兩個方向：
+
+- **沒有 pod 認領的 VirtualService host** —— 危險的一邊。client 會查這個名字，
+  registry 沒有它，所以它永遠拿不到跨 zone 的正確答案。
+- **沒有 VirtualService 宣告的 pod label** —— registry 裡多一筆沒人會查的資料。
+  通常是打錯字或改名時漏改，本身無害，但它幾乎總是伴隨著前一種。
+
+改名是最典型的觸發情境：改了 VirtualService 忘了改 label（或反過來），一次改動
+會同時在兩個方向產生一筆。
+
+### 什麼時候跑
+
+- **CI**：對 staging 叢集跑，離開碼 1 直接擋下部署。
+- **CronJob**：正式叢集每小時跑一次。漂移多半是人改出來的，不會自己好。
+
+叢集內執行需要的權限 —— cluster 範圍的 `list`：
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: zonedns-drift
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+  - apiGroups: ["networking.istio.io"]
+    resources: ["virtualservices"]
+    verbs: ["list"]
+```
+
+權限不足時工具會以離開碼 2 失敗並印出原始的 Forbidden 錯誤，不會被誤判成
+「沒裝 Istio CRD」，也不會被當成一份乾淨的報告。
+
+### 它不檢查什麼
+
+只比對名稱。兩邊都對得上的名稱**仍然可能指向錯誤的 workload** —— 要驗那件事得
+追蹤 VirtualService → destination Service → pod 的路由，也就是設計時評估後否決
+的 Istio traversal 方案（見設計文件 §9 限制 2）。工具每次報告都會把這句話印
+出來，避免一份乾淨報告被讀成「設定正確」。

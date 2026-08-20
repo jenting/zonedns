@@ -370,7 +370,23 @@ zone 服務其實是跨 zone 的，並給出攻擊者控制的位址。agent 對
    字串導致 entry 被拒；開第二個 `ClusterSPIFFEID` 會因 SPIFFE ID 與 selector 相同
    而被 `entriesMasked` 遮蔽。多別名需求須改用 Istio traversal 方案。
 2. **`zonedns.io/host` 與 VirtualService 的 `hosts:` 是同一名稱的兩份宣告。**
-   需要比對檢查防漂移。漂移的後果是 registry 查不到 → 不做 zone 路由（降級但安全）。
+   漂移的後果是 registry 查不到 → 不做 zone 路由（降級但安全），而且**沒有任何
+   東西會報錯** —— DNS 查詢照常有答案，只是答案不再受 zone 約束。
+
+   防線是 `cmd/zonedns-drift`：把所有 VirtualService 的 `hosts:` 與所有帶
+   `zonedns.io/host` 的 pod label 做集合比對，兩個方向都報 —— 沒人認領的 host
+   （危險：client 會查它）與沒人查的 label（多半是打錯字）。離開碼 0 乾淨、
+   1 有漂移、2 檢查本身失敗（連不上、權限不足、沒裝 Istio CRD）。適合放進 CI
+   或以 CronJob 定期跑。
+
+   比對前會排除三類名稱並列在 `--show-skipped` 裡：萬用 host、cluster 內部名稱
+   （短名與 `*.svc.cluster.local`）、以及綁在 gateway 而非 mesh 的 VirtualService。
+   這些不可能有對應的 workload label，比對它們只會產生假警報。
+
+   **這個檢查只比對名稱。** 兩邊都對得上的名稱仍然可能指向錯誤的 workload ——
+   要驗證那件事得走 VirtualService → destination Service → pod 的路由追蹤，也就是
+   限制 1 提到的那個 Istio traversal 方案 —— 本設計刻意不採用它。工具的輸出會把
+   這個界線寫出來，避免一份乾淨報告被讀成「設定正確」。
 3. **稽核僅到 zone 粒度。** 中心端不知道是哪個 workload 在查詢。日後若需
    per-workload DNS 政策，須重新設計而非擴充。
 4. **hostNetwork pod 不支援 zone 路由。**
