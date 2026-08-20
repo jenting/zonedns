@@ -23,7 +23,7 @@ import (
 
 const testAgentID = "spiffe://example.org/node/n1"
 
-// nextCalled 是一個記錄自己是否被呼叫的下游 plugin。
+// nextCalled is a downstream plugin that records whether it was called.
 type nextCalled struct{ called bool }
 
 func (n *nextCalled) Name() string { return "next" }
@@ -36,16 +36,19 @@ func (n *nextCalled) ServeDNS(_ context.Context, w dns.ResponseWriter, r *dns.Ms
 	return dns.RcodeSuccess, nil
 }
 
-// dotWriter 模擬 DoT 連線：ConnectionState 是它自己宣告的方法（不是靠內嵌的
-// dns.ResponseWriter 介面欄位促升而來），所以直接把 *dotWriter 傳進 ServeDNS 時
-// dns.ConnectionStater 斷言會成功。
+// dotWriter simulates a DoT connection: ConnectionState is a method it declares
+// itself, not one promoted from an embedded dns.ResponseWriter interface field,
+// so passing *dotWriter straight into ServeDNS makes the dns.ConnectionStater
+// assertion succeed.
 //
-// 它同時記錄最後一次寫入的訊息（Msg），故意不再另外包一層
-// dnstest.NewRecorder：dnstest.Recorder 本身也是把 dns.ResponseWriter 存成
-// 介面欄位，若拿它包住 dotWriter 再傳進 ServeDNS，Msg 的方法集只會有介面本身
-// 宣告的方法，ConnectionState 斷言就會失敗 —— 這正是 identity.PeerCertificates
-// 文件描述、也是本任務要求新增的 DoT 警告所指的那個「ResponseWriter 包裝讓 DoT
-// 憑證擷取安靜失效」的情境，測試不該再次踩進同一個陷阱。
+// It also records the last message written (Msg), and deliberately does not wrap
+// itself in a dnstest.NewRecorder: dnstest.Recorder likewise stores
+// dns.ResponseWriter as an interface field, so wrapping dotWriter in one before
+// passing it to ServeDNS would leave Msg's method set holding only what the
+// interface itself declares, and the ConnectionState assertion would fail. That
+// is precisely the "wrapping a ResponseWriter makes DoT certificate extraction
+// fail silently" situation described in identity.PeerCertificates and warned
+// about by this task — the tests must not walk into the same trap.
 type dotWriter struct {
 	dns.ResponseWriter
 	state *tls.ConnectionState
@@ -59,12 +62,15 @@ func (w *dotWriter) WriteMsg(m *dns.Msg) error {
 	return w.ResponseWriter.WriteMsg(m)
 }
 
-// dohWriter 模擬 DoH 連線的 ResponseWriter：它刻意不實作 dns.ConnectionStater，
-// 因為真正的 DoH server 也不會讓 writer 帶連線狀態 —— 身分必須從 context 裡的
-// *http.Request 讀出（見 internal/identity/peercert.go）。若 ServeDNS 有 bug
-// 忘記把呼叫端傳入的 ctx 往下傳給 SourceZone（例如誤用
-// context.Background()），這個 writer 會讓身分擷取直接落回「沒有憑證」，
-// 讓依賴 DoH 路徑的測試確實失敗，而不是意外地從 DoT 分支拿到憑證而蒙混過去。
+// dohWriter simulates the ResponseWriter of a DoH connection: it deliberately
+// does not implement dns.ConnectionStater, because a real DoH server does not
+// give the writer connection state either — the identity must be read from the
+// *http.Request in the context (see internal/identity/peercert.go). Should
+// ServeDNS ever have a bug that forgets to pass the caller's ctx down to
+// SourceZone — reaching for context.Background() by mistake, say — this writer
+// makes identity extraction fall straight back to "no certificate", so tests that
+// depend on the DoH path really fail instead of quietly getting a certificate
+// from the DoT branch and passing anyway.
 type dohWriter struct {
 	dns.ResponseWriter
 	Msg *dns.Msg
@@ -75,10 +81,11 @@ func (w *dohWriter) WriteMsg(m *dns.Msg) error {
 	return w.ResponseWriter.WriteMsg(m)
 }
 
-// failingWriter 模擬底層連線寫入失敗的情境（例如 client 已斷線）。用來驗證
-// answerGateway 不會把 WriteMsg 的錯誤吞掉導致 panic，也不會誤把失敗的寫入
-// 回報成別的 rcode —— ServeDNS 仍必須回傳 (dns.RcodeSuccess, nil)，只是把
-// 錯誤記錄下來（見 zonedns.go 的 log.Errorf）。
+// failingWriter simulates a write failing on the underlying connection — a client
+// that has already disconnected, say. It checks that answerGateway neither
+// swallows WriteMsg's error into a panic nor reports a failed write as some other
+// rcode: ServeDNS must still return (dns.RcodeSuccess, nil) and simply log the
+// error (see log.Errorf in zonedns.go).
 type failingWriter struct {
 	dns.ResponseWriter
 	state *tls.ConnectionState
@@ -108,12 +115,15 @@ func newHandler(t *testing.T, next plugin.Handler) ZoneDNS {
 	}
 }
 
-// newRequest 建立一個來自已授權 agent、帶指定 source zone 的查詢。
+// newRequest builds a query from an authorized agent carrying the given source
+// zone.
 //
-// 命名為 newRequest 而非 request：本檔案所在的 zonedns 套件在 zonedns.go 匯入了
-// "github.com/coredns/coredns/request" 套件（識別字為 request）。Go 不允許同一
-// 識別字同時存在於檔案區塊（import）與套件區塊（頂層宣告）——即使宣告在不同檔案，
-// 用 request 當函式名仍會與該匯入衝突而編譯失敗，因此改名。
+// Named newRequest rather than request because the zonedns package this file
+// belongs to imports "github.com/coredns/coredns/request" in zonedns.go under the
+// identifier request. Go does not allow one identifier in both the file block
+// (imports) and the package block (top-level declarations), so even declared in a
+// different file, request as a function name would collide with that import and
+// fail to compile.
 func newRequest(t *testing.T, qname string, qtype uint16, zone string) (*dns.Msg, *dotWriter) {
 	t.Helper()
 	m := new(dns.Msg)
@@ -167,9 +177,10 @@ func TestServeDNSCrossZoneAnswersGateway(t *testing.T) {
 	}
 }
 
-// gateway 答案必須帶回 OPT record —— 觸發這個分支的查詢一定帶了 EDNS0（zone
-// 宣告本身就是靠 EDNS0 option 攜帶的），如果回應漏了 OPT，就是對一個帶 EDNS0
-// 的查詢回一個非 EDNS 的答案，部分 resolver 會視為格式錯誤。
+// A gateway answer must carry an OPT record back. Any query reaching this branch
+// necessarily carried EDNS0 — the zone declaration travels in an EDNS0 option —
+// so a response missing the OPT would be a non-EDNS answer to an EDNS0 query,
+// which some resolvers treat as a format error.
 func TestServeDNSCrossZoneAnswerPreservesEDNS0(t *testing.T) {
 	next := &nextCalled{}
 	h := newHandler(t, next)
@@ -184,9 +195,10 @@ func TestServeDNSCrossZoneAnswerPreservesEDNS0(t *testing.T) {
 	}
 }
 
-// answerGateway 呼叫 state.W.WriteMsg 失敗時（例如 client 中途斷線），不可讓
-// ServeDNS panic 或回傳跟成功時不一致的結果 —— 呼叫端（CoreDNS 的 server 迴圈）
-// 只看 (rcode, error) 這兩個回傳值，錯誤已經在內部記錄成 log 就足夠了。
+// When answerGateway's call to state.W.WriteMsg fails — a client disconnecting
+// mid-flight, say — ServeDNS must neither panic nor return something different
+// from the success case. The caller, CoreDNS's server loop, looks only at the
+// (rcode, error) pair, and logging the error internally is enough.
 func TestServeDNSCrossZoneWriteMsgErrorDoesNotPanic(t *testing.T) {
 	next := &nextCalled{}
 	h := newHandler(t, next)
@@ -209,11 +221,13 @@ func TestServeDNSCrossZoneWriteMsgErrorDoesNotPanic(t *testing.T) {
 	}
 }
 
-// 專案唯一支援的傳輸方式是 DoH（見 setup.go 的 warnIfDoT），身分擷取走的是
-// context 裡的 *http.Request，而非對 writer 做型別斷言那條路徑。這個測試確保
-// ServeDNS 真的把呼叫端傳入的 ctx 往下傳給 Identity.SourceZone —— 若不小心
-// 改成 context.Background()，所有帶 DoT ConnectionStater 的測試仍會通過（它們
-// 走的是另一條分支），只有這個測試會發現迴歸。
+// The only transport this project supports is DoH (see warnIfDoT in setup.go),
+// where identity extraction goes through the *http.Request in the context rather
+// than by type-asserting the writer. This test makes sure ServeDNS really passes
+// the caller's ctx down to Identity.SourceZone: were it changed to
+// context.Background() by accident, every test carrying a DoT ConnectionStater
+// would still pass — they take the other branch — and only this test would catch
+// the regression.
 func TestServeDNSDoHCrossZoneAnswersGateway(t *testing.T) {
 	next := &nextCalled{}
 	h := newHandler(t, next)
@@ -276,7 +290,8 @@ func TestServeDNSUnknownNamePassesThrough(t *testing.T) {
 	}
 }
 
-// 沒有 client cert 的查詢走非 zone-aware 路徑，不是錯誤。
+// A query with no client cert takes the non-zone-aware path; that is not an
+// error.
 func TestServeDNSNoIdentityPassesThrough(t *testing.T) {
 	next := &nextCalled{}
 	h := newHandler(t, next)
@@ -291,24 +306,29 @@ func TestServeDNSNoIdentityPassesThrough(t *testing.T) {
 	}
 }
 
-// zonedns.go 的 `SourceOK: reason == identity.ReasonOK` 是整個信任邊界在
-// ServeDNS 這一層唯一的把關點：把它改成 `reason != identity.ReasonNoTLS`
-// 仍然編譯得過，且會讓「有憑證但不在授權清單」與「有憑證且沒有宣告」都被
-// 誤判成可信 —— 之前完全沒有 ServeDNS 層級的測試用「格式正確、但 SPIFFE ID
-// 不在授權清單內」的憑證跑過跨 zone 查詢，只有 internal/identity 單獨測過這個
-// reason，plugin 層的測試則只用過已授權憑證或完全沒有憑證。這裡補上：未授權
-// agent 對跨 zone 名稱發問，必須拿到下游（一般路徑）的答案，而不是 gateway
-// VIP —— 斷言的是回應內容，不是只看 reason 或 rcode。
+// `SourceOK: reason == identity.ReasonOK` in zonedns.go is the trust boundary's
+// only gate at the ServeDNS layer. Changing it to
+// `reason != identity.ReasonNoTLS` still compiles, and would wrongly treat both
+// "has a certificate but is not on the authorized list" and "has a certificate and
+// made no declaration" as trustworthy. Until now no ServeDNS-level test ever ran
+// a cross-zone query with a certificate that was well formed but whose SPIFFE ID
+// was absent from the authorized list — only internal/identity exercised that
+// reason on its own, while the plugin-level tests used either an authorized
+// certificate or none at all. This fills the gap: an unauthorized agent asking
+// for a cross-zone name must receive the downstream (ordinary) answer, not the
+// gateway VIP — and what is asserted is the response contents, not merely the
+// reason or the rcode.
 func TestServeDNSUnauthorizedAgentDoesNotGetGatewayAnswer(t *testing.T) {
 	next := &nextCalled{}
 	h := newHandler(t, next)
 
 	m := new(dns.Msg)
 	m.SetQuestion("payments.example.com.", dns.TypeA)
-	ednszone.Set(m, ednszone.DefaultCode, "zone-b") // 宣告跨 zone，若被誤信會觸發 gateway 答案
+	ednszone.Set(m, ednszone.DefaultCode, "zone-b") // declares cross-zone; believed wrongly, it would produce a gateway answer
 
-	// 憑證格式完全合法（恰好一個 spiffe URI SAN），只是這個 SPIFFE ID 不在
-	// newHandler 設定的 authorized_agent 清單（只有 testAgentID）裡。
+	// The certificate is perfectly well formed — exactly one spiffe URI SAN — the
+	// SPIFFE ID simply is not on the authorized_agent list newHandler configures,
+	// which holds testAgentID alone.
 	unauthorizedID := "spiffe://example.org/node/intruder"
 	certs := []*x509.Certificate{testcerts.New(t, unauthorizedID)}
 	w := &dotWriter{
@@ -333,14 +353,16 @@ func TestServeDNSUnauthorizedAgentDoesNotGetGatewayAnswer(t *testing.T) {
 	if !isA {
 		t.Fatalf("answer is %T, want *dns.A", w.Msg.Answer[0])
 	}
-	// 必須是下游那顆一般答案（10.96.0.7，見 nextCalled.ServeDNS），不能是
-	// zone-a 的 gateway VIP（203.0.113.10）——後者代表未授權的 zone 宣告被採信了。
+	// It must be downstream's ordinary answer (10.96.0.7, see nextCalled.ServeDNS)
+	// and not zone-a's gateway VIP (203.0.113.10) — the latter would mean the
+	// unauthorized zone declaration was believed.
 	if a.A.String() != "10.96.0.7" {
 		t.Fatalf("answer = %s, want the downstream answer 10.96.0.7 (not the gateway VIP)", a.A)
 	}
 }
 
-// registry 有這個 zone，但設定檔沒有它的 gateway —— 必須 SERVFAIL，不可靜默放行。
+// The registry knows this zone but the config has no gateway for it — this must
+// SERVFAIL rather than quietly let the query through.
 func TestServeDNSMissingGatewayServfails(t *testing.T) {
 	next := &nextCalled{}
 	h := newHandler(t, next)
@@ -358,8 +380,9 @@ func TestServeDNSMissingGatewayServfails(t *testing.T) {
 	}
 }
 
-// IPv4 gateway 遇到 AAAA 查詢時回 NODATA（NOERROR + 空 answer），
-// 讓 client 正常退回 A。回 NXDOMAIN 會讓 client 認為這個名字不存在。
+// An IPv4 gateway meeting an AAAA query returns NODATA (NOERROR with an empty
+// answer) so the client falls back to A as usual. NXDOMAIN would tell the client
+// the name does not exist.
 func TestServeDNSCrossZoneAAAAWithIPv4GatewayReturnsNoData(t *testing.T) {
 	next := &nextCalled{}
 	h := newHandler(t, next)
@@ -389,7 +412,8 @@ func TestServeDNSCrossZoneAAAAWithIPv4GatewayReturnsNoData(t *testing.T) {
 	}
 }
 
-// 非 A/AAAA 的查詢型別不介入 —— 例如 SRV、TXT 應照常由下游回答。
+// Query types other than A/AAAA are left alone — SRV, TXT and the rest are
+// answered downstream as usual.
 func TestServeDNSOtherQtypePassesThrough(t *testing.T) {
 	next := &nextCalled{}
 	h := newHandler(t, next)

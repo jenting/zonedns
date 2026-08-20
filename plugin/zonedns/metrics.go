@@ -7,8 +7,9 @@ import (
 )
 
 var (
-	// sourceZoneTotal 依判定結果分類。reason="unauthorized_agent" 是攻擊訊號，
-	// 應設定告警；reason="no_tls" 在遷移期間是正常的。
+	// sourceZoneTotal is broken down by verdict. reason="unauthorized_agent" is an
+	// attack signal and should be alerted on; reason="no_tls" is normal during a
+	// migration.
 	sourceZoneTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: plugin.Namespace,
 		Subsystem: "zonedns",
@@ -16,8 +17,8 @@ var (
 		Help:      "Count of source zone resolution attempts by outcome.",
 	}, []string{"reason"})
 
-	// decisionTotal 依動作分類。action="servfail" 表示設定漏了某個 zone 的
-	// gateway，應設定告警。
+	// decisionTotal is broken down by action. action="servfail" means the config is
+	// missing a gateway for some zone and should be alerted on.
 	decisionTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: plugin.Namespace,
 		Subsystem: "zonedns",
@@ -25,7 +26,8 @@ var (
 		Help:      "Count of routing decisions by action.",
 	}, []string{"action"})
 
-	// registryNames 是目前可解析的名稱數。掉到 0 表示 registry 出問題。
+	// registryNames is the number of currently resolvable names. Dropping to 0
+	// means something is wrong with the registry.
 	registryNames = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: plugin.Namespace,
 		Subsystem: "zonedns",
@@ -33,7 +35,8 @@ var (
 		Help:      "Number of resolvable names in the current registry snapshot.",
 	})
 
-	// registryConflicts 是因 zone 衝突而不可解析的名稱數。非 0 即為設定問題。
+	// registryConflicts is the number of names left unresolvable by a zone
+	// conflict. Anything but 0 is a configuration problem.
 	registryConflicts = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: plugin.Namespace,
 		Subsystem: "zonedns",
@@ -41,7 +44,7 @@ var (
 		Help:      "Number of names removed due to conflicting zone declarations.",
 	})
 
-	// registryReady 為 0 時所有查詢都走非 zone-aware 路徑。
+	// While registryReady is 0, every query takes the non-zone-aware path.
 	registryReady = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: plugin.Namespace,
 		Subsystem: "zonedns",
@@ -49,10 +52,12 @@ var (
 		Help:      "1 when a registry snapshot is loaded, 0 otherwise.",
 	})
 
-	// registryPollErrors 是連續輪詢失敗次數（見 registry.Poller.ConsecutivePollErrors）。
-	// 失敗時 Store 沿用上一份快照，registryReady 與 registryNames 都不會變 ——
-	// 這是 SPIRE 變得不可達（admin SVID 過期、admin 權限被收回、網路分斷）時
-	// 唯一會動的 metric，非 0 即應告警，見 spec §6.2。
+	// registryPollErrors counts consecutive polling failures (see
+	// registry.Poller.ConsecutivePollErrors). On failure the Store keeps the
+	// previous snapshot, so neither registryReady nor registryNames changes — this
+	// is the only metric that moves when SPIRE becomes unreachable (an expired
+	// admin SVID, admin rights revoked, a network partition). Anything but 0 should
+	// be alerted on; see spec §6.2.
 	registryPollErrors = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: plugin.Namespace,
 		Subsystem: "zonedns",

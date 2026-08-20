@@ -33,20 +33,22 @@ const (
 	defaultTTL          = uint32(30)
 )
 
-// workloadAPIDialTimeout 限制 dialSPIRE 等待本機 SPIRE agent 的 Workload API
-// 交出第一筆 X509 SVID 更新的時間。
+// workloadAPIDialTimeout bounds how long dialSPIRE waits for the local SPIRE
+// agent's Workload API to hand over the first X509 SVID update.
 //
-// go-spiffe 的 NewX509Source 文件明載：它會阻塞到第一筆更新抵達為止，且不帶
-// 任何逾時。若 agent socket 沒起來（路徑寫錯、agent 還沒啟動、agent 掛了），
-// setup() 會永遠卡住整個 Corefile 解析 —— 啟動時 CoreDNS 永遠起不來且沒有任何
-// 錯誤訊息；`reload` 時則卡住 reload 本身，而舊的 instance 仍在提供服務，
-// 讓卡住這件事更難被發現。改成變數（而非 const）是為了讓測試能縮短它，不必
-// 真的等滿逾時。
+// go-spiffe's NewX509Source documents it plainly: it blocks until that first
+// update arrives, with no timeout of its own. If the agent socket is not up — a
+// mistyped path, an agent that has not started, an agent that died — setup()
+// would stall the entire Corefile parse forever: at startup CoreDNS would never
+// come up and say nothing about why, and on `reload` it would stall the reload
+// itself while the old instance keeps serving, making the stall harder still to
+// notice. It is a variable rather than a const so tests can shorten it instead of
+// waiting the timeout out.
 var workloadAPIDialTimeout = 10 * time.Second
 
 func init() { plugin.Register("zonedns", setup) }
 
-// config 是從 Corefile 解析出來的設定。
+// config is the configuration parsed out of the Corefile.
 type config struct {
 	spireServer      string
 	pollInterval     time.Duration
@@ -54,17 +56,19 @@ type config struct {
 	edns0Code        uint16
 	ttl              uint32
 	zones            *zonetable.Table
-	workloadAPI      string // 僅在 spire_server 為網路位址時需要
-	spireServerID    string // 同上，SPIRE Server 的 SPIFFE ID；network address 時必填，見下方驗證
+	workloadAPI      string // needed only when spire_server is a network address
+	spireServerID    string // likewise: SPIRE Server's SPIFFE ID, required for a network address (validated below)
 }
 
-// CheckDirectiveOrder 確認 zonedns 排在 cache 之前。
+// CheckDirectiveOrder confirms that zonedns sorts before cache.
 //
-// 這個順序不是偏好而是正確性要求：cache 若排在前面，它會用 (qname, qtype) 這個
-// 不含 zone 的 key 回答，於是跨 zone 的 client 會拿到別的 zone 快取的答案。這種
-// 錯誤在執行期沒有任何徵兆，因此必須在啟動時就擋下來。
+// The order is a correctness requirement, not a preference: were cache first, it
+// would answer from a (qname, qtype) key that carries no zone, and a cross-zone
+// client would receive an answer cached for another zone. That mistake leaves no
+// sign at runtime, so it has to be stopped at startup.
 //
-// 順序由編譯期的 plugin.cfg 決定，所以這是建置設定的檢查，不是使用者設定的檢查。
+// The order comes from plugin.cfg at compile time, making this a check on the
+// build configuration rather than on the user's.
 func CheckDirectiveOrder(directives []string) error {
 	zonednsAt, cacheAt := -1, -1
 	for i, d := range directives {
@@ -85,16 +89,19 @@ func CheckDirectiveOrder(directives []string) error {
 	return nil
 }
 
-// warnIfDoT 回傳 transport 為 DNS-over-TLS 時該顯示的警告文字，其餘傳輸方式回傳
-// 空字串。
+// warnIfDoT returns the warning text to show when the transport is DNS-over-TLS,
+// and the empty string for every other transport.
 //
-// 身分擷取在兩種傳輸上的做法不同：DoH 從 context 取出 *http.Request，這在其他
-// plugin 包裝 ResponseWriter 之後仍然有效；DoT 則對 ResponseWriter 做
-// dns.ConnectionStater 型別斷言 —— 而 CoreDNS 內建的 metrics plugin 會用一個把
-// dns.ResponseWriter 存成 interface 欄位的 Recorder 包住 writer，導致這個斷言
-// 失敗。後果是 DoT listener 上每個查詢都安靜地回報「沒有憑證」，zone 路由整個
-// 關閉，未授權 agent 的告警永遠不會觸發 —— 而過程中沒有任何錯誤。因此本專案
-// 決定的傳輸方式是 DoH，這裡只警告、不拒絕啟動。
+// Identity extraction differs between the two transports. DoH takes the
+// *http.Request out of the context, which keeps working after another plugin
+// wraps the ResponseWriter. DoT type-asserts the ResponseWriter to
+// dns.ConnectionStater — and CoreDNS's built-in metrics plugin wraps the writer
+// in a Recorder that stores dns.ResponseWriter as an interface field, making that
+// assertion fail. The consequence is that every query on a DoT listener quietly
+// reports "no certificate", zone routing switches off entirely, and the
+// unauthorized-agent alert never fires — all without a single error along the
+// way. The transport this project settled on is therefore DoH, and this only
+// warns rather than refusing to start.
 func warnIfDoT(tr string) string {
 	if tr != transport.TLS {
 		return ""
@@ -173,16 +180,19 @@ func setup(c *caddy.Controller) error {
 	return nil
 }
 
-// dialSPIRE 連上 SPIRE Server 的 Entry API。
+// dialSPIRE connects to SPIRE Server's Entry API.
 //
-// 兩種部署形態：
+// Two deployment shapes:
 //
-//   - unix:// — central 與 SPIRE Server 同機，走本機管理 socket。該 socket 的存取
-//     權由檔案權限控制，不需要 SVID。
-//   - 其他（host:port）— 走 mTLS，憑證取自本機 SPIRE agent 的 Workload API。此時
-//     central 自己的 registration entry 必須設 admin: true，否則 Entry API 會拒絕。
+//   - unix:// — central shares a machine with SPIRE Server and uses the local
+//     admin socket. Access to that socket is governed by file permissions and
+//     needs no SVID.
+//   - anything else (host:port) — mTLS, with certificates from the local SPIRE
+//     agent's Workload API. Central's own registration entry must then set
+//     admin: true, or the Entry API refuses.
 //
-// 憑證用 X509Source 而非靜態檔案，SVID 輪替才不需要重新載入設定。
+// Certificates come from an X509Source rather than static files, so SVID rotation
+// needs no configuration reload.
 func dialSPIRE(cfg *config) (*grpc.ClientConn, func(), error) {
 	if strings.HasPrefix(cfg.spireServer, "unix://") {
 		conn, err := grpc.NewClient(cfg.spireServer, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -317,14 +327,17 @@ func parseConfig(c *caddy.Controller) (*config, error) {
 				if len(args) != 2 {
 					return nil, c.Errf("gateway needs a zone and an address, got %d arguments", len(args))
 				}
-				// ednszone.Valid 是 registry 端（spiffezone.FromPath）也隱含依賴的
-				// 字元集邊界：一個帶點的 zone 名稱（k8s label value 允許，但
-				// ednszone.Valid 拒絕，見其註解與測試 "zone.a"）能在 gateway 表與
-				// registry 裡運作良好，卻會讓每一筆從該 zone 送來的 source zone
-				// 宣告在 identity.SourceZone 被 ednszone.Get 判定為不合法而丟棄
-				// （ReasonNoDeclaration）——那些 workload 從此永遠拿到 zone-盲的
-				// 答案，而且沒有被告警的 metric。在設定解析時就用同一套規則拒絕，
-				// 讓不合規的 zone 在啟動時就爆炸，而不是在執行期悄悄降級。
+				// ednszone.Valid is the character-set boundary the registry side
+				// (spiffezone.FromPath) implicitly depends on too: a zone name with a
+				// dot — permitted as a Kubernetes label value, rejected by
+				// ednszone.Valid, see its doc and the "zone.a" test — works perfectly
+				// well in the gateway table and the registry, while every source zone
+				// declaration arriving from that zone is judged invalid by
+				// ednszone.Get inside identity.SourceZone and discarded
+				// (ReasonNoDeclaration). Those workloads would receive zone-blind
+				// answers from then on, with no metric to alert on. Applying the same
+				// rule at config parse time makes a non-conforming zone blow up at
+				// startup instead of degrading quietly at runtime.
 				if !ednszone.Valid(args[0]) {
 					return nil, c.Errf("gateway zone %q is not a valid zone name (must match the "+
 						"identity/registry zone character set, see ednszone.Valid)", args[0])
@@ -347,16 +360,19 @@ func parseConfig(c *caddy.Controller) (*config, error) {
 	if cfg.spireServer == "" {
 		return nil, c.Err("spire_server is required")
 	}
-	// 沒有授權 agent 表示所有宣告都會被忽略，plugin 永遠不會 zone-aware。
-	// 這一定是設定錯誤，不是合法組態。
+	// With no authorized agent every declaration is ignored and the plugin can
+	// never be zone-aware. That is always a misconfiguration, never a legitimate
+	// setup.
 	if len(cfg.authorizedAgents) == 0 {
 		return nil, c.Err("at least one authorized_agent is required")
 	}
-	// spire_server 是網路位址時，dialSPIRE 走 mTLS，必須用 spire_server_id 釘住
-	// SPIRE Server 的確切身分。少了它就只能驗證「trust domain 內的某個成員」，
-	// 任何持有同 trust domain SVID 的攻擊者攔截連線後都能冒充 SPIRE Server、
-	// 餵一份偽造的 registry，進而左右所有路由決策 —— 必須 fail closed。
-	// unix:// 走本機 socket，不受影響，不需要這個欄位。
+	// When spire_server is a network address, dialSPIRE uses mTLS and
+	// spire_server_id must pin SPIRE Server's exact identity. Without it, all that
+	// can be verified is "some member of the trust domain", and any attacker
+	// holding an SVID from the same trust domain could intercept the connection,
+	// impersonate SPIRE Server, feed a forged registry and thereby steer every
+	// routing decision — this must fail closed. A unix:// socket is local and
+	// unaffected, so the field is not needed there.
 	if !strings.HasPrefix(cfg.spireServer, "unix://") && cfg.spireServerID == "" {
 		return nil, c.Err("spire_server_id is required when spire_server is a network address, to authenticate " +
 			"the SPIRE Server by its exact identity rather than merely by trust domain membership")

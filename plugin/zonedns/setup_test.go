@@ -17,8 +17,9 @@ func TestCheckDirectiveOrder(t *testing.T) {
 	}
 }
 
-// 順序錯誤必須是啟動失敗，不能只是警告 —— cache 排在前面時，跨 zone 的 client
-// 會拿到別人快取的同 zone 答案，而這在執行期沒有任何徵兆。
+// A wrong order must fail startup, not merely warn — with cache first, a
+// cross-zone client receives a same-zone answer cached for somebody else, and
+// there is no sign of it at runtime.
 func TestCheckDirectiveOrderRejectsCacheFirst(t *testing.T) {
 	err := CheckDirectiveOrder([]string{"cache", "zonedns", "forward"})
 	if err == nil {
@@ -35,7 +36,7 @@ func TestCheckDirectiveOrderMissingZonedns(t *testing.T) {
 	}
 }
 
-// 沒有 cache 時順序無所謂。
+// Without cache present the order does not matter.
 func TestCheckDirectiveOrderWithoutCache(t *testing.T) {
 	if err := CheckDirectiveOrder([]string{"zonedns", "forward"}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -72,7 +73,8 @@ func TestParseCorefile(t *testing.T) {
 	}
 }
 
-// 沒有授權 agent 等於這個 plugin 永遠不會 zone-aware，是設定錯誤而非合法組態。
+// No authorized agent means this plugin can never be zone-aware: a
+// misconfiguration, not a legitimate setup.
 func TestParseCorefileRequiresAuthorizedAgent(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns {
 		spire_server unix:///tmp/spire-server/private/api.sock
@@ -94,9 +96,10 @@ func TestParseCorefileRejectsBadGatewayAddress(t *testing.T) {
 	}
 }
 
-// 重複宣告同一個 zone 的 gateway 會靜默用後面那筆覆蓋前面那筆，等於在不知情的
-// 情況下把跨 zone 流量改導到另一個位址 —— 必須直接拒絕設定檔，而不是接受
-// 「最後寫的贏」。
+// Declaring a gateway for one zone twice would silently let the later entry
+// overwrite the earlier, redirecting cross-zone traffic to a different address
+// without anyone knowing — the config file must be refused outright rather than
+// accepting last-one-wins.
 func TestParseCorefileRejectsDuplicateGateway(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns {
 		spire_server unix:///tmp/spire-server/private/api.sock
@@ -109,10 +112,12 @@ func TestParseCorefileRejectsDuplicateGateway(t *testing.T) {
 	}
 }
 
-// k8s label value 允許點字元，但 ednszone.Valid（identity 用來驗證 agent
-// 宣告的 source zone 的同一套規則）拒絕。若 gateway 端不擋，一個帶點的 zone
-// 名稱能正常當 dest zone 使用，卻會讓該 zone 裡每一個 workload 的 source zone
-// 宣告永遠被判定不合法而丟棄，靜默降級成 zone-盲。必須在設定解析時就拒絕。
+// A Kubernetes label value permits a dot, but ednszone.Valid — the same rule
+// identity uses to validate the source zone an agent declares — rejects it.
+// Without a check on the gateway side, a zone name with a dot would work fine as
+// a dest zone while every workload inside it had its source zone declaration
+// judged invalid and discarded, degrading silently to zone-blind. It must be
+// refused at config parse time.
 func TestParseCorefileRejectsNonConformingGatewayZoneName(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns {
 		spire_server unix:///tmp/spire-server/private/api.sock
@@ -124,8 +129,9 @@ func TestParseCorefileRejectsNonConformingGatewayZoneName(t *testing.T) {
 	}
 }
 
-// poll_interval 0 或負值會讓 OnStartup 那個 goroutine 裡的 time.NewTicker
-// panic，直接讓 process 崩潰 —— 必須在解析設定檔的當下就擋下來。
+// A poll_interval of zero or less makes the time.NewTicker inside the OnStartup
+// goroutine panic and takes the process down with it — it has to be stopped while
+// the config file is being parsed.
 func TestParseCorefileRejectsNonPositivePollInterval(t *testing.T) {
 	for _, v := range []string{"0s", "-5s"} {
 		c := caddy.NewTestController("dns", `zonedns {
@@ -139,10 +145,10 @@ func TestParseCorefileRejectsNonPositivePollInterval(t *testing.T) {
 	}
 }
 
-// fmt.Sscanf("%d") 會在遇到第一個非數字字元時停止掃描但不回報錯誤，因此
-// "5m"（duration 格式）會被誤判成 5、"30.5" 被誤判成 30、"65001abc" 被誤判成
-// 65001。改用 strconv.ParseUint 後這些輸入都必須被整個拒絕，而不是截斷取用
-// 開頭那段數字。
+// fmt.Sscanf("%d") stops at the first non-digit and reports no error, so "5m" in
+// duration form is read as 5, "30.5" as 30, and "65001abc" as 65001. With
+// strconv.ParseUint these inputs must be refused whole, rather than truncated to
+// the digits at the front.
 func TestParseCorefileRejectsMalformedTTL(t *testing.T) {
 	for _, v := range []string{"5m", "30.5", "30abc"} {
 		c := caddy.NewTestController("dns", `zonedns {
@@ -156,8 +162,9 @@ func TestParseCorefileRejectsMalformedTTL(t *testing.T) {
 	}
 }
 
-// edns0_code 必須落在 IANA 保留給 local/experimental 用途的 65001-65534 區間，
-// 且不接受帶尾碼垃圾字元的輸入（同一個 strconv 修法順帶解決）。
+// edns0_code must fall in 65001-65534, the range IANA reserves for
+// local/experimental use, and input with trailing junk is not accepted (the same
+// strconv fix handles both).
 func TestParseCorefileRejectsMalformedEdns0Code(t *testing.T) {
 	for _, v := range []string{"65000", "65535", "65001abc"} {
 		c := caddy.NewTestController("dns", `zonedns {
@@ -186,10 +193,11 @@ func TestParseCorefileAcceptsEdns0CodeUpperBound(t *testing.T) {
 	}
 }
 
-// spire_server 是網路位址時走 mTLS：少了 spire_server_id 就只能驗證「trust
-// domain 內的某個成員」，任何持有同 trust domain SVID 的攻擊者攔截連線後都能
-// 冒充 SPIRE Server、餵一份偽造的 registry。必須 fail closed，在設定檔解析時
-// 就拒絕。
+// A network address for spire_server means mTLS: without spire_server_id, all
+// that can be verified is "some member of the trust domain", and any attacker
+// holding an SVID from the same trust domain could intercept the connection,
+// impersonate SPIRE Server and feed a forged registry. This must fail closed, and
+// be refused while the config file is parsed.
 func TestParseCorefileRequiresSpireServerIDForNetworkAddress(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns {
 		spire_server spire-server.example.org:8443
@@ -201,7 +209,8 @@ func TestParseCorefileRequiresSpireServerIDForNetworkAddress(t *testing.T) {
 	}
 }
 
-// unix:// 走本機管理 socket，不受 mTLS 身分驗證影響，不需要 spire_server_id。
+// unix:// uses the local admin socket, is unaffected by mTLS authentication, and
+// needs no spire_server_id.
 func TestParseCorefileUnixSocketDoesNotRequireSpireServerID(t *testing.T) {
 	c := caddy.NewTestController("dns", `zonedns {
 		spire_server unix:///tmp/spire-server/private/api.sock
@@ -228,21 +237,24 @@ func TestParseCorefileAcceptsSpireServerIDForNetworkAddress(t *testing.T) {
 	}
 }
 
-// registryReady 是跨 Corefile reload 共用的套件層級 gauge（見 setup.go）。若
-// setup() 不主動歸零，reload 後它會繼續回報前一個 instance 的就緒狀態，而新的
-// （空的）Store 其實會讓每個查詢都靜默走非 zone-aware 路徑 —— 這個 metric 正是
-// 在最需要準確的時候說謊。
+// registryReady is a package-level gauge shared across Corefile reloads (see
+// setup.go). Unless setup() resets it, after a reload it would keep reporting the
+// previous instance's readiness while the new, empty Store silently sent every
+// query down the non-zone-aware path — the metric lying at exactly the moment
+// accuracy matters most.
 //
-// setup() 內部第一步會呼叫 CheckDirectiveOrder(dnsserver.Directives)，那是
-// vendor 進來、編譯期就固定的 CoreDNS 內建 directive 清單，不包含 "zonedns"
-// （要包含它，必須是下游用自己的 plugin.cfg 重新產生 zdirectives.go 之後的組
-// 建）。測試在本檔案的其他測試都只呼叫 parseConfig，唯獨這裡需要 setup() 真的
-// 跑到底才能驗證 registryReady 的歸零時機，所以在測試範圍內暫時把 "zonedns"
-// 插進 "cache" 之前（滿足 CheckDirectiveOrder），跑完立刻還原。本套件沒有任何
-// 測試使用 t.Parallel()，因此這個暫時性的全域修改不會與其他測試競爭。
+// setup()'s first step calls CheckDirectiveOrder(dnsserver.Directives), the
+// vendored, compile-time-fixed list of CoreDNS's built-in directives, which does
+// not contain "zonedns" (containing it requires a build where downstream
+// regenerated zdirectives.go from its own plugin.cfg). Every other test in this
+// file calls only parseConfig; this one needs setup() to run all the way through
+// to verify when registryReady is reset, so for the duration of the test
+// "zonedns" is inserted before "cache" to satisfy CheckDirectiveOrder and
+// restored immediately afterwards. No test in this package uses t.Parallel(), so
+// this temporary global change cannot race with another test.
 func TestSetupResetsRegistryReadyGauge(t *testing.T) {
-	registryReady.Set(1)      // 模擬前一個 instance 已經就緒過。
-	registryPollErrors.Set(3) // 模擬前一個 instance 曾經連續輪詢失敗過。
+	registryReady.Set(1)      // as if a previous instance had become ready.
+	registryPollErrors.Set(3) // as if a previous instance had failed several polls in a row.
 
 	origDirectives := dnsserver.Directives
 	extended := make([]string, 0, len(origDirectives)+1)
@@ -285,12 +297,14 @@ func TestSetupResetsRegistryReadyGauge(t *testing.T) {
 	}
 }
 
-// go-spiffe 的 NewX509Source 文件明載會阻塞到第一筆 Workload API 更新抵達為止，
-// 且不帶任何逾時 —— 若 dialSPIRE 用 context.Background() 呼叫它，一個沒起來的
-// agent socket 會讓 setup() 永遠卡住（啟動時整個掛住、reload 時卡住 reload
-// 本身）。這裡把 workloadAPIDialTimeout 縮短成測試可接受的長度，指向一個確定
-// 不存在的 unix socket，驗證 dialSPIRE 會在這段時間內回傳錯誤，而不是一直等
-// 下去；並驗證錯誤訊息指名 workload_api，讓操作者知道要檢查什麼。
+// go-spiffe documents plainly that NewX509Source blocks until the first Workload
+// API update arrives, with no timeout of its own — so were dialSPIRE to call it
+// with context.Background(), an agent socket that is not up would stall setup()
+// forever: hanging startup outright, or hanging the reload itself. This test
+// shortens workloadAPIDialTimeout to something a test can wait for, points it at
+// a unix socket that certainly does not exist, and checks that dialSPIRE returns
+// an error within that window rather than waiting indefinitely — and that the
+// error names workload_api, so an operator knows what to look at.
 func TestDialSPIRETimesOutWhenWorkloadAPIUnavailable(t *testing.T) {
 	origTimeout := workloadAPIDialTimeout
 	workloadAPIDialTimeout = 200 * time.Millisecond
@@ -319,14 +333,18 @@ func TestDialSPIRETimesOutWhenWorkloadAPIUnavailable(t *testing.T) {
 	}
 }
 
-// warnIfDoT 必須只在 transport 為 tls 時回傳警告文字，其餘傳輸方式一律回傳空字串。
+// warnIfDoT must return the warning text only when the transport is tls, and the
+// empty string for every other transport.
 //
-// 原因：身分擷取在 DoT 與 DoH 上的做法不同 —— DoH 從 context 取出 *http.Request，
-// 這在其他 plugin 包裝 ResponseWriter 之後仍然有效；DoT 則對 ResponseWriter 做
-// dns.ConnectionStater 型別斷言，而 CoreDNS 內建的 metrics plugin 會用一個把
-// dns.ResponseWriter 存成 interface 欄位的 Recorder 包住 writer，導致斷言失敗。
-// 後果是 DoT listener 上每個查詢都安靜地回報「沒有憑證」，zone 路由整個關閉，
-// 且未授權 agent 的告警永遠不會觸發，而過程中沒有任何錯誤。
+// The reason: identity extraction differs between DoT and DoH. DoH takes the
+// *http.Request out of the context, which keeps working after another plugin
+// wraps the ResponseWriter. DoT type-asserts the ResponseWriter to
+// dns.ConnectionStater, and CoreDNS's built-in metrics plugin wraps the writer in
+// a Recorder that stores dns.ResponseWriter as an interface field, making that
+// assertion fail. The consequence is that every query on a DoT listener quietly
+// reports "no certificate", zone routing switches off entirely, and the
+// unauthorized-agent alert never fires — all without a single error along the
+// way.
 func TestWarnIfDoT(t *testing.T) {
 	msg := warnIfDoT(transport.TLS)
 	if msg == "" {
