@@ -246,17 +246,51 @@ CoreDNS plugin，必須編譯進 binary；不同的是它編譯進的不是普�
    答案，而且執行期沒有任何徵兆。`setup()` 一啟動就會呼叫
    `CheckDirectiveOrder(dnsserver.Directives)`，順序錯誤會直接拒絕啟動而不是
    靜默接受（見 `plugin/zonedns_agent/setup.go`）。
-4. 用 `sigs.k8s.io/node-local-dns` 既有的 `Makefile` 與 `Dockerfile.node-cache`
+4. **`go mod vendor`，不是 `go mod tidy`。** node-local-dns 把相依 vendor 進
+   repo（有 `vendor/` 目錄），所以加入本 module 後必須重新 vendor，否則建置會
+   以「marked as explicit in vendor/modules.txt, but not explicitly required in
+   go.mod」失敗。本 repo 是 private，容器內 `go get` 拉不到，因此還需要一條
+   `replace` 指向原始碼：
+
+   ```bash
+   go mod edit -replace github.com/jenting/zonedns=/path/to/zonedns
+   go mod edit -require github.com/jenting/zonedns@v0.0.0
+   GOOS=linux go mod vendor
+   ```
+
+5. **vendor 與建置都必須指定 `GOOS=linux`。** 在 macOS 上直接 `go mod vendor`
+   會漏掉 `k8s.io/kubernetes/pkg/util/iptables` —— 它是 linux-only 的，而
+   node-local-dns 用它管理 iptables 規則。症狀是一連串
+   `undefined: utiliptables.Table`，看起來像相依版本衝突，實際上是 vendor 樹
+   缺了那個平台的檔案。node-local-dns 本來就只為 linux 建置，用它既有的
+   `Dockerfile.node-cache` 不會遇到這個問題；只有在本機直接建置時才會。
+
+6. 用 `sigs.k8s.io/node-local-dns` 既有的 `Makefile` 與 `Dockerfile.node-cache`
    建置 —— 部署形態完全沿用該專案的產物，不需要另外自建 CI/CD 管線。
+
+以上步驟已實際驗證過：對 `sigs.k8s.io/node-local-dns` 主線建置成功，
+`zonedns_agent` 在產出的 binary 中正常載入（會走到 `NewMTLS` 才因為沒有 SPIRE
+socket 而停，代表 Corefile 解析與 plugin 註冊都成立）。
 
 ## image 體積
 
 上游的 `node-local-dns` 只相依 `k8s.io/apimachinery`，不含 `client-go`。
 `zonedns_agent` 的 k8s 模式（`internal/podzone`）需要 `client-go` 建立本機
-pod 的 node-scoped informer，因此自建 image 會明顯大於上游版本 —— 這是預期
-之內的取捨，不是建置設定出錯的徵兆。VM 模式在執行期完全不會用到
-`client-go`（見下方 Corefile），但因為 binary 是同一份，image 體積的差異
-在兩種模式下都存在。
+pod 的 node-scoped informer，因此自建 image 明顯大於上游版本 —— 這是預期之內
+的取捨，不是建置設定出錯的徵兆。
+
+實測（同一台機器、同一組建置參數、`linux/arm64`）：
+
+| binary | 大小 |
+|---|---|
+| 上游 node-local-dns | 44.7 MB |
+| 含 `zonedns_agent` | 86.0 MB |
+
+**接近翻倍（+39.4 MB，+92%）。** 這個數字值得在導入前讓管理 image 散佈的人
+知道：每個節點都要拉這份 image。
+
+VM 模式在執行期完全不會用到 `client-go`（見下方 Corefile），但因為 binary 是
+同一份，體積差異在兩種模式下都存在。
 
 ## 版本 pinning
 
