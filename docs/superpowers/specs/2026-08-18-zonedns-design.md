@@ -434,9 +434,26 @@ zone 服務其實是跨 zone 的，並給出攻擊者控制的位址。agent 對
 3. ~~**central 服務的擺放位置。**~~ **已確認：置於 VM，路徑上無終結 TLS 的設備。**
    §6.1 的信任邊界完整成立 — central 看到的 client cert 即為 agent 本人的 SVID。
 
-   **此前提為本設計的安全基礎，任何日後在路徑上引入 L7 ingress、反向代理或
-   TLS 終結負載平衡器的變更，都會使 §6.1 的驗證靜默失效**（查詢照常有答案，
-   只是 zone 宣告不再經過任何驗證）。應以測試持續驗證，而非僅記錄於文件。
+   2026-08-20 再次確認：環境內不會有 TLS termination 出現在打到 DNS server 的
+   路徑上。
+
+   **此前提為本設計的安全基礎。** 日後若在路徑上引入 L7 ingress、反向代理或
+   TLS 終結負載平衡器，會發生什麼事：
+
+   - **agent → central 方向由建構方式擋住。** `internal/dohupstream` 以
+     `tlsconfig.AuthorizeID(central)` 釘死對方的 SPIFFE ID，中間設備出示自己的
+     憑證時握手直接失敗 —— SERVFAIL 加 `upstream_errors_total`，這一側不可能靜默。
+   - **central → agent 方向會降級但有訊號。** central 看到的是中間設備的
+     client cert，不是 agent 本人的 SVID。該身分不在 `authorized_agent` 清單裡，
+     zone 宣告被忽略、查詢回退到非 zone-aware 路徑，而
+     `coredns_zonedns_source_zone_total{reason="unauthorized_agent"}` 會上升
+     —— 這正是 §9 限制 5 與部署文件把它列為必要告警的原因。
+
+   換言之，執行期的 mTLS 釘住本身就是這個前提的持續驗證，而且比任何測試都強：
+   它在正式環境的每一次查詢上生效。**真正無法由程式碼防住的是人的反應** ——
+   把中間設備的 SPIFFE ID 加進 `authorized_agent` 來「修好」那個告警。那一步
+   之後，該設備就能宣告任意 zone，整套隔離失效且完全無聲。`unauthorized_agent`
+   告警的處理流程必須寫明：這個告警的正確處置是移除中間設備，不是授權它。
 
 4. **CoreDNS 對多個 `bind` server block 的支援**（僅在日後改回 per-zone 位址時才需要）。
 

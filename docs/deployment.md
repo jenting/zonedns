@@ -196,7 +196,7 @@ https://example.com:443 {
 
 | Metric | 條件 | 意義 |
 |---|---|---|
-| `coredns_zonedns_source_zone_total{reason="unauthorized_agent"}` | 任何非零增長 | 有未授權的來源在宣告 zone，這是攻擊訊號 |
+| `coredns_zonedns_source_zone_total{reason="unauthorized_agent"}` | 任何非零增長 | 有未授權的來源在宣告 zone，這是攻擊訊號。**處置見下方「不可回頭的前提」—— 絕不可以把該身分加進 `authorized_agent` 來消音** |
 | `coredns_zonedns_decision_total{action="servfail"}` | 任何非零增長 | 某個 zone 缺 gateway 設定 |
 | `coredns_zonedns_registry_conflicts` | > 0 | 有 FQDN 被宣告成多個 zone，這些名字目前不可解析 |
 | `coredns_zonedns_registry_ready` | == 0 持續超過一個 `poll_interval` | registry 未載入，全部查詢退回非 zone-aware |
@@ -213,7 +213,28 @@ central 與各節點 agent 之間的路徑上**不得有任何終結 TLS 的設�
 `authorized_agent` 比對會失敗或誤中，而**查詢仍會正常得到答案** —— 失效完全無聲
 （設計文件 §11 第 3 項）。
 
-這一點應以測試持續驗證：定期以非授權憑證發出查詢，確認 zone 宣告確實被忽略
+**2026-08-20 已向環境負責人確認：打到 DNS server 的路徑上不會有 TLS
+termination。** 本設計的安全基礎成立。
+
+執行期本身就在持續驗證這件事，而且比任何定期測試都強 —— 它在每一次查詢上生效：
+
+- **agent → central 方向由建構方式擋住。** agent 以 `AuthorizeID(central)` 釘死
+  對方的 SPIFFE ID，中間設備出示自己的憑證時握手直接失敗（SERVFAIL 加
+  `upstream_errors_total`）。這一側不可能靜默。
+- **central → agent 方向會降級，但 `unauthorized_agent` 會動。** 這就是那個
+  告警存在的理由。
+
+### 這個告警的正確處置
+
+`unauthorized_agent` 上升時，**唯一正確的處置是找出那個未授權身分並移除它**
+（若是中間設備，就是把該設備從路徑上拿掉）。
+
+**絕對不要把它的 SPIFFE ID 加進 `authorized_agent` 來讓告警消失。** 那一步之後
+該身分就能宣告任意 zone，整套 zone 隔離失效，而且從此完全無聲 —— 告警不再響，
+查詢照常有答案，只是答案不再受任何約束。這是程式碼防不住的一步：`authorized_agent`
+是設定，設定說誰可信，central 就信誰。
+
+若要另外做主動檢查，方式是定期以非授權憑證發出查詢，確認 zone 宣告確實被忽略
 （即回應為非 zone-aware 的一般答案，而不是 SERVFAIL 或連線層級的拒絕 ——
 `identity` 把「未授權」與「沒有憑證」都當成同一種退路處理，這是設計上刻意的
 fail-safe，見設計文件 §6.1，但也代表這個檢查沒辦法只靠「查詢有沒有失敗」來做，
