@@ -275,6 +275,11 @@ pod 的 node-scoped informer，因此自建 image 會明顯大於上游版本 �
 升級這三個版本前，先確認 `sigs.k8s.io/node-local-dns` 上游本身已經升級到
 對應版本，而不是反過來。
 
+## Kubernetes manifest
+
+可直接套用的完整 manifest 在 `deploy/k8s/`（RBAC、ConfigMap、DaemonSet、
+ClusterSPIFFEID），含必須按環境替換的值一覽表。以下說明相對上游改了什麼。
+
 ## DaemonSet 的變更
 
 部署形態（DaemonSet、每節點一份、link-local 位址、iptables 規則、pod 的

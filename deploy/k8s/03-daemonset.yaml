@@ -1,0 +1,148 @@
+# node-local-dns DaemonSet，內含 zonedns_agent。
+#
+# 結構完全沿用上游 kubernetes/kubernetes 的 cluster/addons/dns/nodelocaldns，
+# 只有三處差異（部署文件「DaemonSet 的變更」一節）：
+#   1. image 指向自建版本（上游 image 沒有 zonedns_agent，plugin 是編譯期連結的）
+#   2. serviceAccountName 綁到有 pods 讀取權的 SA（見 01-rbac.yaml）
+#   3. 多兩個掛載與兩個環境變數：SPIRE 的 Workload API socket，以及節點自身的
+#      名稱與位址
+#
+# 上游原本就有、且一項都不能省的：hostNetwork、dnsPolicy: Default、
+# priorityClassName、-localip 的兩個位址、xtables-lock 掛載、NET_ADMIN、
+# 以及涵蓋所有 taint 的 tolerations。少任何一項，node-local-dns 本身就不會
+# 正常運作 —— 那跟 zone 路由無關，是它管理 dummy interface 與 iptables 規則
+# 所需要的。
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-local-dns
+  namespace: kube-system
+  labels:
+    k8s-app: node-local-dns
+    kubernetes.io/cluster-service: "true"
+    addonmanager.kubernetes.io/mode: Reconcile
+spec:
+  updateStrategy:
+    rollingUpdate:
+      maxUnavailable: 10%
+  selector:
+    matchLabels:
+      k8s-app: node-local-dns
+  template:
+    metadata:
+      labels:
+        k8s-app: node-local-dns
+      annotations:
+        prometheus.io/port: "9253"
+        prometheus.io/scrape: "true"
+    spec:
+      priorityClassName: system-node-critical
+      serviceAccountName: node-local-dns
+      hostNetwork: true
+      dnsPolicy: Default  # Don't use cluster DNS.
+      tolerations:
+      - key: "CriticalAddonsOnly"
+        operator: "Exists"
+      - effect: "NoExecute"
+        operator: "Exists"
+      - effect: "NoSchedule"
+        operator: "Exists"
+      containers:
+      - name: node-cache
+        # 必改：自建 image。上游的 k8s-dns-node-cache 不含 zonedns_agent。
+        image: REGISTRY/k8s-dns-node-cache-zonedns:TAG
+        resources:
+          requests:
+            cpu: 25m
+            # 上游是 5Mi。client-go 的 informer 需要更多空間放本機 pod 的快取，
+            # 25Mi 是保守值；請依實際節點 pod 數量調整。
+            memory: 25Mi
+        args: [ "-localip", "__PILLAR__LOCAL__DNS__,__PILLAR__DNS__SERVER__", "-conf", "/etc/Corefile", "-upstreamsvc", "kube-dns-upstream" ]
+        securityContext:
+          capabilities:
+            add:
+            - NET_ADMIN
+        env:
+        # zonedns_agent 用 node_name 過濾 informer，只看本機的 pod。
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        # 節點自身位址，用於偵測 masquerade：查詢的 source IP 若等於節點 IP，
+        # 就無法判斷是哪個 workload 在問。這個值格式錯誤時 plugin 會啟動失敗，
+        # 不會被靜默忽略 —— 因為它是那個訊號唯一的依據。
+        - name: NODE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        ports:
+        - containerPort: 53
+          name: dns
+          protocol: UDP
+        - containerPort: 53
+          name: dns-tcp
+          protocol: TCP
+        - containerPort: 9253
+          name: metrics
+          protocol: TCP
+        livenessProbe:
+          httpGet:
+            host: __PILLAR__LOCAL__DNS__
+            path: /health
+            port: 8080
+          initialDelaySeconds: 60
+          timeoutSeconds: 5
+        volumeMounts:
+        - mountPath: /run/xtables.lock
+          name: xtables-lock
+          readOnly: false
+        - name: config-volume
+          mountPath: /etc/coredns
+        - name: kube-dns-config
+          mountPath: /etc/kube-dns
+        # SPIRE 的 Workload API：agent 用它取得自己的 SVID 去跟 central 建 mTLS。
+        - name: spire-agent-socket
+          mountPath: /run/spire/sockets
+          readOnly: true
+      volumes:
+      - name: xtables-lock
+        hostPath:
+          path: /run/xtables.lock
+          type: FileOrCreate
+      - name: kube-dns-config
+        configMap:
+          name: kube-dns
+          optional: true
+      - name: config-volume
+        configMap:
+          name: node-local-dns
+          items:
+            - key: Corefile
+              path: Corefile.base
+      # 必確認：SPIRE agent 在你們節點上實際暴露 socket 的路徑。這裡用的是
+      # SPIFFE 慣例值；helm chart 安裝的 SPIRE 可能不同。路徑錯了的話 plugin
+      # 會在啟動時逾時失敗並指名 workload_api，不會靜默降級。
+      - name: spire-agent-socket
+        hostPath:
+          path: /run/spire/sockets
+          type: Directory
+---
+# Headless service，讓 Prometheus 抓得到每個節點的 metrics。照上游。
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    prometheus.io/port: "9253"
+    prometheus.io/scrape: "true"
+  labels:
+    k8s-app: node-local-dns
+  name: node-local-dns
+  namespace: kube-system
+spec:
+  clusterIP: None
+  ports:
+    - name: metrics
+      port: 9253
+      targetPort: 9253
+  selector:
+    k8s-app: node-local-dns

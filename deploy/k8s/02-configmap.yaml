@@ -1,0 +1,88 @@
+# node-local-dns 的 Corefile。
+#
+# 相對上游只多了一件事：一個專屬於 zone 路由網域的 server block。既有的
+# cluster.local、in-addr.arpa、ip6.arpa 與預設 forward 完全照上游，行為不變。
+#
+# 為什麼要獨立一個 block（spec §7.4）：node-local-dns 內建的 cache plugin 以
+# (qname, qtype) 為 key，不含發問者的 zone。若讓它快取參與 zone 路由的名稱，
+# zone-a 的 pod 問過之後，zone-b 的 pod 會拿到同一份答案 —— 而且拿得像模像樣，
+# 執行期沒有任何徵兆。把 zonedns_agent 限縮在自己的 block，它用自己的
+# zone-aware 快取，其餘設定一行都不受影響。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: node-local-dns
+  namespace: kube-system
+  labels:
+    addonmanager.kubernetes.io/mode: Reconcile
+data:
+  Corefile: |
+    # ── 以下為 zonedns 新增 ────────────────────────────────────────────────
+    # example.com 換成你們 VirtualService hosts 實際使用的網域。只有落在這個
+    # block 的查詢會走 zone 路由。
+    example.com:53 {
+        errors
+        reload
+        loop
+        bind __PILLAR__LOCAL__DNS__ __PILLAR__DNS__SERVER__
+        zonedns_agent {
+            mode              k8s
+            node_name         {$NODE_NAME}
+            zone_label        zone
+            # 不含路徑：DoH 的 /dns-query 由函式庫自動接上，寫進去會變成
+            # /dns-query/dns-query 並得到 HTTP 404。帶路徑的值會在啟動時被拒絕。
+            upstream          https://zonedns-central.example.org:8443
+            central_spiffe_id spiffe://example.org/zone/mgmt/service/zonedns-central
+            workload_api      unix:///run/spire/sockets/agent.sock
+            cache_size        4096
+            edns0_code        65001
+        }
+        prometheus :9253
+        }
+    # ── 以上為 zonedns 新增 ────────────────────────────────────────────────
+    __PILLAR__DNS__DOMAIN__:53 {
+        errors
+        cache {
+                success 9984 30
+                denial 9984 5
+        }
+        reload
+        loop
+        bind __PILLAR__LOCAL__DNS__ __PILLAR__DNS__SERVER__
+        forward . __PILLAR__CLUSTER__DNS__ {
+                force_tcp
+        }
+        prometheus :9253
+        health __PILLAR__LOCAL__DNS__:8080
+        }
+    in-addr.arpa:53 {
+        errors
+        cache 30
+        reload
+        loop
+        bind __PILLAR__LOCAL__DNS__ __PILLAR__DNS__SERVER__
+        forward . __PILLAR__CLUSTER__DNS__ {
+                force_tcp
+        }
+        prometheus :9253
+        }
+    ip6.arpa:53 {
+        errors
+        cache 30
+        reload
+        loop
+        bind __PILLAR__LOCAL__DNS__ __PILLAR__DNS__SERVER__
+        forward . __PILLAR__CLUSTER__DNS__ {
+                force_tcp
+        }
+        prometheus :9253
+        }
+    .:53 {
+        errors
+        cache 30
+        reload
+        loop
+        bind __PILLAR__LOCAL__DNS__ __PILLAR__DNS__SERVER__
+        forward . __PILLAR__UPSTREAM__SERVERS__
+        prometheus :9253
+        }
