@@ -37,11 +37,12 @@ func toAnySlice(in []string) []any {
 	return out
 }
 
-// newDynamic 建出一個只服務 servedVersion 的 fake dynamic client。
+// newDynamic builds a fake dynamic client that serves only servedVersion.
 //
-// fake client 對未註冊的 list kind 會 panic，而真的 API server 是回 404。
-// 這裡把兩個版本都註冊起來，再用 reactor 讓沒被服務的那個回傳真正的 NotFound，
-// 讓版本回退的分支面對的是它在正式環境會遇到的那個錯誤型別。
+// The fake client panics on an unregistered list kind, whereas a real API server
+// returns 404. Both versions are registered here and a reactor makes the
+// unserved one return a genuine NotFound, so the version-fallback branch faces
+// the error type it will meet in production.
 func newDynamic(t *testing.T, servedVersion string, objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
 	t.Helper()
 
@@ -54,7 +55,7 @@ func newDynamic(t *testing.T, servedVersion string, objs ...runtime.Object) *dyn
 	client.PrependReactor("list", "virtualservices", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		gvr := action.GetResource()
 		if gvr.Version == servedVersion {
-			return false, nil, nil // 交給預設的 tracker 處理
+			return false, nil, nil // let the default tracker handle it
 		}
 		return true, nil, errors.NewNotFound(gvr.GroupResource(), "")
 	})
@@ -76,8 +77,8 @@ func TestCollectVirtualServiceHosts(t *testing.T) {
 		t.Errorf("hosts = %v, want %v", hosts, want)
 	}
 
-	// 被跳過的東西必須留下痕跡：一份「沒有漂移」的報告如果其實是把所有名稱都
-	// 濾掉了，看起來會跟真的沒有漂移一模一樣。
+	// What was skipped must leave a trace: a "no drift" report that really
+	// filtered every name away looks exactly like one with no drift in it.
 	gotReasons := map[string]SkipReason{}
 	for _, s := range skipped {
 		gotReasons[s.Host] = s.Reason
@@ -107,8 +108,9 @@ func TestCollectVirtualServiceHostsFallsBackToV1beta1(t *testing.T) {
 }
 
 func TestCollectVirtualServiceHostsRejectsMalformedSpec(t *testing.T) {
-	// hosts 寫成字串而不是陣列。靜靜當成「這個 VirtualService 沒有 host」會讓它
-	// 完全逃過比對 —— 而它可能正是漂移的那一個。
+	// hosts written as a string instead of an array. Quietly treating that as
+	// "this VirtualService has no hosts" would let it escape the comparison
+	// entirely — and it may be precisely the one that drifted.
 	bad := virtualService("v1", "prod", "payments", nil, nil)
 	bad.Object["spec"].(map[string]any)["hosts"] = "payments.example.com"
 
@@ -139,9 +141,10 @@ func TestCollectPodHosts(t *testing.T) {
 }
 
 func TestCollectVirtualServiceHostsErrorsWhenNoCRD(t *testing.T) {
-	// 叢集裡沒裝 Istio CRD，和叢集裡沒有任何 VirtualService，對這支工具是天差
-	// 地別的兩件事：後者代表沒有漂移，前者代表這次檢查根本什麼都沒檢查到。
-	// 回空清單會讓「沒裝 Istio」被印成一份漂亮的乾淨報告。
+	// A cluster without the Istio CRD and a cluster without any VirtualService
+	// are entirely different things to this tool: the latter means no drift, the
+	// former means the check examined nothing at all. Returning an empty list
+	// would print "Istio is not installed" as a nice clean report.
 	client := newDynamic(t, "no-such-version")
 	_, _, err := CollectVirtualServiceHosts(context.Background(), client, DefaultClusterDomain, "")
 	if err == nil {
@@ -150,8 +153,9 @@ func TestCollectVirtualServiceHostsErrorsWhenNoCRD(t *testing.T) {
 }
 
 func TestCollectVirtualServiceHostsPropagatesNonNotFoundErrors(t *testing.T) {
-	// 權限不足（403）不是「這個版本沒被服務」。當成 NotFound 而繼續試下一個版本，
-	// 最後會產生一句誤導的「沒有 CRD」—— 真正的原因是 RBAC。
+	// Insufficient permission (403) is not "this version is not served".
+	// Treating it as NotFound and moving on to the next version ends in a
+	// misleading "no CRD" when the real cause is RBAC.
 	client := newDynamic(t, "v1")
 	client.PrependReactor("list", "virtualservices", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, errors.NewForbidden(action.GetResource().GroupResource(), "", nil)
@@ -163,8 +167,9 @@ func TestCollectVirtualServiceHostsPropagatesNonNotFoundErrors(t *testing.T) {
 }
 
 func TestCollectScopesToNamespace(t *testing.T) {
-	// CI 上這個檢查曾經被「別的 namespace 裡還沒刪乾淨的 pod」污染而誤判。
-	// 範圍限縮必須真的生效，否則 --namespace 只是一個看起來有用的旗標。
+	// This check was once thrown off in CI by a pod left behind in another
+	// namespace. The scoping has to actually take effect, or --namespace is just
+	// a flag that looks useful.
 	client := newDynamic(t, "v1",
 		virtualService("v1", "wanted", "a", nil, []string{"a.example.com"}),
 		virtualService("v1", "other", "b", nil, []string{"b.example.com"}),

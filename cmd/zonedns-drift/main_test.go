@@ -51,8 +51,9 @@ func TestPrintReportSkippedHiddenByDefault(t *testing.T) {
 }
 
 func TestPrintReportStatesWhatItDoesNotCheck(t *testing.T) {
-	// 這份報告最危險的讀法是「乾淨 = 設定正確」。名稱兩邊都對得上，仍然可能指向
-	// 錯誤的 workload —— 工具不查那個，就必須在報告裡講明白。
+	// The most dangerous way to read this report is "clean means correctly
+	// configured". Names matching on both sides can still point at the wrong
+	// workload — the tool does not check that, so it must say so in the report.
 	var buf bytes.Buffer
 	printReport(&buf, drift.Compare([]string{"a.example.com"}, nil), nil, drift.HostLabel, false)
 	if !strings.Contains(buf.String(), "does not verify") {
