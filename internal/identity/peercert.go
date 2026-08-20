@@ -1,7 +1,8 @@
-// Package identity 是 zonedns 的信任邊界（spec §6.1）。
+// Package identity is zonedns's trust boundary (spec §6.1).
 //
-// 整套 zone 隔離是否可被繞過，只取決於這個套件是否正確。任何修改都必須連帶檢視
-// 這裡的測試是否仍然涵蓋對應的攻擊情境。
+// Whether the whole of zone isolation can be bypassed depends on nothing but
+// this package being correct. Any change must come with a review of whether the
+// tests here still cover the corresponding attack.
 package identity
 
 import (
@@ -14,29 +15,33 @@ import (
 	"github.com/miekg/dns"
 )
 
-// PeerCertificates 取出這次查詢的 client certificate 鏈。
+// PeerCertificates returns the client certificate chain for this query.
 //
-// 兩種傳輸的取法不同：
+// The two transports differ in how it is obtained:
 //
-//   - DoH：CoreDNS 的 HTTPS server 會把 *http.Request 放進 context。從 context 取
-//     而不是對 writer 做型別斷言 — 上游 plugin（例如 metrics）可能包裝過
-//     ResponseWriter，型別斷言會失敗，而失敗的方式是「安靜地回 false」，
-//     結果是 zone 驗證整個失效卻沒有任何錯誤。
+//   - DoH: CoreDNS's HTTPS server puts the *http.Request into the context. It is
+//     taken from the context rather than by type-asserting the writer — an
+//     upstream plugin (metrics, for one) may have wrapped the ResponseWriter, in
+//     which case the assertion fails, and it fails by quietly returning false.
+//     Zone verification would be entirely disabled without a single error.
 //
-//   - DoT：writer 實作 dns.ConnectionStater。
+//   - DoT: the writer implements dns.ConnectionStater.
 //
-//     這條路徑對 ResponseWriter 包裝不健壯：CoreDNS 的 metrics plugin 會用一個
-//     把 dns.ResponseWriter 存成 interface 欄位的 Recorder 包住 writer，此時
-//     `w.(dns.ConnectionStater)` 斷言失敗 —— 結果不是報錯，而是安靜地落到
-//     「沒有憑證」，DoT 查詢的 zone 驗證就這樣被關掉而不會有任何告警。DoH 分支
-//     刻意改成從 context 讀 *http.Request，正是為了不受這種包裝影響。我們刻意
-//     不強迫本 plugin 排到 metrics 之前去修這件事 —— 那樣做雖然能修好 DoT，卻
-//     會讓 CoreDNS 自己的 request metrics 再也看不到跨 zone 的回應，對一個我們
-//     根本沒有部署的傳輸方式來說不划算。結論：zone-aware listener 必須用 DoH，
-//     不能依賴 DoT 這條路徑。
+//     This path is not robust against ResponseWriter wrapping. CoreDNS's metrics
+//     plugin wraps the writer in a Recorder that stores dns.ResponseWriter as an
+//     interface field, at which point the `w.(dns.ConnectionStater)` assertion
+//     fails — and the result is not an error but a quiet fall through to "no
+//     certificate", switching off zone verification for DoT queries with no
+//     alert whatsoever. The DoH branch deliberately reads the *http.Request from
+//     the context precisely so that wrapping cannot affect it. Forcing this
+//     plugin to sort ahead of metrics would fix DoT, but CoreDNS's own request
+//     metrics would then never see cross-zone responses again — a poor trade for
+//     a transport we do not deploy. The conclusion: a zone-aware listener must be
+//     DoH and must not rely on this DoT path.
 //
-// 沒有 TLS、或有 TLS 但對方沒有出示憑證時回 ok=false。呼叫端必須把這個情況當成
-// 「非 zone-aware 的正常路徑」，而不是錯誤。
+// Returns ok=false when there is no TLS, or TLS but no certificate presented.
+// The caller must treat that as the ordinary non-zone-aware path, not an
+// error.
 func PeerCertificates(ctx context.Context, w dns.ResponseWriter) ([]*x509.Certificate, bool) {
 	if req, isDoH := ctx.Value(dnsserver.HTTPRequestKey{}).(*http.Request); isDoH && req != nil {
 		return certsFromState(req.TLS)
@@ -54,17 +59,22 @@ func certsFromState(st *tls.ConnectionState) ([]*x509.Certificate, bool) {
 	return st.PeerCertificates, true
 }
 
-// SPIFFEIDFromCert 取出憑證的 SPIFFE ID（URI SAN）。
+// SPIFFEIDFromCert returns the certificate's SPIFFE ID (its URI SAN).
 //
-// 必須「恰好一個」URI SAN，且其 scheme 為 spiffe，否則回 ok=false。
+// There must be exactly one URI SAN and its scheme must be spiffe; anything else
+// returns ok=false.
 //
-// crypto/tls 的鏈驗證不檢查 URI SAN 的數量或 scheme，而 SourceZone 刻意不重
-// 驗證鏈（見套件說明），所以「SPIFFE 憑證只能有一個 URI SAN」這個 SPIFFE 規範
-// 要求的不變量，這裡就是唯一把關的地方。SAN 順序由持有憑證的一方（可能是攻擊
-// 者）決定：若允許多個 URI SAN 時挑出第一個 spiffe scheme 的當身分，攻擊者只
-// 要拿到一張同時帶著「被授權的 SPIFFE ID」與「自己的 SPIFFE ID」的憑證，把被
-// 授權的那個排在前面，就能冒充成被授權的 agent。因此看到超過一個 URI SAN 一律
-// 拒絕，不嘗試挑出「最合理」的那個 —— 模糊就是要 fail closed。
+// crypto/tls's chain verification checks neither the number of URI SANs nor
+// their scheme, and SourceZone deliberately does not re-verify the chain (see
+// the package doc), so this is the only place enforcing the SPIFFE
+// specification's invariant that a SPIFFE certificate carries exactly one URI
+// SAN. SAN order is chosen by whoever holds the certificate, possibly an
+// attacker: if several URI SANs were allowed and the first with a spiffe scheme
+// were taken as the identity, an attacker holding a certificate that carries
+// both an authorized SPIFFE ID and their own could impersonate the authorized
+// agent simply by ordering the authorized one first. So more than one URI SAN is
+// refused outright, with no attempt to pick the "most plausible" one — ambiguity
+// must fail closed.
 func SPIFFEIDFromCert(cert *x509.Certificate) (string, bool) {
 	if len(cert.URIs) != 1 {
 		return "", false

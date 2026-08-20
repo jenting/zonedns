@@ -14,18 +14,21 @@ import (
 	"time"
 )
 
-// CA 是拋棄式的憑證頒發機構，用來簽發能完成真實 TLS 握手的憑證。
+// CA is a throwaway certificate authority for issuing certificates that can
+// complete a real TLS handshake.
 //
-// 為什麼不能用 New：它回傳的是自簽的 *x509.Certificate，沒有私鑰。那對「手工
-// 組一個 tls.ConnectionState 再餵給程式」的單元測試夠用，但真實握手需要成對的
-// 憑證與金鑰，而且雙方必須鏈到同一個信任根 —— 否則驗證的是憑證鏈以外的東西。
+// Why New will not do: it returns a self-signed *x509.Certificate with no
+// private key. That is enough for unit tests that hand-assemble a
+// tls.ConnectionState and feed it in, but a real handshake needs a matching
+// certificate and key, and both sides must chain to the same trust root —
+// otherwise what gets verified is something other than the chain.
 type CA struct {
 	cert *x509.Certificate
 	key  *ecdsa.PrivateKey
 	pool *x509.CertPool
 }
 
-// NewCA 建立一個新的拋棄式 CA。
+// NewCA creates a new throwaway CA.
 func NewCA(t *testing.T) *CA {
 	t.Helper()
 
@@ -56,13 +59,15 @@ func NewCA(t *testing.T) *CA {
 	return &CA{cert: cert, key: key, pool: pool}
 }
 
-// Pool 回傳只信任這個 CA 的憑證池，供 tls.Config 的 RootCAs／ClientCAs 使用。
+// Pool returns a cert pool trusting only this CA, for the RootCAs/ClientCAs of
+// a tls.Config.
 func (ca *CA) Pool() *x509.CertPool { return ca.pool }
 
-// Issue 簽發一張帶指定 SPIFFE ID 作為 URI SAN 的葉憑證。
+// Issue signs a leaf certificate carrying the given SPIFFE ID as its URI SAN.
 //
-// 同時設定 serverAuth 與 clientAuth，因為 SPIFFE 的 SVID 本來就兩用 —— 同一張
-// 憑證在一個連線上當 client、在另一個連線上當 server。
+// It sets both serverAuth and clientAuth, because a SPIFFE SVID serves both
+// roles by design — the same certificate acts as the client on one connection
+// and the server on another.
 func (ca *CA) Issue(t *testing.T, spiffeID string) tls.Certificate {
 	t.Helper()
 
@@ -82,7 +87,7 @@ func (ca *CA) Issue(t *testing.T, spiffeID string) tls.Certificate {
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		URIs:         []*url.URL{u},
-		// 讓 httptest 起的伺服器能以 127.0.0.1/localhost 被驗證。
+		// So a server started by httptest verifies as 127.0.0.1/localhost.
 		DNSNames:    []string{"localhost"},
 		IPAddresses: []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
 	}

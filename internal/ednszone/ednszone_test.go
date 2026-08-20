@@ -35,7 +35,7 @@ func TestSetIsIdempotent(t *testing.T) {
 	if !ok || got != "zone-b" {
 		t.Fatalf("got (%q,%v), want (zone-b,true)", got, ok)
 	}
-	// 不可累積出兩個同 code 的 option
+	// Two options with the same code must not accumulate
 	opt := m.IsEdns0()
 	n := 0
 	for _, o := range opt.Option {
@@ -50,7 +50,7 @@ func TestSetIsIdempotent(t *testing.T) {
 
 func TestSetPreservesExistingOPT(t *testing.T) {
 	m := newQuery()
-	m.SetEdns0(4096, true) // 既有的 OPT，帶 DO bit
+	m.SetEdns0(4096, true) // an existing OPT, with the DO bit set
 	Set(m, DefaultCode, "zone-a")
 
 	opt := m.IsEdns0()
@@ -71,7 +71,7 @@ func TestGetMissing(t *testing.T) {
 	}
 
 	m := newQuery()
-	m.SetEdns0(4096, false) // 有 OPT 但沒有我們的 option
+	m.SetEdns0(4096, false) // an OPT, but not carrying our option
 	if _, ok := Get(m, DefaultCode); ok {
 		t.Fatal("expected ok=false when option absent")
 	}
@@ -95,11 +95,12 @@ func TestGetRejectsInvalidZone(t *testing.T) {
 	}
 }
 
-// Pack/Unpack 讓兩個帶同一個 code 的 EDNS0_LOCAL option 存活下來（Set 本身
-// 防止單一呼叫端疊加出這種訊息，但 central 端解析的是線上位元組，不受 Set
-// 保護）。Get 必須回 ok=false 而不是任選其中一個 —— 見 spec §10 的「多個 EDNS0
-// option」adversarial 案例，以及本套件與 SPIFFEIDFromCert 一致的 fail-closed
-// 原則。
+// Pack/Unpack lets two EDNS0_LOCAL options with the same code survive (Set
+// itself prevents a single caller from stacking them up, but central parses
+// bytes off the wire and is not protected by Set). Get must return ok=false
+// rather than pick one — see the "multiple EDNS0 options" adversarial case in
+// spec §10, and this package's fail-closed principle, shared with
+// SPIFFEIDFromCert.
 func TestGetRejectsDuplicateOption(t *testing.T) {
 	m := newQuery()
 	opt := m.IsEdns0()
@@ -112,8 +113,8 @@ func TestGetRejectsDuplicateOption(t *testing.T) {
 		&dns.EDNS0_LOCAL{Code: DefaultCode, Data: []byte("zone-b")},
 	)
 
-	// 往返一次 wire format，確認兩個 option 真的能在 Pack/Unpack 之後存活，
-	// 不是只在記憶體內的 slice 上才成立。
+	// Round-trip through the wire format, to confirm both options really survive
+	// Pack/Unpack rather than only holding in an in-memory slice.
 	packed, err := m.Pack()
 	if err != nil {
 		t.Fatalf("Pack: %v", err)

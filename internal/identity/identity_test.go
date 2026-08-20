@@ -17,7 +17,8 @@ func cfg() Config {
 	return NewConfig([]string{agentID}, ednszone.DefaultCode)
 }
 
-// query 建立一個帶 source zone 宣告的查詢；zone 為空字串時不加宣告。
+// query builds a query carrying a source zone declaration; an empty zone adds
+// no declaration.
 func query(zone string) *dns.Msg {
 	m := new(dns.Msg)
 	m.SetQuestion("payments.example.com.", dns.TypeA)
@@ -27,7 +28,7 @@ func query(zone string) *dns.Msg {
 	return m
 }
 
-// tlsWriter 建立一個帶指定憑證的 DoT writer。
+// tlsWriter builds a DoT writer carrying the given certificates.
 func tlsWriter(t *testing.T, uri string) dns.ResponseWriter {
 	t.Helper()
 	certs := []*x509.Certificate{testcerts.New(t, uri)}
@@ -44,7 +45,7 @@ func TestSourceZoneHappyPath(t *testing.T) {
 	}
 }
 
-// 沒有 TLS 就沒有身分 — 這是非 zone-aware listener 的正常路徑。
+// No TLS means no identity — the ordinary path for a non-zone-aware listener.
 func TestSourceZoneNoTLS(t *testing.T) {
 	zone, reason := cfg().SourceZone(context.Background(), &plainWriter{}, query("zone-a"))
 	if reason != ReasonNoTLS {
@@ -55,8 +56,8 @@ func TestSourceZoneNoTLS(t *testing.T) {
 	}
 }
 
-// 核心攻擊情境：憑證有效（TLS 層驗過），但不是授權的 agent。
-// 它的 EDNS0 宣告必須被完全忽略。
+// The core attack: the certificate is valid (the TLS layer verified it) but it
+// is not an authorized agent. Its EDNS0 declaration must be ignored entirely.
 func TestSourceZoneUnauthorizedAgentDeclarationIgnored(t *testing.T) {
 	w := tlsWriter(t, "spiffe://example.org/workload/attacker")
 	zone, reason := cfg().SourceZone(context.Background(), w, query("zone-a"))
@@ -68,7 +69,7 @@ func TestSourceZoneUnauthorizedAgentDeclarationIgnored(t *testing.T) {
 	}
 }
 
-// 授權清單必須是精確比對，不可用前綴。
+// The authorized list must match exactly, never by prefix.
 func TestSourceZoneAuthorizedListIsExactMatch(t *testing.T) {
 	for _, id := range []string{
 		agentID + "/extra",
@@ -112,7 +113,7 @@ func TestSourceZoneRejectsMalformedZone(t *testing.T) {
 	}
 }
 
-// 憑證沒有 SPIFFE ID 時不可被當成授權 agent。
+// A certificate without a SPIFFE ID must not count as an authorized agent.
 func TestSourceZoneCertWithoutSPIFFEID(t *testing.T) {
 	zone, reason := cfg().SourceZone(context.Background(), tlsWriter(t, ""), query("zone-a"))
 	if reason != ReasonUnauthorizedAgent {
@@ -123,7 +124,8 @@ func TestSourceZoneCertWithoutSPIFFEID(t *testing.T) {
 	}
 }
 
-// 只檢查葉憑證。中繼 CA 憑證即使帶著授權的 SPIFFE ID 也不算。
+// Only the leaf is examined. An intermediate CA certificate does not count even
+// when it carries an authorized SPIFFE ID.
 func TestSourceZoneOnlyLeafCertificateCounts(t *testing.T) {
 	leaf := testcerts.New(t, "spiffe://example.org/workload/attacker")
 	intermediate := testcerts.New(t, agentID)
@@ -140,7 +142,8 @@ func TestSourceZoneOnlyLeafCertificateCounts(t *testing.T) {
 	}
 }
 
-// 空的授權清單表示沒有任何 agent 被授權，不是「全部放行」。
+// An empty authorized list means no agent is authorized, not "let everyone
+// through".
 func TestSourceZoneEmptyAuthorizedListDeniesAll(t *testing.T) {
 	c := NewConfig(nil, ednszone.DefaultCode)
 	zone, reason := c.SourceZone(context.Background(), tlsWriter(t, agentID), query("zone-a"))
@@ -152,7 +155,8 @@ func TestSourceZoneEmptyAuthorizedListDeniesAll(t *testing.T) {
 	}
 }
 
-// option code 設定不一致時，宣告必須被忽略而非誤讀。
+// When the configured option codes disagree, the declaration must be ignored
+// rather than misread.
 func TestSourceZoneRespectsConfiguredOptionCode(t *testing.T) {
 	c := NewConfig([]string{agentID}, 65002)
 	zone, reason := c.SourceZone(context.Background(), tlsWriter(t, agentID), query("zone-a"))
@@ -164,9 +168,9 @@ func TestSourceZoneRespectsConfiguredOptionCode(t *testing.T) {
 	}
 }
 
-// Reason.String() 的輸出是 Prometheus metric 的 label value；調整 iota 順序
-// 會在不知不覺間改名 metric，所以每個常數的字串都要單獨鎖住，外加一個
-// out-of-range 值鎖住 default 分支。
+// Reason.String() produces a Prometheus metric label value. Reordering the iota
+// would rename the metric without anyone noticing, so every constant's string is
+// pinned individually, plus an out-of-range value to pin the default branch.
 func TestReasonString(t *testing.T) {
 	cases := []struct {
 		reason Reason
