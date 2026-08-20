@@ -22,6 +22,12 @@ NODE_LOCAL_DNS_REF ?= 1.26.8
 
 KIND_CLUSTER ?= zonedns-dev
 
+# 漂移檢查要對「真的」VirtualService CRD 驗證 —— fake dynamic client 對 GVR
+# 不做任何檢查，群組名或複數形打錯它一樣照列不誤。注意路徑是 base/files/，
+# 不是 base/crds/（後者在 1.20 之後就不存在了）。
+ISTIO_VERSION ?= release-1.24
+ISTIO_CRD_URL ?= https://raw.githubusercontent.com/istio/istio/$(ISTIO_VERSION)/manifests/charts/base/files/crd-all.gen.yaml
+
 .PHONY: help
 help: ## 列出可用的目標
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -75,6 +81,22 @@ kind-down: ## 刪除 kind cluster
 .PHONY: test-cluster
 test-cluster: ## 對現有 cluster 跑 informer 測試（需先 make kind-up）
 	go test -tags=cluster ./internal/podzone/ -run TestCluster -v -count=1 -timeout 10m
+
+.PHONY: istio-crds
+istio-crds: ## 裝上 Istio CRD（漂移檢查的測試需要真的 VirtualService CRD）
+	kubectl apply -f $(ISTIO_CRD_URL)
+	kubectl wait --for=condition=Established --timeout=60s \
+	  crd/virtualservices.networking.istio.io
+
+.PHONY: test-drift
+test-drift: ## 對現有 cluster 跑漂移檢查的測試（需先 make istio-crds）
+	go test -tags=cluster ./internal/drift/ -run TestCluster -v -count=1 -timeout 10m
+
+## ── 漂移檢查 ──────────────────────────────────────────────────────────
+
+.PHONY: drift
+drift: ## 用目前的 kubeconfig 檢查 VirtualService 與 pod label 是否漂移
+	go run ./cmd/zonedns-drift --show-skipped
 
 ## ── Image ─────────────────────────────────────────────────────────────
 

@@ -62,6 +62,13 @@ pod ──一般 UDP DNS──▶ node-local DNS + zonedns_agent
 | `internal/spiffezone` | 從 SPIFFE ID path 取出 zone |
 | `internal/testcerts` | 測試專用：產生帶指定 URI SAN 的拋棄式憑證，只被 `_test.go` 匯入 |
 
+**工具**
+
+| 路徑 | 說明 |
+|---|---|
+| `cmd/zonedns-drift` | 比對 VirtualService 的 `hosts:` 與 pod 的 `zonedns.io/host` label，抓出兩份宣告的漂移 |
+| `internal/drift` | 上面那支工具的比對與收集邏輯 |
+
 節點端與中心端不共用程式碼，只共用 `internal/ednszone` 定義的線上格式（EDNS0
 option 裡怎麼編碼一個 zone 宣告）—— 這是兩者之間唯一的相容性介面。任何一邊
 單獨修改這個格式，另一邊都不會編譯失敗或執行期報錯，只會讓宣告的 zone 讀不
@@ -136,3 +143,50 @@ go test -tags=cluster ./internal/podzone/ -run TestCluster -v
 而失敗。
 
 必須是兩個節點：單節點的 cluster 無法證明範圍真的被限縮。
+
+`internal/drift/cluster_test.go` 同樣以 `cluster` tag 隔開，需要一個裝了 Istio
+CRD 的 cluster：
+
+```bash
+kind create cluster
+make istio-crds
+make test-drift
+```
+
+它驗的是 fake dynamic client 結構上做不到的事：那個假物件**對 GVR 不做任何驗證**
+—— 群組名、資源複數形、版本全部打錯，它一樣照列不誤。也就是說「這支工具真的
+讀得到 VirtualService」這件事，在單元測試裡從來沒有被證明過，而它是整個檢查的
+前提：讀不到就等於沒有漂移，一份漂亮的乾淨報告。
+
+## 漂移檢查
+
+一個 workload 的對外名稱在這套設計裡被寫了兩份 —— pod 的 `zonedns.io/host`
+label 決定 SPIRE entry 的 dns_name（也就是 central registry 的 key），Istio
+VirtualService 的 `hosts:` 決定 client 實際查什麼名字。**兩份宣告漂移時沒有任何
+東西會報錯**：central 查不到那個名字，就把它當成不歸自己管而交給下游，於是那個
+服務靜靜地失去 zone 路由，而 DNS 查詢照常有答案。
+
+```bash
+make drift              # 用目前的 kubeconfig
+go run ./cmd/zonedns-drift --show-skipped
+```
+
+| 離開碼 | 意義 |
+|---|---|
+| 0 | 沒有漂移 |
+| 1 | 發現漂移 |
+| 2 | 檢查本身失敗（連不上、權限不足、沒裝 Istio CRD） |
+
+離開碼 2 是刻意與 0 分開的：叢集裡沒有 Istio CRD 和叢集裡沒有漂移，如果都印成
+「乾淨」，這支工具就會在最該說話的時候保持沉默。
+
+比對前會排除三類名稱（`--show-skipped` 會列出來並附上理由）：萬用 host、cluster
+內部名稱（短名與 `*.svc.cluster.local`）、以及綁在 gateway 而非 mesh 的
+VirtualService。這些不可能有對應的 workload label，比對它們只會製造假警報。
+
+**這個檢查只比對名稱。** 兩邊都對得上的名稱仍然可能指向錯誤的 workload —— 要驗
+那件事得追蹤 VirtualService → destination Service → pod 的路由，也就是設計時評估
+後否決的 Istio traversal 方案。工具的輸出會把這個界線印出來。
+
+在叢集內執行（CronJob）時需要的權限：對 `pods` 與 `networking.istio.io` 的
+`virtualservices` 有 cluster 範圍的 `list`。
