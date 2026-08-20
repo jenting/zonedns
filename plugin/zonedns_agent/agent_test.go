@@ -16,20 +16,22 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
-// fakeUpstream 記錄它收到的查詢並回一筆固定答案。
+// fakeUpstream records the query it received and returns one fixed answer.
 type fakeUpstream struct {
 	seen  []*dns.Msg
 	err   error
 	calls int
 
-	// rcode 為非零值時覆蓋回應的 Rcode（RcodeSuccess 恰好是零值，所以預設就是
-	// 原本「回一筆成功答案」的行為）。
+	// A non-zero rcode overrides the response's Rcode. RcodeSuccess happens to be
+	// the zero value, so the default remains the original "return one successful
+	// answer" behaviour.
 	rcode int
-	// withAnswer 讓回應即使 rcode 非成功也帶著固定的 A record —— 用來測試快取
-	// 路徑在收到 in-band 失敗時的行為。
+	// withAnswer makes the response carry the fixed A record even when the rcode is
+	// not a success — used to test how the cache path behaves on an in-band
+	// failure.
 	withAnswer bool
-	// mismatchQuestion 讓回應的 Question section 改成另一個名字，模擬 central
-	// 端一個把答案送錯查詢的 bug。
+	// mismatchQuestion changes the response's Question section to a different name,
+	// simulating a bug at central that sends an answer to the wrong query.
 	mismatchQuestion bool
 }
 
@@ -53,7 +55,7 @@ func (f *fakeUpstream) Exchange(_ context.Context, m *dns.Msg) (*dns.Msg, error)
 	return resp, nil
 }
 
-// writerFrom 建立一個 source IP 為 ip 的 ResponseWriter。
+// writerFrom builds a ResponseWriter whose source IP is ip.
 func writerFrom(ip string) *dnstest.Recorder {
 	w := &test.ResponseWriter{}
 	w.RemoteIP = ip
@@ -81,7 +83,7 @@ func queryFor(name string) *dns.Msg {
 	return m
 }
 
-// mapResolver 是最小的 ZoneResolver 測試替身。
+// mapResolver is the smallest possible ZoneResolver test double.
 type mapResolver map[string]string
 
 func (m mapResolver) Zone(ip netip.Addr) (string, bool) {
@@ -113,7 +115,8 @@ func TestServeDNSDeclaresTheSourceZone(t *testing.T) {
 	}
 }
 
-// 認不出來源時仍要轉發，但不可宣告任何 zone —— 猜一個 zone 比不宣告危險得多。
+// An unrecognised source is still forwarded, but must declare no zone — guessing
+// one is far more dangerous than declaring none.
 func TestServeDNSUnknownSourceDeclaresNothing(t *testing.T) {
 	up := &fakeUpstream{}
 	a := newAgent(t, mapResolver{}, up)
@@ -129,9 +132,10 @@ func TestServeDNSUnknownSourceDeclaresNothing(t *testing.T) {
 	}
 }
 
-// 沒識別出來源時，若查詢本身帶著偽造的 zone 宣告，agent 必須清除它 —— 否則攻擊者
-// 可以在 agent 猜不到 zone 的那一刻，自己決定要宣告哪個 zone，而 central 會相信
-// agent 轉發的一切。
+// When the source is not identified and the query carries a forged zone
+// declaration of its own, the agent must strip it — otherwise, at the very moment
+// the agent cannot work out the zone, an attacker gets to choose which zone is
+// declared, and central believes everything the agent forwards.
 func TestServeDNSStripsForgedZoneWhenSourceUnknown(t *testing.T) {
 	up := &fakeUpstream{}
 	a := newAgent(t, mapResolver{}, up)
@@ -147,8 +151,9 @@ func TestServeDNSStripsForgedZoneWhenSourceUnknown(t *testing.T) {
 	}
 }
 
-// 已識別出來源時，agent 自己判定的 zone 必須覆蓋查詢裡任何既有宣告 —— client 不能
-// 冒充 agent 對自己 zone 的判斷。
+// With the source identified, the zone the agent determined must override any
+// declaration already in the query — a client must not be able to impersonate the
+// agent's judgement about its own zone.
 func TestServeDNSOverridesForgedZoneWhenSourceKnown(t *testing.T) {
 	up := &fakeUpstream{}
 	a := newAgent(t, mapResolver{"10.1.0.5": "zone-a"}, up)
@@ -168,7 +173,8 @@ func TestServeDNSOverridesForgedZoneWhenSourceKnown(t *testing.T) {
 	}
 }
 
-// 這是本套件存在的理由：同名查詢、不同 zone，不可共用快取。
+// This package's reason to exist: queries for the same name from different zones
+// must not share a cache entry.
 func TestCacheIsKeyedByZone(t *testing.T) {
 	up := &fakeUpstream{}
 	a := newAgent(t, mapResolver{"10.1.0.5": "zone-a", "10.1.0.9": "zone-b"}, up)
@@ -198,8 +204,9 @@ func TestCacheHitAvoidsUpstream(t *testing.T) {
 	}
 }
 
-// 上游失敗必須是 SERVFAIL，不可交給下一個 plugin —— 那會繞過 zone 路由並回一個
-// 看起來正常的直連位址。
+// An upstream failure must be SERVFAIL and must not fall through to the next
+// plugin — that would bypass zone routing and return a direct address that looks
+// perfectly normal.
 func TestUpstreamErrorIsServfail(t *testing.T) {
 	up := &fakeUpstream{err: errors.New("central unreachable")}
 	a := newAgent(t, mapResolver{"10.1.0.5": "zone-a"}, up)
@@ -213,9 +220,9 @@ func TestUpstreamErrorIsServfail(t *testing.T) {
 	}
 }
 
-// 上游以 in-band DNS 失敗（例如 NXDOMAIN）回應時，client 必須看到那個真正的
-// rcode —— 不可被 SetReply 洗成 NOERROR，否則一個真的不存在的名字看起來像是
-// 存在但沒有紀錄。
+// When upstream responds with an in-band DNS failure such as NXDOMAIN, the client
+// must see that real rcode — SetReply must not launder it into NOERROR, or a name
+// that genuinely does not exist looks like one that exists with no records.
 func TestServeDNSPreservesUpstreamNXDOMAIN(t *testing.T) {
 	up := &fakeUpstream{rcode: dns.RcodeNameError}
 	a := newAgent(t, mapResolver{"10.1.0.5": "zone-a"}, up)
@@ -229,8 +236,9 @@ func TestServeDNSPreservesUpstreamNXDOMAIN(t *testing.T) {
 	}
 }
 
-// 同一條規則也適用於快取命中路徑：存進快取、再取出來寫給 client 的訊息，一樣不
-// 能被 SetReply 洗掉原本的 rcode。
+// The same rule applies on the cache-hit path: a message stored in the cache and
+// then written back to a client must not have its original rcode laundered away
+// by SetReply either.
 func TestCacheHitPreservesUpstreamRcode(t *testing.T) {
 	up := &fakeUpstream{rcode: dns.RcodeServerFailure, withAnswer: true}
 	a := newAgent(t, mapResolver{"10.1.0.5": "zone-a"}, up)
@@ -249,7 +257,8 @@ func TestCacheHitPreservesUpstreamRcode(t *testing.T) {
 	}
 }
 
-// source IP 等於節點 IP 是 masquerade 的徵兆，必須可觀測。
+// A source IP equal to the node IP is a sign of masquerading, and must be
+// observable.
 func TestNodeIPSourceIsCounted(t *testing.T) {
 	up := &fakeUpstream{}
 	a := newAgent(t, mapResolver{}, up)
@@ -263,10 +272,12 @@ func TestNodeIPSourceIsCounted(t *testing.T) {
 	}
 }
 
-// central 的身分由 mTLS 釘住，但那不保證它回的答案真的是這次問的問題 —— 一個
-// central 端的 bug（例如把另一筆查詢的答案送錯連線）不可被原封不動地包成一筆
-// 看起來正常但答非所問的回應洗給 client。必須當成上游失敗處理，用同一個
-// metric 計數，而且不可以被存進快取。
+// Central's identity is pinned by mTLS, but that does not guarantee the answer it
+// returns belongs to the question just asked. A bug at central — sending another
+// query's answer down the wrong connection, say — must not be wrapped up untouched
+// and passed to the client as a normal-looking response to a different question.
+// It must be handled as an upstream failure, counted by the same metric, and
+// never stored in the cache.
 func TestServeDNSRejectsMismatchedUpstreamQuestion(t *testing.T) {
 	up := &fakeUpstream{mismatchQuestion: true}
 	a := newAgent(t, mapResolver{"10.1.0.5": "zone-a"}, up)
@@ -310,7 +321,7 @@ func TestAnswersQuestion(t *testing.T) {
 		t.Fatal("a reply for a different qtype must not match")
 	}
 
-	// DNS 名稱大小寫不敏感，這裡不能被判定成不符。
+	// DNS names are case-insensitive, so this must not count as a mismatch.
 	caseDiffers := new(dns.Msg)
 	caseDiffers.SetReply(q)
 	caseDiffers.Question = []dns.Question{{Name: strings.ToUpper(q.Question[0].Name), Qtype: dns.TypeA, Qclass: dns.ClassINET}}
@@ -325,7 +336,7 @@ func TestStaticResolver(t *testing.T) {
 	if !ok || zone != "zone-c" {
 		t.Fatalf("got (%q,%v), want (zone-c,true)", zone, ok)
 	}
-	// VM 模式下 zone 與來源無關。
+	// Under VM mode the zone is independent of the source.
 	zone, ok = r.Zone(netip.MustParseAddr("172.16.0.1"))
 	if !ok || zone != "zone-c" {
 		t.Fatalf("got (%q,%v), want (zone-c,true)", zone, ok)

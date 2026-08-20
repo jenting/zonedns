@@ -7,12 +7,13 @@ import (
 )
 
 var (
-	// zoneResolutionTotal 依判定結果分類。
+	// zoneResolutionTotal is broken down by outcome.
 	//
-	// result="node_ip" 是最重要的一個：它表示查詢的 source IP 就是節點自己的 IP。
-	// 正常情況下 pod 的查詢帶著 pod IP 抵達（node-local DNS 走 link-local 位址，
-	// 不經 DNAT），所以這個數字跳升代表節點上有東西在做 SNAT/masquerade，而那會
-	// 讓整個節點退化成單一 zone —— 靜默地。
+	// result="node_ip" is the one that matters most: it means a query's source IP
+	// was the node's own. Normally a pod's query arrives carrying the pod IP —
+	// node-local DNS uses a link-local address and no DNAT — so a jump in this
+	// number means something on the node is doing SNAT or masquerading, which
+	// collapses the whole node into a single zone. Silently.
 	zoneResolutionTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: plugin.Namespace,
 		Subsystem: "zonedns_agent",
@@ -20,7 +21,7 @@ var (
 		Help:      "Count of source zone resolution attempts by outcome.",
 	}, []string{"result"})
 
-	// cacheTotal 區分命中與未命中。
+	// cacheTotal separates hits from misses.
 	cacheTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: plugin.Namespace,
 		Subsystem: "zonedns_agent",
@@ -28,7 +29,7 @@ var (
 		Help:      "Count of zone-aware cache lookups by outcome.",
 	}, []string{"result"})
 
-	// upstreamErrorsTotal 記錄對 central 的查詢失敗次數。
+	// upstreamErrorsTotal counts failed queries to central.
 	upstreamErrorsTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: plugin.Namespace,
 		Subsystem: "zonedns_agent",
@@ -36,7 +37,7 @@ var (
 		Help:      "Count of failed DoH exchanges with the central server.",
 	})
 
-	// resolverReady 為 0 時所有查詢都不宣告 zone。
+	// While resolverReady is 0, no query declares a zone.
 	resolverReady = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: plugin.Namespace,
 		Subsystem: "zonedns_agent",

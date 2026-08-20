@@ -13,10 +13,12 @@ import (
 	"github.com/miekg/dns"
 )
 
-// 同一個名字、兩個不同 zone 的 pod，必須得到不同的答案，而且兩次都真的問了上游。
-// 這是節點端存在的理由。跟 agent_test.go 裡以 fakeUpstream 直接傳遞 *dns.Msg 的
-// 單元測試不同，這裡走真正的 DoH wire 編碼／解碼（httptest server +
-// dohupstream.NewWithHTTPClient），驗證的是整條路徑，不是個別函式。
+// One name, two pods in different zones, and the answers must differ — with
+// upstream really queried both times. This is the node side's reason to exist.
+// Unlike the unit tests in agent_test.go, which pass a *dns.Msg straight through
+// a fakeUpstream, this goes through real DoH wire encoding and decoding (an
+// httptest server plus dohupstream.NewWithHTTPClient), verifying the whole path
+// rather than individual functions.
 func TestEndToEndSameNameDifferentZones(t *testing.T) {
 	var declared []string
 
@@ -30,7 +32,8 @@ func TestEndToEndSameNameDifferentZones(t *testing.T) {
 		zone, _ := ednszone.Get(req, ednszone.DefaultCode)
 		declared = append(declared, zone)
 
-		// central 的行為：zone-a 是同 zone（回服務位址），其餘回 gateway。
+		// Central's behaviour: zone-a is the same zone (the service address comes
+		// back), everything else gets the gateway.
 		addr := "203.0.113.10"
 		if zone == "zone-a" {
 			addr = "10.96.0.7"

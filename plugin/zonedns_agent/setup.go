@@ -36,9 +36,9 @@ func init() { plugin.Register("zonedns_agent", setup) }
 
 type config struct {
 	mode            mode
-	zone            string // vm 模式
-	nodeName        string // k8s 模式
-	zoneLabel       string // k8s 模式
+	zone            string // vm mode
+	nodeName        string // k8s mode
+	zoneLabel       string // k8s mode
 	upstreamURL     string
 	centralSPIFFEID string
 	workloadAPI     string
@@ -47,12 +47,13 @@ type config struct {
 	nodeIP          netip.Addr
 }
 
-// CheckDirectiveOrder 確認 zonedns_agent 排在 cache 之前。
+// CheckDirectiveOrder confirms that zonedns_agent sorts before cache.
 //
-// 這是正確性要求而非偏好：既有的 cache plugin 以 (qname, qtype) 為 key，不含發問者
-// 的 zone。若它排在前面，zone-a 的 pod 問過之後，zone-b 的 pod 會拿到同一份答案 ——
-// 而且拿得像模像樣，執行期沒有任何徵兆。順序由編譯期的 plugin.cfg 決定，所以這是
-// 建置設定的檢查。
+// This is a correctness requirement, not a preference: the existing cache plugin
+// keys on (qname, qtype) and does not include the asking workload's zone. If it
+// sorts first, then once a zone-a pod has asked, a zone-b pod receives that same
+// answer — convincingly, with no sign of it at runtime. The order comes from
+// plugin.cfg at compile time, making this a check on the build configuration.
 func CheckDirectiveOrder(directives []string) error {
 	agentAt, cacheAt := -1, -1
 	for i, d := range directives {
@@ -73,60 +74,71 @@ func CheckDirectiveOrder(directives []string) error {
 	return nil
 }
 
-// resolverGeneration 為每一次啟動 k8s watcher 配發一個遞增的世代編號。它是
-// package 層級、跨越多次 setup() 呼叫共用的狀態，本身只是單純遞增，不需要
-// 額外保護 —— 遞增沒有「讀了再決定要不要寫」這種步驟。
+// resolverGeneration hands each k8s watcher startup an increasing generation
+// number. It is package-level state shared across setup() calls, and since it
+// only ever increments it needs no further protection — an increment has no
+// read-then-decide-whether-to-write step in it.
 //
-// 理由：reload 期間新舊兩個 watcher 的生命週期會重疊 —— coredns/caddy 的
-// Instance.Restart 先把新 instance 完整啟動（含這裡的 c.OnStartup）成功之後，
-// 才去呼叫舊 instance 的 Stop 與 OnShutdown。若舊 watcher 因為自己的 ctx 被
-// 取消而想把 resolverReady 歸零，這個歸零可能發生在新 watcher 已經同步完成、
-// 把 gauge 設成 1 之後 —— 兩個 goroutine 之間沒有任何順序保證，較舊世代的
-// 歸零會蓋掉較新世代已經回報的就緒狀態，而且蓋掉之後不會再有任何事件把它
-// 修回來（每個 watcher 的 OnReady 只呼叫一次）。世代編號讓「要歸零」的那一刻
-// 可以自問「我是不是最後一個真正就緒的世代」，不是的話就什麼都不做。
+// Why it exists: during a reload the lifetimes of the old and new watchers
+// overlap. coredns/caddy's Instance.Restart brings the new instance fully up,
+// c.OnStartup here included, and only then calls the old instance's Stop and
+// OnShutdown. So when the old watcher wants to zero resolverReady because its own
+// ctx was cancelled, that zeroing can land after the new watcher has finished
+// syncing and set the gauge to 1 — nothing orders the two goroutines — and the
+// older generation's zero would overwrite the readiness the newer one already
+// reported, with no later event to put it right (each watcher's OnReady fires
+// once). The generation number lets the moment of zeroing ask itself "am I still
+// the last generation that actually became ready?", and do nothing if not.
 var resolverGeneration atomic.Uint64
 
-// resolverReadyMu 保護 resolverReadyGeneration，也讓它跟 resolverReady 這個
-// gauge 的寫入綁在同一個不可分割的臨界區裡。
+// resolverReadyMu protects resolverReadyGeneration and binds it into the same
+// indivisible critical section as writes to the resolverReady gauge.
 //
-// 「讀出目前最新的就緒世代、跟自己的世代比較、決定要不要寫入 gauge」這一整
-// 串動作必須當成單一原子操作，不能拆成「先讀、再寫」兩步 —— 光是把
-// resolverReadyGeneration 換成 atomic.Uint64 並不夠：atomic 保證的是單一
-// Load 或單一 Store 各自不可分割，不保證「Load 之後根據結果決定的 Store」
-// 整體不可分割。若中間留了窗口，較舊世代可能在讀到「我還是最新」之後、還
-// 沒來得及寫入 0 之前，被較新世代插進來把自己標成就緒；等較舊世代接著執行
-// 它已經決定好的動作，會把較新世代剛寫好的「就緒」蓋掉 —— 蓋掉之後同樣不會
-// 再有任何事件修正它，直到下一次 reload，是原本這個機制要避免的「卡在 0」
-// 錯誤，只是窗口從整個 reload 縮小成這一個 check-then-act 的瞬間。
-// TestResolverReadyGuardTOCTOU 會用 resolverStoppedTestHook 強制重現這個窗口。
+// Reading the latest ready generation, comparing it with one's own, and deciding
+// whether to write the gauge must be a single atomic operation and cannot be
+// split into read-then-write. Making resolverReadyGeneration an atomic.Uint64
+// would not suffice: atomics make a single Load or a single Store indivisible,
+// not "a Store decided upon after a Load". Left a window, an older generation
+// could read "I am still the latest" and then, before it manages to write 0, be
+// overtaken by a newer generation marking itself ready; the older generation then
+// carries out the action it had already decided on and overwrites the readiness
+// the newer one just wrote — and again no later event puts it right until the
+// next reload. That is the same "stuck at 0" fault this mechanism exists to
+// prevent, with the window narrowed from a whole reload to this one
+// check-then-act instant. TestResolverReadyGuardTOCTOU forces that window open
+// with resolverStoppedTestHook.
 var (
 	resolverReadyMu         sync.Mutex
-	resolverReadyGeneration uint64 // 由 resolverReadyMu 保護
+	resolverReadyGeneration uint64 // protected by resolverReadyMu
 )
 
-// resolverStoppedTestHook 不是 nil 時，會在 markResolverStopped 讀出目前的
-// 就緒世代、比較之後、真正寫入 gauge 之前被呼叫一次。它唯一的用途是讓測試
-// 能夠強制重現 check-then-act 需要的那個交錯時機；正式環境永遠是 nil，多一
-// 次 nil 檢查的成本可以忽略。寫法上比照 agent.go 的 timeNow 變數。
+// When resolverStoppedTestHook is not nil it is called once inside
+// markResolverStopped, after the current ready generation has been read and
+// compared and before the gauge is actually written. Its only purpose is to let
+// tests force the interleaving a check-then-act needs; in production it is always
+// nil, and one extra nil check costs nothing. It follows the style of the timeNow
+// variable in agent.go.
 var resolverStoppedTestHook func()
 
-// newUpstream 建立 agent 對 central 的連線。可在測試中覆蓋 —— 寫法比照上面的
-// resolverStoppedTestHook 與 agent.go 的 timeNow 變數。central 端的 SPIRE 連線
-// 是惰性的（見 plugin/zonedns/setup.go 的 dialSPIRE），可以直接測；這裡的
-// dohupstream.NewMTLS 不同，它一定會卡住等一個真實的 Workload API 回應第一筆
-// SVID，沒有這一層間接，setup() 本身就沒有任何測試能跑，包括
-// CheckDirectiveOrder 有沒有被呼叫、VM 模式的就緒 gauge 有沒有設對、以及每一條
-// 錯誤路徑有沒有正確地把 cancel/cleanup 收乾淨。
+// newUpstream builds the agent's connection to central. Overridable in tests,
+// following the style of resolverStoppedTestHook above and the timeNow variable
+// in agent.go. Central's SPIRE connection is lazy (see dialSPIRE in
+// plugin/zonedns/setup.go) and can be tested directly; dohupstream.NewMTLS here
+// is different — it always blocks waiting for a real Workload API to deliver the
+// first SVID. Without this indirection no test of setup() could run at all:
+// whether CheckDirectiveOrder is called, whether VM mode sets the readiness gauge
+// correctly, and whether every error path tidies up its cancel and cleanup.
 var newUpstream = dohupstream.NewMTLS
 
-// wireResolverReadyLifecycle 讓 resolverReady gauge 的生命週期跟著 ctx 走：立刻
-// 標記 gen 這個世代為就緒，並在 ctx 結束時嘗試把它清空（是否真的清空由世代比較
-// 決定，見 resolverGeneration 與 markResolverStopped 上方的註解）。
+// wireResolverReadyLifecycle ties the resolverReady gauge's lifetime to ctx: it
+// marks generation gen ready at once, and attempts to clear it when ctx ends
+// (whether it really clears is decided by the generation comparison — see the
+// docs above resolverGeneration and markResolverStopped).
 //
-// VM 模式沒有非同步的載入階段，一建立解析器就是就緒的，但仍然要走跟 k8s 模式
-// 相同的世代保護，兩種模式的 shutdown 才不會互相蓋掉彼此寫入的 gauge —— 例如
-// reload 前後兩個 instance 一個是 k8s 模式、一個是 vm 模式時。
+// VM mode has no asynchronous loading phase and is ready the moment its resolver
+// is built, but it still goes through the same generation guard as k8s mode, so
+// the two modes' shutdowns cannot overwrite each other's gauge writes — as when a
+// reload has one instance in k8s mode and the other in vm mode.
 func wireResolverReadyLifecycle(ctx context.Context) {
 	gen := resolverGeneration.Add(1)
 	markResolverReady(gen)
@@ -136,12 +148,14 @@ func wireResolverReadyLifecycle(ctx context.Context) {
 	}()
 }
 
-// markResolverReady 記錄 gen 這個世代已經同步完成。呼叫端一律可以直接標成
-// 就緒，因為 OnReady 只會在真正同步完成時觸發一次，永遠代表目前已知最新的
-// 事實 —— 不需要跟任何人比較。仍然要拿 resolverReadyMu，理由見它上面的
-// 註解：這個函式跟 markResolverStopped 寫的是同一個世代編號與同一個 gauge，
-// 兩邊必須共用同一把鎖才能互相排除，不然這裡的寫入本身也可能被
-// markResolverStopped 的 check-then-act 夾在中間。
+// markResolverReady records that generation gen has finished syncing. Callers may
+// always mark ready outright, because OnReady fires once and only on a real
+// completed sync, so it always represents the latest known fact — there is nobody
+// to compare against. It still takes resolverReadyMu, for the reason given above
+// that mutex: this function and markResolverStopped write the same generation
+// number and the same gauge, and they must share one lock to exclude each other,
+// or a write here could itself land in the middle of markResolverStopped's
+// check-then-act.
 func markResolverReady(gen uint64) {
 	resolverReadyMu.Lock()
 	defer resolverReadyMu.Unlock()
@@ -149,9 +163,10 @@ func markResolverReady(gen uint64) {
 	resolverReady.Set(1)
 }
 
-// markResolverStopped 記錄 gen 這個世代的 watcher 已經停止。只有在還沒有
-// 更新的世代取得就緒狀態時才把 gauge 歸零。「比較世代」與「寫入 gauge」在
-// 同一把鎖底下完成，理由見 resolverReadyMu 上的註解。
+// markResolverStopped records that generation gen's watcher has stopped. It zeroes
+// the gauge only when no newer generation has become ready. Comparing generations
+// and writing the gauge happen under one lock, for the reason given above
+// resolverReadyMu.
 func markResolverStopped(gen uint64) {
 	resolverReadyMu.Lock()
 	defer resolverReadyMu.Unlock()
@@ -195,10 +210,12 @@ func setup(c *caddy.Controller) error {
 	switch cfg.mode {
 	case modeVM:
 		resolver = NewStaticResolver(cfg.zone)
-		// VM 模式沒有非同步的載入階段，解析器一建立就是就緒的；wireResolverReadyLifecycle
-		// 立刻標成就緒，並在 shutdown（ctx.Done()）時比照 k8s 模式把 gauge 清掉 ——
-		// 少了這一步，VM 模式的節點關閉之後 resolver_ready 會繼續卡在 1，跟已經
-		// 停止回答的事實不符。
+		// VM mode has no asynchronous loading phase and is ready the moment its
+		// resolver is built. wireResolverReadyLifecycle marks it ready at once and,
+		// on shutdown (ctx.Done()), clears the gauge exactly as k8s mode does —
+		// without that step a VM-mode node would leave resolver_ready stuck at 1
+		// after it shut down, contradicting the fact that it has stopped
+		// answering.
 		wireResolverReadyLifecycle(ctx)
 	case modeK8s:
 		restCfg, err := rest.InClusterConfig()
@@ -216,14 +233,16 @@ func setup(c *caddy.Controller) error {
 		w := podzone.New(client, cfg.nodeName, cfg.zoneLabel)
 		resolver = w
 
-		// 這裡刻意不把 resolverReady 設成 0：此刻只是「正在解析新的設定」，
-		// 舊 instance（如果這是一次 reload）仍在正常回答查詢，把全域共用的
-		// gauge 提早歸零會製造一個假的「未就緒」窗口，讓每一次 reload 都觸發
-		// resolver_ready==0 的告警，即使服務完全沒有中斷。gauge 維持它原本
-		// 的值 —— 冷啟動時是 promauto 給的預設 0，reload 時是舊 instance 留下
-		// 的 1 —— 直到下面兩個事件之一真正發生：這個 watcher 同步完成
-		// （OnReady）或它被關閉（ctx.Done）。世代編號的用途見上方
-		// resolverGeneration 的註解。
+		// resolverReady is deliberately not set to 0 here. All that is happening at
+		// this moment is "a new configuration is being parsed", and the old instance
+		// — if this is a reload — is still answering queries normally. Zeroing the
+		// shared gauge early would manufacture a false "not ready" window and fire
+		// the resolver_ready==0 alert on every reload, even with no interruption of
+		// service at all. The gauge keeps whatever value it had — promauto's default
+		// 0 on a cold start, the 1 left by the old instance on a reload — until one
+		// of two things really happens: this watcher finishes syncing (OnReady) or
+		// it is shut down (ctx.Done). For what the generation number is for, see the
+		// doc above resolverGeneration.
 		gen := resolverGeneration.Add(1)
 		w.OnReady = func() { markResolverReady(gen) }
 		c.OnStartup(func() error {
@@ -264,12 +283,14 @@ func parseConfig(c *caddy.Controller) (*config, error) {
 		edns0Code: ednszone.DefaultCode,
 		zoneLabel: "zone",
 	}
-	// 一個設了但解不開的 NODE_IP 必須是錯誤，而不是悄悄當成沒設：masquerade
-	// 偵測（Agent.resolveZone 比對來源位址是不是節點自己的 IP）是唯一會告訴
-	// 操作者「這個節點上有東西在改寫來源位址、已經退化成單一 zone」的訊號，
-	// DaemonSet manifest 裡打錯一個字元就讓它悄悄失效，且沒有任何記錄，正是
-	// 這個專案一路在消除的那種失敗模式。行為要跟下面 Corefile 的 node_ip
-	// 選項一致——那裡同樣的解析錯誤會讓啟動失敗。
+	// A NODE_IP that is set but unparseable must be an error rather than quietly
+	// treated as unset. Masquerade detection — Agent.resolveZone comparing the
+	// source address against the node's own IP — is the only signal that tells an
+	// operator "something on this node is rewriting source addresses and it has
+	// collapsed into a single zone". One mistyped character in the DaemonSet
+	// manifest disabling it silently, with nothing recorded, is exactly the failure
+	// mode this project has been eliminating throughout. The behaviour matches the
+	// node_ip Corefile option below, where the same parse error fails startup.
 	if v := os.Getenv("NODE_IP"); v != "" {
 		addr, err := netip.ParseAddr(v)
 		if err != nil {
@@ -357,11 +378,13 @@ func parseConfig(c *caddy.Controller) (*config, error) {
 				if !c.NextArg() {
 					return nil, c.ArgErr()
 				}
-				// 驗證邏輯與 plugin/zonedns/setup.go 的 edns0_code 完全一致 ——
-				// 兩端的值必須相同（見 spec §6.6），錯開任何一端的驗證規則都可能
-				// 讓一個值在其中一端被接受、在另一端被拒絕，兩邊就再也對不上。
-				// strconv.ParseUint（不同於 fmt.Sscanf 的 "%d"）會直接拒絕
-				// 尾隨的垃圾字元，而不是靜默停在第一個非數字字元。
+				// The validation is identical to edns0_code in
+				// plugin/zonedns/setup.go — the two ends must carry the same value (see
+				// spec §6.6), and letting either side's rule drift could have a value
+				// accepted at one end and refused at the other, after which they never
+				// agree again. strconv.ParseUint, unlike fmt.Sscanf's "%d", refuses
+				// trailing junk outright instead of quietly stopping at the first
+				// non-digit.
 				code, err := strconv.ParseUint(c.Val(), 10, 16)
 				if err != nil {
 					return nil, c.Errf("invalid edns0_code %q: %v", c.Val(), err)
@@ -383,11 +406,12 @@ func parseConfig(c *caddy.Controller) (*config, error) {
 	if cfg.upstreamURL == "" {
 		return nil, c.Err("upstream is required")
 	}
-	// upstream 必須是 https:// —— NewMTLS 建出來的 client 整套存在的理由就是
-	// 用 SPIFFE ID 釘住 central 的身分；一個 http:// 的 upstream 會讓查詢走
-	// 純文字傳輸，http.Transport 的 TLSClientConfig（也就是那個 AuthorizeID
-	// pin）根本不會被用上，等於一個字元就讓 mTLS 釘住整套形同虛設，且沒有
-	// 任何錯誤或警告，查詢照常送出去。
+	// upstream must be https://. The entire reason the client built by NewMTLS
+	// exists is to pin central's identity by SPIFFE ID; an http:// upstream sends
+	// queries in plaintext and the http.Transport's TLSClientConfig — the
+	// AuthorizeID pin — is never consulted at all. One character would render the
+	// whole mTLS pinning moot, with no error and no warning, while queries go out
+	// as usual.
 	u, err := url.Parse(cfg.upstreamURL)
 	if err != nil {
 		return nil, c.Errf("invalid upstream %q: %v", cfg.upstreamURL, err)
@@ -397,20 +421,22 @@ func parseConfig(c *caddy.Controller) (*config, error) {
 			"cleartext, bypassing the SPIFFE server pinning NewMTLS exists to provide entirely",
 			cfg.upstreamURL, u.Scheme)
 	}
-	// upstream 不可帶路徑。CoreDNS 的 doh.NewRequestWithContext 會自己接上
-	// "/dns-query"，所以 "https://central/dns-query" 會變成
-	// "/dns-query/dns-query"，central 回 404，而這裡看到的只會是「上游回
-	// HTTP 404」—— 對維運的人來說完全指不到原因。
+	// upstream must not carry a path. CoreDNS's doh.NewRequestWithContext appends
+	// "/dns-query" itself, so "https://central/dns-query" becomes
+	// "/dns-query/dns-query", central answers 404, and all that is visible here is
+	// "upstream returned HTTP 404" — which points an operator at nothing.
 	//
-	// 選擇拒絕而不是自動去掉：一個被靜默改寫的設定值比一個啟動就失敗的設定值
-	// 危險，而這正是本專案反覆在消除的那種失效形態。
+	// Refusing rather than stripping it automatically: a configuration value
+	// silently rewritten is more dangerous than one that fails at startup, and that
+	// is the failure shape this project keeps eliminating.
 	if p := strings.TrimSuffix(u.Path, "/"); p != "" {
 		return nil, c.Errf("upstream %q must not include a path; the DoH path is always %q and is "+
 			"appended automatically, so %q would be requested as %q and answered with HTTP 404",
 			cfg.upstreamURL, "/dns-query", u.Path, u.Path+"/dns-query")
 	}
-	// central_spiffe_id 沒有安全的預設值：少了它就只剩憑證鏈驗證，信任域內任何
-	// 一張 SVID 都能冒充 central 並回傳任意答案。
+	// central_spiffe_id has no safe default: without it only chain verification
+	// remains, and any SVID in the trust domain could impersonate central and return
+	// whatever it liked.
 	if cfg.centralSPIFFEID == "" {
 		return nil, c.Err("central_spiffe_id is required; without it any SVID in the trust domain could impersonate the central server")
 	}
@@ -423,16 +449,19 @@ func parseConfig(c *caddy.Controller) (*config, error) {
 		if cfg.zone == "" {
 			return nil, c.Err("vm mode requires zone")
 		}
-		// zone 名稱必須是線上格式承載得了的 —— 否則 central 會靜默忽略宣告，
-		// 這台 VM 的查詢會永遠拿到不分 zone 的答案。
+		// The zone name must be something the wire format can carry — otherwise
+		// central silently ignores the declaration and this VM's queries receive
+		// zone-blind answers forever.
 		if !ednszone.Valid(cfg.zone) {
 			return nil, c.Errf("zone %q is not a valid zone name (letters, digits, '-' and '_' only, at most %d bytes)",
 				cfg.zone, ednszone.MaxLen)
 		}
-		// node_name 只有 k8s 模式的 podzone.Watcher 會用到。讓它在 vm 模式底下
-		// 悄悄解析成功、卻完全不起作用，會讓操作者以為 Corefile 裡寫的
-		// node_name 有意義，實際上這台機器的 zone 完全由 zone 選項決定 ——
-		// Corefile 表達的意圖跟實際行為對不上，必須在啟動時就攤開來講。
+		// node_name is used only by k8s mode's podzone.Watcher. Letting it parse
+		// quietly under vm mode while doing nothing at all would have an operator
+		// believe the node_name in the Corefile means something, when this machine's
+		// zone is settled entirely by the zone option — the Corefile's stated intent
+		// and the actual behaviour would disagree, and that has to be said out loud
+		// at startup.
 		if cfg.nodeName != "" {
 			return nil, c.Err("node_name is not valid in vm mode; vm mode declares the zone once via " +
 				"the zone option, not per-query from pod labels")
@@ -441,10 +470,10 @@ func parseConfig(c *caddy.Controller) (*config, error) {
 		if cfg.nodeName == "" {
 			return nil, c.Err("k8s mode requires node_name")
 		}
-		// 對稱地，zone 只有 vm 模式的 StaticResolver 會用到。k8s 模式下這個節點
-		// 混跑多個 zone 是常態，逐查詢由 pod label 決定 —— 若 Corefile 寫了
-		// zone zone-c，操作者可能誤以為這個節點只服務 zone-c，實際上該選項
-		// 被整個忽略。
+		// Symmetrically, zone is used only by vm mode's StaticResolver. Under k8s
+		// mode a node routinely mixes several zones, settled per query by the pod
+		// label — so a Corefile saying `zone zone-c` could have an operator believe
+		// this node serves zone-c alone, while the option is ignored entirely.
 		if cfg.zone != "" {
 			return nil, c.Err("zone is not valid in k8s mode; k8s mode determines the zone per-query " +
 				"from pod labels, not from a fixed zone option")
