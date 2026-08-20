@@ -1,20 +1,23 @@
 //go:build ignore
 
-// 這個檔案會被複製進 sigs.k8s.io/node-local-dns 的 cmd/node-cache/ 套件裡。
+// This file is copied into the cmd/node-cache/ package of
+// sigs.k8s.io/node-local-dns.
 //
-// 為什麼用「加一個檔案」而不是改上游的 main.go：後者要靠 sed 在別人的原始碼上
-// 做字串取代，上游一改格式就會壞，而且壞掉的方式是「patch 沒套用但建置成功」——
-// 產出一個看起來正常、卻沒有 zonedns_agent 的 binary。多加一個檔案則是編譯期
-// 就決定的事：檔案在，plugin 就在。
+// Why add a file rather than patch upstream's main.go: patching means sed-ing
+// string replacements into somebody else's source, which breaks the moment
+// upstream reformats — and it breaks by way of "the patch did not apply but the
+// build succeeded", producing a binary that looks fine and has no zonedns_agent
+// in it. An extra file is settled at compile time instead: the file is there, so
+// the plugin is there.
 //
-// 帶 ignore tag 是為了不讓它參與本 repo 的建置（它是 package main 卻沒有 main
-// 函式）。Dockerfile 複製進去時會剝掉那一行。
+// The ignore tag keeps it out of this repo's build (it is package main with no
+// main function). The Dockerfile strips that line as it copies the file in.
 package main
 
 import (
 	"github.com/coredns/coredns/core/dnsserver"
 
-	// blank import 讓 plugin 把自己註冊進 CoreDNS。
+	// The blank import lets the plugin register itself with CoreDNS.
 	_ "github.com/jenting/zonedns/plugin/zonedns_agent"
 )
 
@@ -22,12 +25,14 @@ func init() {
 	insertBeforeCache("zonedns_agent")
 }
 
-// insertBeforeCache 把 directive 插進 dnsserver.Directives 中 cache 之前。
+// insertBeforeCache places a directive ahead of cache in dnsserver.Directives.
 //
-// 順序不是偏好：node-local-dns 內建的 cache plugin 以 (qname, qtype) 為 key，
-// 不含發問者的 zone。若它排在前面，一個 zone 的 pod 會拿到另一個 zone 快取的
-// 答案，而執行期沒有任何徵兆。plugin 的 setup() 會在啟動時檢查這個順序並拒絕
-// 啟動，所以這裡插錯位置不會靜默通過 —— 但正確地插在這裡，才是讓它一開始就對。
+// The order is not a preference: node-local-dns's built-in cache plugin keys on
+// (qname, qtype) and does not include the asking workload's zone. If it sorts
+// first, a pod in one zone receives an answer cached for another, with no sign of
+// it at runtime. The plugin's setup() checks this order at startup and refuses to
+// start, so getting it wrong here will not pass silently — but placing it
+// correctly here is what makes it right in the first place.
 func insertBeforeCache(name string) {
 	for _, d := range dnsserver.Directives {
 		if d == name {
