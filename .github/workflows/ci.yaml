@@ -1,0 +1,160 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # 與 go.mod 的 go 指令一致。這個版本不是隨意選的：它必須跟上游
+  # sigs.k8s.io/node-local-dns 對得上，否則 agent plugin 連結不進去。
+  GO_VERSION: "1.25"
+
+jobs:
+  test:
+    name: 測試與靜態檢查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "以下檔案未格式化："
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go mod tidy 應為 no-op
+        run: |
+          cp go.mod /tmp/go.mod.orig
+          cp go.sum /tmp/go.sum.orig
+          go mod tidy
+          if ! diff -q go.mod /tmp/go.mod.orig >/dev/null || ! diff -q go.sum /tmp/go.sum.orig >/dev/null; then
+            echo "go mod tidy 產生了差異，請在本機執行後提交："
+            diff go.mod /tmp/go.mod.orig || true
+            exit 1
+          fi
+
+      - name: go test
+        run: go test ./... -race -cover
+
+  plugin-link:
+    name: 連結進 CoreDNS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: zonedns
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      # 這個 job 驗證的東西 go test ./... 完全碰不到：module 單獨編得過，
+      # 不代表它能被 CoreDNS 的 plugin.cfg 連結進去。一個新的 import、一個
+      # 版本衝突、或 plugin 註冊方式的改動，都只會在這裡失敗。
+      - name: 取得 CoreDNS（版本與 go.mod 一致）
+        run: |
+          version=$(grep -oE 'github.com/coredns/coredns v[0-9.]+' zonedns/go.mod | head -1 | awk '{print $2}')
+          echo "CoreDNS $version"
+          git clone -q --depth 1 --branch "$version" https://github.com/coredns/coredns.git coredns
+
+      - name: 把兩個 plugin 都加進 plugin.cfg 並建置
+        working-directory: coredns
+        run: |
+          set -euo pipefail
+          go mod edit -replace github.com/jenting/zonedns="$GITHUB_WORKSPACE/zonedns"
+          go mod edit -require github.com/jenting/zonedns@v0.0.0
+
+          # 兩者都必須排在 cache 之前，否則 plugin 自己會在啟動時拒絕啟動。
+          sed -i 's|^cache:cache$|zonedns:github.com/jenting/zonedns/plugin/zonedns\nzonedns_agent:github.com/jenting/zonedns/plugin/zonedns_agent\ncache:cache|' plugin.cfg
+          grep -n -B2 '^cache:cache$' plugin.cfg
+
+          # 順序很重要：go generate 先寫出 import，go mod tidy 才不會把 require 清掉。
+          go generate
+          go mod tidy
+          go build -o coredns-zonedns .
+
+      - name: 確認兩個 plugin 都註冊了
+        working-directory: coredns
+        run: |
+          set -euo pipefail
+          plugins=$(./coredns-zonedns -plugins)
+          for p in zonedns zonedns_agent; do
+            echo "$plugins" | grep -qx "$p" || { echo "$p 未註冊"; echo "$plugins"; exit 1; }
+            echo "✓ $p"
+          done
+
+      # 順序保護是本專案唯二的啟動期硬性檢查之一，而它只有在真實 binary 上
+      # 才驗得到 —— 單元測試給的是合成的 Directives 切片。
+      - name: 順序錯誤時必須拒絕啟動
+        working-directory: coredns
+        run: |
+          set -euo pipefail
+          sed -i '/^zonedns:github.com\/jenting\/zonedns\/plugin\/zonedns$/d' plugin.cfg
+          sed -i 's|^cache:cache$|cache:cache\nzonedns:github.com/jenting/zonedns/plugin/zonedns|' plugin.cfg
+          go generate && go build -o coredns-wrongorder .
+
+          cat > /tmp/Corefile <<'EOF'
+          example.com:1053 {
+              zonedns {
+                  spire_server      unix:///tmp/nonexistent.sock
+                  authorized_agent  spiffe://example.org/zone/infra/node/node-01
+                  gateway           zone-a 203.0.113.10
+              }
+              cache 30
+          }
+          EOF
+          if ./coredns-wrongorder -conf /tmp/Corefile -dns.port 1053 2>/tmp/err.log; then
+            echo "順序錯誤竟然啟動成功了 —— 保護失效"
+            exit 1
+          fi
+          grep -q "must be ordered before cache" /tmp/err.log || {
+            echo "拒絕了，但訊息不是預期的："; cat /tmp/err.log; exit 1; }
+          echo "✓ 順序錯誤被正確拒絕"
+          cat /tmp/err.log
+
+  manifests:
+    name: Kubernetes manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 建立 kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: zonedns-ci
+
+      # ClusterSPIFFEID 需要 spire-controller-manager 的 CRD 才驗得到欄位是否
+      # 真的存在 —— 少了它，一個打錯的欄位名會被當成合法 YAML 放過去。
+      - name: 安裝 ClusterSPIFFEID CRD
+        run: |
+          curl -sSfL -o /tmp/csid-crd.yaml \
+            https://raw.githubusercontent.com/spiffe/spire-controller-manager/main/config/crd/bases/spire.spiffe.io_clusterspiffeids.yaml
+          kubectl apply -f /tmp/csid-crd.yaml
+          kubectl wait --for=condition=Established --timeout=60s \
+            crd/clusterspiffeids.spire.spiffe.io
+
+      - name: server-side dry-run
+        run: |
+          set -euo pipefail
+          for f in deploy/k8s/*.yaml; do
+            echo "── $f"
+            kubectl apply --dry-run=server -f "$f"
+          done
