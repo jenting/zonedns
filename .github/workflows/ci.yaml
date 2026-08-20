@@ -174,7 +174,7 @@ jobs:
         uses: helm/kind-action@v1
         with:
           cluster_name: zonedns-informer
-          config: deploy/k8s/kind-2node.yaml
+          config: deploy/kind/two-node.yaml
 
       # 用 repo 裡真正的 RBAC，不是另外寫一份寬鬆的 —— 這個 job 要驗的其中
       # 一件事就是那份 manifest 給的權限夠不夠。

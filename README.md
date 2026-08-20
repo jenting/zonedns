@@ -95,14 +95,33 @@ go test ./... -race
 source zone 下得到不同答案：中心端在 `plugin/zonedns/e2e_test.go`，節點端在
 `plugin/zonedns_agent/e2e_test.go`（經真正的 DoH wire 編碼／解碼）。
 
-### 測試沒有涵蓋的
+### 兩端對接測試
 
-這兩件事已知未被自動化測試涵蓋，且都曾實際造成問題：
+`internal/integration` 讓真正的 `Agent.ServeDNS` 經過**真實的 mTLS 握手**打到
+真正的 `ZoneDNS.ServeDNS`，中間不替換任何一端的邏輯。它涵蓋單邊測試構造不出來
+的情境：兩端設定不同的 `edns0_code`、未授權憑證在真實握手下被拒、以及 client
+偽造的宣告在線上被剝除。
 
-- **兩端從未在測試中真正對接。** 它們只在 `internal/ednszone` 的套件測試裡各自
-  碰到線上格式。一個只有在兩端接起來才會顯現的錯誤，兩邊的測試都會是綠的 ——
-  `upstream` URL 重複附加 `/dns-query` 那個 bug 就是這樣躲過 16 個任務與兩輪
-  最終審查的。
-- **k8s 模式的 pod informer 從未在真實 cluster 執行過。** 單元測試用的
-  `fake.NewSimpleClientset` 不套用 field selector，所以「只看本機節點的 pod」
-  這件事在測試裡從來沒有真正發生。
+那裡的假 central **刻意跟真的一樣嚴格** —— 它套用與 CoreDNS DoH server 完全
+相同的路徑檢查。`upstream` URL 重複附加 `/dns-query` 那個 bug 之所以躲過 16 個
+任務與兩輪最終審查，正是因為當時的測試替身接受任何路徑。寬鬆的替身會複製它
+本來要防的盲點。
+
+### 需要真實 cluster 的測試
+
+`internal/podzone/cluster_test.go` 以 `cluster` build tag 隔開，一般的
+`go test ./...` 不會跑到。CI 用兩節點 kind cluster 執行；本機重現：
+
+```bash
+kind create cluster --config deploy/kind/two-node.yaml
+kubectl apply -f deploy/k8s/01-rbac.yaml
+go test -tags=cluster ./internal/podzone/ -run TestCluster -v
+```
+
+它驗的是 `fake.NewSimpleClientset` 結構上做不到的事：它的 object tracker
+**忽略 field selector**，所以「informer 只看本機節點的 pod」這個行為在其他
+測試裡從來沒有真正發生過。測試以該 ServiceAccount 的 token 連線、用的是
+`deploy/k8s/01-rbac.yaml` 那份真正的 RBAC，所以權限不足時 informer 會同步不了
+而失敗。
+
+必須是兩個節點：單節點的 cluster 無法證明範圍真的被限縮。
