@@ -1,0 +1,38 @@
+# 中心端：CoreDNS + plugin/zonedns。
+#
+# CoreDNS 的 plugin 是編譯期連結的，沒有執行期載入機制，所以必須重建宿主 binary。
+# build context 是 repo 根目錄。
+#
+#   docker build -f build/Dockerfile.central -t zonedns-central:dev .
+
+ARG GO_VERSION=1.25
+ARG COREDNS_VERSION=v1.14.6
+
+FROM golang:${GO_VERSION} AS builder
+ARG COREDNS_VERSION
+
+RUN git clone -q --depth 1 --branch ${COREDNS_VERSION} \
+      https://github.com/coredns/coredns.git /src/coredns
+
+# 本 repo 是 private，容器內 go get 拉不到，所以用 replace 指向複製進來的原始碼。
+COPY . /src/zonedns
+WORKDIR /src/coredns
+RUN go mod edit -replace github.com/jenting/zonedns=/src/zonedns && \
+    go mod edit -require github.com/jenting/zonedns@v0.0.0
+
+# zonedns 必須排在 cache 之前，否則 plugin 的 setup() 會拒絕啟動：內建 cache
+# 以 (qname, qtype) 為 key，不含發問者的 zone。
+RUN sed -i 's|^cache:cache$|zonedns:github.com/jenting/zonedns/plugin/zonedns\ncache:cache|' plugin.cfg && \
+    grep -q '^zonedns:' plugin.cfg
+
+# 順序很重要：go generate 先寫出 import，go mod tidy 才不會把 require 清掉。
+RUN go generate && go mod tidy && \
+    CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/coredns .
+
+# 建完就驗，讓失敗停在建置而不是部署。
+RUN /out/coredns -plugins | grep -qx zonedns
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=builder /out/coredns /usr/local/bin/coredns
+USER nonroot:nonroot
+ENTRYPOINT ["/usr/local/bin/coredns"]

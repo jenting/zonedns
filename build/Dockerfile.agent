@@ -1,0 +1,60 @@
+# 節點端：sigs.k8s.io/node-local-dns + plugin/zonedns_agent。
+#
+# 宿主不是普通 CoreDNS，而是 node-local-dns —— 它另外管理 dummy interface 與
+# iptables 規則，那些是 link-local 位址能運作的前提。
+#
+# 這裡有兩個不明顯、但少了就會壞的步驟：
+#   1. node-local-dns 把相依 vendor 進 repo，所以要 go mod vendor，不是 go mod tidy
+#   2. vendor 與建置都必須 GOOS=linux —— 在別的平台 vendor 會漏掉 linux-only 的
+#      k8s.io/kubernetes/pkg/util/iptables，症狀是一串 undefined: utiliptables.*，
+#      看起來像版本衝突，實際上是 vendor 樹缺了那個平台的檔案
+#
+#   docker build -f build/Dockerfile.agent -t zonedns-agent:dev .
+
+ARG GO_VERSION=1.25
+# 釘在上游 kubernetes/kubernetes 的 nodelocaldns addon manifest 目前使用的版本，
+# 這樣自建 image 與上游的部署形態是同一代。注意預設分支是 master 不是 main。
+ARG NODE_LOCAL_DNS_REF=1.26.8
+
+FROM golang:${GO_VERSION} AS builder
+ARG NODE_LOCAL_DNS_REF
+ARG TARGETARCH
+
+RUN git clone -q --depth 1 --branch ${NODE_LOCAL_DNS_REF} \
+      https://github.com/kubernetes-sigs/node-local-dns.git /src/node-local-dns
+
+COPY . /src/zonedns
+WORKDIR /src/node-local-dns
+
+# 加一個檔案而不是改 main.go：它自己的 init() 完成 blank import 與 Directives
+# 插入。用 sed 改上游原始碼的話，上游一改格式就會靜默失效 —— 建置照樣成功，
+# 只是產出的 binary 沒有 plugin。
+# 剝掉 ignore tag —— 在本 repo 它用來排除這個沒有 main 函式的 package main，
+# 到了這裡它必須參與建置。
+COPY build/zonedns_register.go /tmp/zonedns_register.go
+RUN grep -v '^//go:build ignore$' /tmp/zonedns_register.go > cmd/node-cache/zonedns_register.go && \
+    grep -q 'zonedns_agent' cmd/node-cache/zonedns_register.go
+
+# tidy 必須在 vendor 之前：本 module 帶進上游 go.mod 沒有的相依（go-spiffe、
+# golang-lru 等），沒先 tidy 的話 vendor 會以「updates to go.mod needed」失敗。
+RUN go mod edit -replace github.com/jenting/zonedns=/src/zonedns && \
+    go mod edit -require github.com/jenting/zonedns@v0.0.0 && \
+    go mod tidy && \
+    GOOS=linux go mod vendor
+
+RUN GOOS=linux GOARCH=${TARGETARCH:-amd64} CGO_ENABLED=0 \
+      go build -ldflags="-s -w" -o /out/node-cache ./cmd/node-cache
+
+# node-local-dns 沒有 -plugins 旗標，所以改用「餵一份含 zonedns_agent 的
+# Corefile，確認它解析得過」來驗。設定不完整時它會停在取 SVID，那已經證明
+# directive 有被認得 —— 若 plugin 沒連進去，錯誤會是 Unknown directive。
+RUN printf 'example.com:53 {\n zonedns_agent {\n  mode vm\n  zone zone-a\n  upstream https://central.invalid\n  central_spiffe_id spiffe://example.org/c\n  workload_api unix:///nonexistent.sock\n }\n}\n' > /tmp/Corefile && \
+    /out/node-cache -localip 169.254.20.10 -conf /tmp/Corefile \
+      -setupinterface=false -setupiptables=false -skipteardown 2>&1 \
+      | tee /tmp/out.log; \
+    grep -q "Unknown directive" /tmp/out.log && { echo "plugin 未連結進去"; exit 1; } || true
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=builder /out/node-cache /usr/local/bin/node-cache
+USER nonroot:nonroot
+ENTRYPOINT ["/usr/local/bin/node-cache"]

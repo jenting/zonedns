@@ -82,7 +82,18 @@ option 裡怎麼編碼一個 zone 宣告）—— 這是兩者之間唯一的相
 發問者的 zone。若它排在前面，一個 zone 的 pod 會拿到另一個 zone 快取的答案，而
 執行期沒有任何徵兆。兩端都會在啟動時檢查並拒絕錯誤的順序。
 
-完整步驟見 `docs/deployment.md`。
+```bash
+make images          # 兩個 image
+make image-central   # 只建中心端
+make image-agent     # 只建節點端
+make help            # 全部目標
+```
+
+兩份 Dockerfile 各自內建自檢：中心端確認 `-plugins` 列得出 `zonedns`，節點端
+餵一份含 `zonedns_agent` 的 Corefile 確認 directive 被認得。建置失敗會停在建置，
+而不是變成一個看起來正常、卻沒有 plugin 的 image。
+
+完整步驟與版本 pinning 的理由見 `docs/deployment.md`。
 
 ## 測試
 

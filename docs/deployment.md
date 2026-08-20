@@ -255,8 +255,13 @@ CoreDNS plugin，必須編譯進 binary；不同的是它編譯進的不是普�
    ```bash
    go mod edit -replace github.com/jenting/zonedns=/path/to/zonedns
    go mod edit -require github.com/jenting/zonedns@v0.0.0
+   go mod tidy          # 必須在 vendor 之前
    GOOS=linux go mod vendor
    ```
+
+   `go mod tidy` 不能省，也不能跟 vendor 對調：本 module 帶進上游 `go.mod` 沒有
+   的相依，沒先 tidy 的話 `go mod vendor` 會直接以
+   `updates to go.mod needed` 失敗。
 
 5. **vendor 與建置都必須指定 `GOOS=linux`。** 在 macOS 上直接 `go mod vendor`
    會漏掉 `k8s.io/kubernetes/pkg/util/iptables` —— 它是 linux-only 的，而
